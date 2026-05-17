@@ -7,10 +7,19 @@
 #
 # (Pass --chromium to target ~/.config/chromium/... instead.)
 #
+# The extension id is derived from the `key` field in extension/manifest.json
+# and is the same on every machine that loads this unpacked extension. You
+# only need to pass it explicitly if you regenerate the keypair.
+#
 # Usage:
-#   ./install/linux/install-host.sh <chrome-extension-id> [--no-build] [--chromium]
+#   ./install/linux/install-host.sh [<chrome-extension-id>] [--no-build] [--chromium]
 
 set -euo pipefail
+
+# Pinned extension id derived from the `key` in extension/manifest.json.
+# Override by passing a different id as the first positional argument (only
+# needed if you regenerate the keypair).
+DEFAULT_EXT_ID="oplkebjcjmifidmnbehpadfakodjjoge"
 
 EXT_ID=""
 SKIP_BUILD=false
@@ -26,15 +35,8 @@ for arg in "$@"; do
 done
 
 if [[ -z "$EXT_ID" ]]; then
-  cat >&2 <<USAGE
-Usage: $0 <chrome-extension-id> [--no-build] [--chromium]
-
-Pass the 32-character extension id from chrome://extensions. Example:
-  $0 abcdefghijklmnopabcdefghijklmnop
-
-Use --chromium if you load the extension in Chromium instead of Chrome.
-USAGE
-  exit 2
+  EXT_ID="$DEFAULT_EXT_ID"
+  echo "Using pinned extension id: $EXT_ID"
 fi
 
 if [[ ! "$EXT_ID" =~ ^[a-p]{32}$ ]]; then

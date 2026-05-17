@@ -21,3 +21,8 @@
 .env
 .env.local
 *.local
+
+# Extension signing private key — derived public key is committed inside
+# extension/manifest.json (`key` field), the private half lives only here
+# and is needed only if we ever publish to the Chrome Web Store.
+extension/key.pem

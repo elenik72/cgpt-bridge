@@ -5,33 +5,32 @@
 # Writes the Chrome Native Messaging manifest to:
 #   ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.cgpt_bridge.host.json
 #
-# Usage:
-#   ./install/macos/install-host.sh <chrome-extension-id> [--no-build]
+# The extension id is derived from the `key` field in extension/manifest.json
+# and is therefore the same on every machine that loads this unpacked
+# extension. You only need to pass it explicitly if you replace the key.
 #
-# Get the extension id from chrome://extensions while the unpacked extension is
-# loaded. It is a 32-character lowercase string under the extension's name.
+# Usage:
+#   ./install/macos/install-host.sh [<chrome-extension-id>] [--no-build]
 
 set -euo pipefail
 
-EXT_ID="${1:-}"
+# Pinned extension id derived from the `key` in extension/manifest.json.
+# Override by passing a different id as the first positional argument (only
+# needed if you regenerate the keypair).
+DEFAULT_EXT_ID="oplkebjcjmifidmnbehpadfakodjjoge"
+
+EXT_ID=""
 SKIP_BUILD=false
 for arg in "$@"; do
-  if [[ "$arg" == "--no-build" ]]; then
-    SKIP_BUILD=true
-  fi
+  case "$arg" in
+    --no-build) SKIP_BUILD=true ;;
+    --*)        echo "unknown flag: $arg" >&2; exit 2 ;;
+    *)          if [[ -z "$EXT_ID" ]]; then EXT_ID="$arg"; fi ;;
+  esac
 done
-
-if [[ -z "$EXT_ID" || "$EXT_ID" == --* ]]; then
-  cat >&2 <<USAGE
-Usage: $0 <chrome-extension-id> [--no-build]
-
-Pass the 32-character extension id from chrome://extensions. Example:
-  $0 abcdefghijklmnopabcdefghijklmnop
-
-This writes the Native Messaging manifest that pins our host to that exact
-extension id via "allowed_origins".
-USAGE
-  exit 2
+if [[ -z "$EXT_ID" ]]; then
+  EXT_ID="$DEFAULT_EXT_ID"
+  echo "Using pinned extension id: $EXT_ID"
 fi
 
 # Sanity-check the extension id shape (Chrome uses 32 lowercase letters a-p).

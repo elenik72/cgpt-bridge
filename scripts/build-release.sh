@@ -104,15 +104,17 @@ This tarball contains:
    - Open `chrome://extensions`.
    - Enable *Developer mode* (top right).
    - Click *Load unpacked*, choose the `extension/` folder from this bundle.
-   - Copy the 32-character extension id shown under the extension card.
+   - The extension id is fixed via the `key` field in the manifest, so it is
+     the same on every machine. You do not need to copy it — the installer
+     below already knows it.
 
 2. **Install the Native Messaging manifest.**
-   - macOS:  `./install/macos/install-host.sh <extension-id>`
-   - Linux:  `./install/linux/install-host.sh <extension-id>`
+   - macOS:  `./install/macos/install-host.sh`
+   - Linux:  `./install/linux/install-host.sh`
      Use `--chromium` if you loaded the extension in Chromium instead of Chrome.
 
-   The script writes a manifest pinning the host to your extension id and
-   pointing it at `bin/cgpt-bridge-host` in this folder. Do not move the
+   The script writes a manifest pinning the host to the pinned extension id
+   and pointing it at `bin/cgpt-bridge-host` in this folder. Do not move the
    folder after running the installer — the manifest stores an absolute path.
 
 3. **Reload the extension.** Click the refresh icon on the extension card.
