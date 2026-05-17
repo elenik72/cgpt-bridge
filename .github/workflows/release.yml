@@ -16,23 +16,15 @@ jobs:
   build:
     name: build (${{ matrix.label }})
     strategy:
-      # Don't cancel other targets if one fails — partial bundles are still
-      # useful while we diagnose the broken target.
       fail-fast: false
       matrix:
         include:
+          # Only macOS ARM for now. Adding macos-x86_64 or linux-x86_64
+          # later is a one-line append to this include list.
           - label: macos-arm64
             os: macos-14          # Apple Silicon runner
             artifact_os: macos
             artifact_arch: arm64
-          - label: macos-x86_64
-            os: macos-13          # Intel runner (kept while Rosetta-only macs exist)
-            artifact_os: macos
-            artifact_arch: x86_64
-          - label: linux-x86_64
-            os: ubuntu-latest
-            artifact_os: linux
-            artifact_arch: x86_64
 
     runs-on: ${{ matrix.os }}
 
