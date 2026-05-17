@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "cgpt-bridge",
+  "version": "0.0.1",
+  "description": "Local personal bridge prototype for active ChatGPT tab.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwgzwdblUN0059Cb6uxpK4vqaGP9wAan0z4Z0HxnnsRI4W857IkwRrDjwzM+juVw3NSQjct4gUii0bC5WtrfZAyGvxuNtbD5ve7E4es83X91JjUalg5BJ/aCRCTGzXAleJsPnHPCJmCibPr1jRP32jJxI1qGZTh7r+RwPc5RsA80QaICNZxOP1vIf/1HAlAm7h67SI0qJ7oz4m7vZ3r0wwOvcAQlTnRyrzqm1bIHTLHBYHoMqWyAx1TkHHgQ8j/x5Mxa6SNxC5H7f8MTN+WqUyGe6Mj2QFh+WK+KWyyD2ztwx2D1OfK1an/8dEy3g+on5EIMKhkAJ7Ogy/JL0aOowUQIDAQAB",
+  "action": {
+    "default_title": "cgpt-bridge: send test prompt to active ChatGPT tab"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["tabs", "activeTab", "nativeMessaging"],
+  "host_permissions": ["https://chatgpt.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

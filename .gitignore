@@ -2,7 +2,7 @@
 /target/
 
 # Release bundle output
-/dist/
+# /dist/
 
 # Node / extension build output
 /extension/node_modules/
