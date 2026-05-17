@@ -1,0 +1,23 @@
+# Rust build output
+/target/
+
+# Release bundle output
+/dist/
+
+# Node / extension build output
+/extension/node_modules/
+/extension/dist/
+
+# Per-project agent state — never commit
+/.cgpt-bridge/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Local env / secrets
+.env
+.env.local
+*.local

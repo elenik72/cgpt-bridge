@@ -1,0 +1,114 @@
+name: release-bundle
+
+# Manual-only: open the Actions tab in GitHub, pick "release-bundle",
+# click "Run workflow". The job builds the Rust CLI + host and the Chrome
+# extension on each target platform and uploads the staged tarball as an
+# artifact you can download and install.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional tag suffix to append to artifact names (e.g. rc1, hotfix)."
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: build (${{ matrix.label }})
+    strategy:
+      # Don't cancel other targets if one fails — partial bundles are still
+      # useful while we diagnose the broken target.
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-arm64
+            os: macos-14          # Apple Silicon runner
+            artifact_os: macos
+            artifact_arch: arm64
+          - label: macos-x86_64
+            os: macos-13          # Intel runner (kept while Rosetta-only macs exist)
+            artifact_os: macos
+            artifact_arch: x86_64
+          - label: linux-x86_64
+            os: ubuntu-latest
+            artifact_os: linux
+            artifact_arch: x86_64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read workspace version
+        id: ver
+        shell: bash
+        run: |
+          VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          if [[ -z "$VERSION" ]]; then
+            echo "could not read version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # ---- Rust toolchain + cache ----
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Key by host + Cargo.lock so each matrix target has its own cache.
+          shared-key: ${{ matrix.label }}
+
+      # ---- Node toolchain + cache ----
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: extension/package-lock.json
+
+      # ---- Build everything via the existing release bundler ----
+      - name: Build release bundle
+        shell: bash
+        run: |
+          chmod +x scripts/build-release.sh
+          ./scripts/build-release.sh
+
+      - name: Locate bundle
+        id: bundle
+        shell: bash
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          TAG_SUFFIX=""
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            TAG_SUFFIX="-${{ github.event.inputs.tag }}"
+          fi
+          BUNDLE_NAME="cgpt-bridge-${VERSION}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}${TAG_SUFFIX}"
+          # The bundler always uses the un-suffixed name; rename for upload.
+          SRC_DIR="dist/cgpt-bridge-${VERSION}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
+          SRC_TAR="${SRC_DIR}.tar.gz"
+          if [[ -n "$TAG_SUFFIX" ]]; then
+            mv "$SRC_DIR" "dist/${BUNDLE_NAME}"
+            mv "$SRC_TAR" "dist/${BUNDLE_NAME}.tar.gz"
+          fi
+          echo "name=$BUNDLE_NAME"           >> "$GITHUB_OUTPUT"
+          echo "tarball=dist/${BUNDLE_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test the bundled CLI
+        shell: bash
+        run: |
+          BIN="dist/${{ steps.bundle.outputs.name }}/bin/cgpt"
+          "$BIN" --version
+          "$BIN" agent --help | head -20
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # The artifact name doubles as the folder name on download — keep
+          # it identical to the tarball stem for clarity.
+          name: ${{ steps.bundle.outputs.name }}
+          path: ${{ steps.bundle.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 30
