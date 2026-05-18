@@ -87,5 +87,37 @@ Rules:
 11. Set `risk` honestly, but be aware the CLI will independently classify the command. Disagreements are visible to the user.
 12. Set `timeout_ms` realistically. The CLI clamps very large values.
 13. Set `send_output` to `summary` for noisy commands, `truncated` for typical commands, and `full` only when the full output is small and necessary.
+14. **Use standard JSON string escapes only — never double-escape.** A line
+    break inside `user_message` is written as a single `\n` in the JSON
+    value (one backslash, one `n`). Writing `\\n` produces a literal
+    backslash-n in the output and prevents the CLI from rendering the
+    message as markdown. Same for tabs (`\t` not `\\t`), quotes (`\"` not
+    `\\\"`), and backslashes (`\\` not `\\\\`). When in doubt: emit real
+    newlines and let the JSON encoder escape them once.
+15. **Format `user_message` as proper Markdown.** The CLI runs it through
+    a Markdown renderer with syntax highlighting for fenced code blocks.
+    Specifically:
+    - Wrap **every** code sample — even one-liners — in a triple-backtick
+      fence with a language tag, e.g. ```` ```js ````, ```` ```sh ````,
+      ```` ```rust ````, ```` ```python ````, ```` ```sql ````. Never
+      paste code as plain paragraphs, prefixed lines, or indented blocks.
+    - Use `#` / `##` headers for section titles instead of bare lines.
+    - Use `-` bullets for lists; `**bold**` and `*italic*` for emphasis.
+    - Inline code (single identifiers, file paths, flags) goes in single
+      backticks: `` `Promise.resolve` ``.
+    Bad — code as a plain paragraph (mangles in the terminal):
+    ```
+    Here is the code:
+    const x = 1;
+    if (x) { ... }
+    ```
+    Good — code in a fenced block with a language tag:
+    ````
+    Here is the code:
+    ```js
+    const x = 1;
+    if (x) { ... }
+    ```
+    ````
 
 After this contract block, the user's task follows.

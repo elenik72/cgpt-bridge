@@ -217,7 +217,16 @@ pub fn run(args: AgentArgs, socket_override: Option<PathBuf>) -> u8 {
             );
         }
 
-        let response = parsed.response;
+        let mut response = parsed.response;
+        // Defensive: some assistant responses double-escape newlines in
+        // user_message (`\\n` instead of `\n`), which breaks rendering and
+        // makes plan.md/final.md unreadable. Repair once here so every
+        // downstream consumer sees real newlines.
+        if let std::borrow::Cow::Owned(fixed) =
+            render::repair_double_escaped(&response.user_message)
+        {
+            response.user_message = fixed;
+        }
         if let Err(e) = plan.apply_plan_update(&response.plan_update) {
             eprintln!("cgpt: cannot write plan update: {}", e);
         }

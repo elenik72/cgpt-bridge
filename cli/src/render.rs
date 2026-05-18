@@ -13,6 +13,7 @@
 //!   - Non-TTY stdout → raw markdown emitted verbatim. Downstream consumers
 //!     get clean text instead of ANSI escapes.
 
+use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 
@@ -26,15 +27,240 @@ use termimad::{Alignment, MadSkin};
 /// Print `text` to stdout. Pretty-renders when stdout is a TTY, otherwise
 /// emits raw markdown verbatim. Always guarantees a trailing newline.
 pub fn print_markdown(text: &str) {
+    let text = repair_double_escaped(text);
+    let text = autofence_unfenced_code(text.as_ref());
     if !std::io::stdout().is_terminal() {
-        print_raw(text);
+        print_raw(&text);
         return;
     }
-    let out = render_to_string(text);
+    let out = render_to_string(&text);
     print!("{}", out);
     if !out.ends_with('\n') {
         println!();
     }
+}
+
+/// Detect blocks of bare code in `user_message` and wrap them in proper
+/// triple-backtick fences so the syntect highlighter picks them up.
+///
+/// The assistant is contractually required to fence code (rule 15 of the
+/// agent prompt contract). This is a defensive fallback for the cases
+/// where the assistant emits raw code as a plain paragraph — without this
+/// the lines render as malformed prose: termimad treats them as
+/// arbitrary text, indentation drifts, and selective lines get
+/// inline-code backgrounds because they happen to be four-space indented.
+///
+/// Heuristic — a paragraph (run of non-blank lines surrounded by blank
+/// lines or document edges) is treated as code when:
+///   - it is not already inside a fence; and
+///   - it contains 2+ lines; and
+///   - at least half of its lines look code-like (semicolons, braces, fat
+///     arrows, call-style parentheses, common keyword prefixes, etc); and
+///   - it does not look like prose (multiple lines ending with `.` `?`
+///     `!`, or starting with a capital letter followed by spaces).
+///
+/// Conservative on purpose: false-fencing prose is worse than missing a
+/// fence the assistant should have written itself.
+pub fn autofence_unfenced_code(text: &str) -> String {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut in_fence = false;
+    let mut fence_marker: &str = "";
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start().trim_end_matches('\n');
+
+        // Pass fenced regions through unchanged. Toggle state on each fence.
+        if !in_fence {
+            if let Some(marker) = detect_fence_open(trimmed) {
+                in_fence = true;
+                fence_marker = marker;
+                out.push_str(lines[i]);
+                i += 1;
+                continue;
+            }
+        } else if trimmed.starts_with(fence_marker)
+            && trimmed[fence_marker.len()..].trim().is_empty()
+        {
+            in_fence = false;
+            fence_marker = "";
+            out.push_str(lines[i]);
+            i += 1;
+            continue;
+        }
+
+        if in_fence {
+            out.push_str(lines[i]);
+            i += 1;
+            continue;
+        }
+
+        // Outside any fence. Find a paragraph (contiguous non-blank lines).
+        if lines[i].trim().is_empty() {
+            out.push_str(lines[i]);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < lines.len() && !lines[i].trim().is_empty() {
+            i += 1;
+        }
+        let paragraph = &lines[start..i];
+
+        if paragraph_looks_like_code(paragraph) {
+            let lang = guess_language(paragraph);
+            out.push_str("```");
+            out.push_str(lang);
+            out.push('\n');
+            for l in paragraph {
+                out.push_str(l);
+            }
+            // Ensure newline before closing fence.
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("```\n");
+        } else {
+            for l in paragraph {
+                out.push_str(l);
+            }
+        }
+    }
+    out
+}
+
+fn paragraph_looks_like_code(lines: &[&str]) -> bool {
+    if lines.len() < 2 {
+        return false;
+    }
+    let mut code_signals = 0usize;
+    let mut prose_signals = 0usize;
+    for raw in lines {
+        let l = raw.trim_end_matches('\n');
+        let t = l.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Markdown structural lines disqualify the paragraph.
+        if t.starts_with('#')
+            || t.starts_with("- ")
+            || t.starts_with("* ")
+            || t.starts_with("> ")
+            || t.starts_with("|")
+        {
+            return false;
+        }
+        // Strong code signals.
+        let has_code_punct = t.contains(';')
+            || t.contains("=>")
+            || t.contains("->")
+            || t.contains("::")
+            || t.ends_with('{')
+            || t.ends_with('}')
+            || t.starts_with('}')
+            || t.starts_with('{')
+            || t.contains("function ")
+            || t.contains("const ")
+            || t.contains("let ")
+            || t.contains("var ")
+            || t.contains("def ")
+            || t.contains("class ")
+            || t.contains("import ")
+            || t.contains("return ")
+            || t.contains("async ")
+            || t.contains("await ");
+        if has_code_punct {
+            code_signals += 1;
+            continue;
+        }
+        // Prose signal: ends with sentence punctuation and contains a space.
+        let ends_sentence = t.ends_with('.') || t.ends_with('!') || t.ends_with('?');
+        if ends_sentence && t.contains(' ') {
+            prose_signals += 1;
+        }
+    }
+    // Need a clear majority of code lines and no prose-sentence vibe.
+    code_signals >= 2 && code_signals > prose_signals
+}
+
+fn guess_language(lines: &[&str]) -> &'static str {
+    let joined: String = lines.iter().copied().collect::<String>();
+    let j = joined.as_str();
+    if j.contains("=>")
+        || j.contains("const ")
+        || j.contains("let ")
+        || j.contains("function ")
+        || j.contains("await ")
+        || j.contains("Promise")
+        || j.contains("console.log")
+    {
+        return "js";
+    }
+    if j.contains("def ") || j.contains("self.") || j.contains("import ") && j.contains(":") {
+        return "python";
+    }
+    if j.contains("fn ") || j.contains("let mut ") || j.contains("impl ") || j.contains("&str") {
+        return "rust";
+    }
+    if j.starts_with("$ ") || j.starts_with("#!/") || j.contains(" | ") || j.contains("echo ") {
+        return "sh";
+    }
+    ""
+}
+
+/// Defensive repair for assistant messages that double-escape JSON string
+/// values. Some ChatGPT responses arrive with `\\n` in `user_message`,
+/// which serde decodes to a literal `\n` (two characters) instead of a real
+/// newline. The result is one giant unbroken line that termimad can't
+/// format.
+///
+/// Heuristic — applied only when **all** of the following hold so we
+/// don't mangle short legitimate snippets like `console.log("a\nb")`:
+///   - the string contains zero real newlines; and
+///   - it contains at least three literal `\n` (two-char) sequences.
+///
+/// When triggered, we walk the string and reverse the standard JSON string
+/// escapes (`\n`, `\t`, `\r`, `\"`, `\\`).
+pub fn repair_double_escaped(text: &str) -> Cow<'_, str> {
+    if text.contains('\n') {
+        return Cow::Borrowed(text);
+    }
+    if text.matches("\\n").count() < 3 {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('n') => {
+                chars.next();
+                out.push('\n');
+            }
+            Some('t') => {
+                chars.next();
+                out.push('\t');
+            }
+            Some('r') => {
+                chars.next();
+                out.push('\r');
+            }
+            Some('"') => {
+                chars.next();
+                out.push('"');
+            }
+            Some('\\') => {
+                chars.next();
+                out.push('\\');
+            }
+            _ => out.push('\\'),
+        }
+    }
+    Cow::Owned(out)
 }
 
 fn print_raw(text: &str) {
@@ -277,5 +503,72 @@ mod tests {
     fn highlight_block_resets_sgr() {
         let out = highlight_code_block("rust", "fn x() {}\n");
         assert!(out.ends_with("\x1b[0m\n"));
+    }
+
+    #[test]
+    fn repair_unescapes_double_escaped_message() {
+        let input = "Пример Promise:\\n\\nconst x = 1;\\nconst y = 2;\\nconst z = 3;";
+        let out = repair_double_escaped(input);
+        assert_eq!(
+            out.as_ref(),
+            "Пример Promise:\n\nconst x = 1;\nconst y = 2;\nconst z = 3;"
+        );
+    }
+
+    #[test]
+    fn repair_leaves_real_newlines_alone() {
+        let input = "line1\nline2 with literal \\n in code\nline3";
+        let out = repair_double_escaped(input);
+        assert_eq!(out.as_ref(), input);
+    }
+
+    #[test]
+    fn repair_leaves_short_legitimate_snippets_alone() {
+        // Only one literal \n — likely an actual code example, not double-escape.
+        let input = "Use console.log(\"a\\nb\")";
+        let out = repair_double_escaped(input);
+        assert_eq!(out.as_ref(), input);
+    }
+
+    #[test]
+    fn repair_handles_tabs_quotes_and_backslashes() {
+        let input = "a\\nb\\tc\\\"d\\\\e\\nf\\ng";
+        let out = repair_double_escaped(input);
+        assert_eq!(out.as_ref(), "a\nb\tc\"d\\e\nf\ng");
+    }
+
+    #[test]
+    fn autofence_wraps_unfenced_js_block() {
+        let input =
+            "Here is the code:\n\nconst x = 1;\nif (x) {\n  console.log(\"ok\");\n}\n\nDone.\n";
+        let out = autofence_unfenced_code(input);
+        assert!(out.contains("```js\n"));
+        assert!(out.contains("const x = 1;"));
+        assert!(out.contains("\n```\n"));
+        // Prose stays unwrapped.
+        assert!(out.contains("Here is the code:"));
+        assert!(out.contains("Done."));
+    }
+
+    #[test]
+    fn autofence_leaves_already_fenced_code_alone() {
+        let input = "```rust\nfn x() {}\n```\n\nThat is rust.\n";
+        let out = autofence_unfenced_code(input);
+        // No double-fencing.
+        assert_eq!(out.matches("```").count(), 2);
+    }
+
+    #[test]
+    fn autofence_does_not_fence_plain_prose() {
+        let input = "Line one is a sentence.\nLine two is also a sentence.\nNothing code-like here.\n";
+        let out = autofence_unfenced_code(input);
+        assert!(!out.contains("```"));
+    }
+
+    #[test]
+    fn autofence_skips_markdown_structural_paragraphs() {
+        let input = "- bullet one;\n- bullet two;\n- bullet three;\n";
+        let out = autofence_unfenced_code(input);
+        assert!(!out.contains("```"));
     }
 }
