@@ -86,9 +86,10 @@ pub struct AgentArgs {
     #[arg(long = "buffer", default_value_t = false)]
     pub buffer: bool,
 
-    /// Disable rendering the final assistant message through `glow`. By
-    /// default, when stdout is a TTY and `glow` is on PATH, the final
-    /// markdown is pretty-printed. With this flag the raw markdown is
+    /// Disable pretty markdown rendering of the final assistant message.
+    /// By default, when stdout is a TTY, the final `user_message` is
+    /// rendered through the built-in `termimad` skin (headers, lists,
+    /// tables, code blocks, emphasis). With this flag the raw markdown is
     /// emitted verbatim. Note: piped/redirected stdout already disables
     /// rendering automatically.
     #[arg(long = "no-pretty", default_value_t = false)]

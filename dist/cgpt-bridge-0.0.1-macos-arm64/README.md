@@ -57,17 +57,12 @@ prebuilt bundle.
 
 Optional runtime extras (no install blocker — `cgpt` falls back gracefully):
 
-- **`glow`** — used to pretty-print the final assistant message of a
-  `cgpt agent` run when stdout is a TTY. Without it, the raw markdown is
-  printed and a one-line install hint is emitted on stderr.
-  - macOS: `brew install glow`
-  - Linux: `sudo apt install glow` (Debian/Ubuntu) /
-    `sudo pacman -S glow` (Arch) / see
-    [charmbracelet/glow](https://github.com/charmbracelet/glow#installation)
-    for other distros.
 - **Clipboard reader** — only needed if you use `--buffer`. macOS ships
   `pbpaste` by default. On Linux install one of `wl-clipboard` (Wayland,
   provides `wl-paste`), `xclip`, or `xsel`.
+
+Pretty markdown rendering of the final agent message is built in via
+`termimad` — no external binary required.
 
 Two artifact formats — pick one:
 
@@ -197,10 +192,11 @@ cgpt agent --buffer
 cgpt agent --buffer "fix this:"
 ```
 
-`--buffer` also works for `cgpt ask`. When the final agent message arrives,
-it is rendered through `glow` if installed (pretty markdown in your terminal);
-otherwise the raw markdown is printed. Use `--no-pretty` to force the raw
-path.
+`--buffer` also works for `cgpt ask`. When the final agent message arrives
+and stdout is a TTY, it is rendered as pretty markdown via the built-in
+`termimad` skin (headers, lists, tables, code blocks). When stdout is piped
+or redirected, raw markdown is emitted automatically. Use `--no-pretty` to
+force the raw path even on a TTY.
 
 Check that your install is healthy:
 

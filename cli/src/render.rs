@@ -1,45 +1,34 @@
-//! Pretty-print markdown text via `glow` when available, falling back to
-//! the raw text otherwise. Used to render the final assistant message of a
+//! In-process markdown renderer for the final assistant message of a
 //! `cgpt agent` session.
 //!
-//! Fallback policy (per the user-confirmed plan):
-//!   - If `glow` is not on PATH, print the raw markdown to stdout and emit a
-//!     one-line install hint on stderr. The agent run still succeeds; only
-//!     the rendering is downgraded.
-//!   - If stdout is not a TTY (the output is being piped / redirected), skip
-//!     `glow` entirely and print raw markdown so downstream consumers don't
-//!     receive ANSI escapes.
+//! Uses `termimad` so there is no external runtime dependency to install.
+//! Renders headers, lists, blockquotes, tables, inline code/bold/italic,
+//! and fenced code blocks (no syntax highlighting in v0.1 — that is a
+//! follow-up with `syntect`).
+//!
+//! TTY policy:
+//!   - If stdout is not a TTY (piped / redirected), the raw markdown is
+//!     emitted so downstream consumers don't receive ANSI escapes.
+//!   - On any unexpected error from the renderer the raw markdown is
+//!     printed instead so the agent run never loses content.
 
-use std::io::{IsTerminal, Write};
-use std::process::{Command, Stdio};
+use std::io::IsTerminal;
 
-/// Print `text` to stdout. Tries `glow -s auto -` when stdout is a TTY; on
-/// any failure (binary missing, non-zero exit, write error) falls back to
-/// printing the raw text. A single trailing newline is guaranteed so callers
-/// don't have to think about it.
+use termimad::crossterm::style::Color;
+use termimad::{Alignment, MadSkin};
+
+/// Print `text` to stdout. Pretty-renders when stdout is a TTY, otherwise
+/// emits raw markdown verbatim. Always guarantees a trailing newline.
 pub fn print_markdown(text: &str) {
     if !std::io::stdout().is_terminal() {
         print_raw(text);
         return;
     }
-    match render_with_glow(text) {
-        Ok(rendered) => {
-            print!("{}", rendered);
-            if !rendered.ends_with('\n') {
-                println!();
-            }
-        }
-        Err(RenderErr::NotFound) => {
-            eprintln!(
-                "cgpt: `glow` not found on PATH — falling back to raw markdown.\n\
-                 Install glow for prettier output: `brew install glow` (macOS) or see https://github.com/charmbracelet/glow."
-            );
-            print_raw(text);
-        }
-        Err(RenderErr::Other(msg)) => {
-            eprintln!("cgpt: glow rendering failed: {} — falling back to raw.", msg);
-            print_raw(text);
-        }
+    let skin = build_skin();
+    let rendered = skin.text(text, Some(terminal_width())).to_string();
+    print!("{}", rendered);
+    if !rendered.ends_with('\n') {
+        println!();
     }
 }
 
@@ -50,42 +39,43 @@ fn print_raw(text: &str) {
     }
 }
 
-enum RenderErr {
-    NotFound,
-    Other(String),
+/// Tuned theme. Goal: readable on both light and dark terminals, no
+/// hard-coded backgrounds that fight the user's color scheme. Foreground
+/// accents only.
+fn build_skin() -> MadSkin {
+    let mut skin = MadSkin::default();
+
+    // Headers: descending accent intensity.
+    skin.set_headers_fg(Color::Cyan);
+    skin.headers[0].align = Alignment::Left;
+    skin.headers[0].set_fg(Color::Cyan);
+    if skin.headers.len() > 1 {
+        skin.headers[1].set_fg(Color::Cyan);
+    }
+    if skin.headers.len() > 2 {
+        skin.headers[2].set_fg(Color::Blue);
+    }
+
+    // Emphasis.
+    skin.bold.set_fg(Color::White);
+    skin.italic.set_fg(Color::Magenta);
+    skin.strikeout.set_fg(Color::DarkGrey);
+
+    // Inline code + fenced code blocks: foreground tweak only, no bg so
+    // the user's terminal background carries through.
+    skin.inline_code.set_fg(Color::Yellow);
+    skin.code_block.set_fg(Color::Yellow);
+
+    // Lists / bullets / quotes.
+    skin.bullet.set_fg(Color::Cyan);
+    skin.quote_mark.set_fg(Color::DarkGrey);
+
+    // Tables look like tables.
+    skin.table.align = Alignment::Center;
+
+    skin
 }
 
-fn render_with_glow(text: &str) -> Result<String, RenderErr> {
-    let mut child = match Command::new("glow")
-        .args(["-s", "auto", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(RenderErr::NotFound),
-        Err(e) => return Err(RenderErr::Other(e.to_string())),
-    };
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        if let Err(e) = stdin.write_all(text.as_bytes()) {
-            return Err(RenderErr::Other(format!("write to glow stdin: {}", e)));
-        }
-    }
-    // Dropping stdin closes it so glow finishes.
-    drop(child.stdin.take());
-
-    let out = child
-        .wait_with_output()
-        .map_err(|e| RenderErr::Other(format!("wait glow: {}", e)))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(RenderErr::Other(if stderr.is_empty() {
-            format!("glow exited {}", out.status)
-        } else {
-            stderr
-        }));
-    }
-    String::from_utf8(out.stdout).map_err(|e| RenderErr::Other(format!("glow stdout: {}", e)))
+fn terminal_width() -> usize {
+    termimad::terminal_size().0 as usize
 }

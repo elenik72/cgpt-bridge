@@ -136,7 +136,7 @@ Behavior:
   - If `run`, executes the command in shell mode (see §8), capturing stdout, stderr, exit code, duration, and timeout status.
   - Redacts likely secrets and truncates output per `send_output` (see `protocol.md` and `security.md`).
   - Sends a `cgpt-command-result-v1` block back to ChatGPT in the next turn.
-- If `command` is null and `status == final`, prints the final message and exits 0. When `glow` is installed on `PATH` and stdout is a TTY, the final `user_message` is rendered as pretty markdown; otherwise raw markdown is emitted. `--no-pretty` forces the raw path.
+- If `command` is null and `status == final`, prints the final message and exits 0. When stdout is a TTY, the final `user_message` is rendered as pretty markdown via the built-in `termimad` renderer (headers, lists, tables, code blocks, inline emphasis). When stdout is piped or redirected, raw markdown is emitted so downstream consumers get clean text. `--no-pretty` forces the raw path unconditionally.
 - Loops until: `status == final`, user quits, repair fails, policy block, timeout, tab unavailable, or fatal error.
 
 There is **no fixed maximum step count** in interactive mode. Each iteration still requires explicit user confirmation, so the user is the rate limit.
