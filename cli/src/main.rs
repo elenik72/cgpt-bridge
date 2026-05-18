@@ -12,7 +12,7 @@
 use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
 
-use cgpt_bridge_cli::{args, spinner::Phase, transport};
+use cgpt_bridge_cli::{args, clipboard, spinner::Phase, transport};
 use cgpt_bridge_protocol::{AskRequest, BridgeResponse, ErrorCode};
 
 use args::{Cli, Command};
@@ -73,7 +73,7 @@ fn run(cli: Cli) -> ExitKind {
 }
 
 fn run_ask(cmd: args::AskArgs, socket_override: &Option<std::path::PathBuf>) -> ExitKind {
-    let prompt = match collect_prompt(&cmd.prompt) {
+    let prompt = match collect_prompt(&cmd.prompt, cmd.buffer) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -156,19 +156,32 @@ fn map_error_code(code: ErrorCode) -> ExitKind {
     }
 }
 
-/// Combine positional args and stdin into the prompt text. Rules:
-///   - If positional args are given: join with spaces. If stdin is also piped
-///     (not a TTY), append it as `\n\n<stdin>`.
-///   - If only stdin: use it verbatim.
+/// Combine positional args and the secondary source (stdin or clipboard)
+/// into the prompt text. Rules:
+///   - If `--buffer` is set, the secondary source is the OS clipboard and
+///     stdin is left untouched. Otherwise the secondary source is stdin when
+///     piped (non-TTY).
+///   - If positional args are present: join with spaces. If a secondary
+///     source is present, append it as `\n\n<secondary>`.
+///   - If only the secondary source: use it verbatim.
 ///   - If neither: usage error to stderr, exit code 2.
-fn collect_prompt(positional: &[String]) -> Result<String, ExitKind> {
+fn collect_prompt(positional: &[String], buffer: bool) -> Result<String, ExitKind> {
     let positional_text = if positional.is_empty() {
         None
     } else {
         Some(positional.join(" "))
     };
 
-    let stdin_text = if io::stdin().is_terminal() {
+    let secondary = if buffer {
+        match clipboard::read() {
+            Ok(s) if !s.trim().is_empty() => Some(s),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("cgpt: --buffer: failed to read clipboard: {}", e);
+                return Err(ExitKind::Usage);
+            }
+        }
+    } else if io::stdin().is_terminal() {
         None
     } else {
         let mut buf = String::new();
@@ -183,7 +196,7 @@ fn collect_prompt(positional: &[String]) -> Result<String, ExitKind> {
         }
     };
 
-    let combined = match (positional_text, stdin_text) {
+    let combined = match (positional_text, secondary) {
         (Some(a), Some(b)) => format!("{}\n\n{}", a, b),
         (Some(a), None) => a,
         (None, Some(b)) => b,
@@ -193,7 +206,9 @@ fn collect_prompt(positional: &[String]) -> Result<String, ExitKind> {
                  Usage: cgpt ask \"<prompt>\"\n\
                  Or pipe text on stdin, e.g.:\n\
                    echo \"hello\" | cgpt ask\n\
-                   cargo test 2>&1 | cgpt ask \"explain this failure\""
+                   cargo test 2>&1 | cgpt ask \"explain this failure\"\n\
+                 Or read from the OS clipboard:\n\
+                   cgpt ask --buffer"
             );
             return Err(ExitKind::Usage);
         }

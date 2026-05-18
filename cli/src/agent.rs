@@ -36,7 +36,9 @@ use cgpt_bridge_protocol::agent::{
 use cgpt_bridge_protocol::{AskRequest, BridgeResponse};
 
 use crate::args::AgentArgs;
+use crate::clipboard;
 use crate::plan::{new_session_id, PlanStore};
+use crate::render;
 use crate::runner::{prompt_and_run, RunConfig, RunOutcome};
 use crate::spinner::Phase;
 use crate::transport::{ask_once, new_request_id, resolve_socket_path, AskOutcome};
@@ -63,7 +65,7 @@ pub fn run(args: AgentArgs, socket_override: Option<PathBuf>) -> u8 {
         }
     };
 
-    let task = match collect_task(&args.task) {
+    let task = match collect_task(&args.task, args.buffer) {
         Ok(t) => t,
         Err(code) => return code as u8,
     };
@@ -179,8 +181,13 @@ pub fn run(args: AgentArgs, socket_override: Option<PathBuf>) -> u8 {
         if let Err(e) = plan.apply_plan_update(&response.plan_update) {
             eprintln!("cgpt: cannot write plan update: {}", e);
         }
+        let is_final = matches!(response.status, Status::Final);
         if !response.user_message.is_empty() {
-            println!("{}", response.user_message);
+            if is_final && !args.no_pretty {
+                render::print_markdown(&response.user_message);
+            } else {
+                println!("{}", response.user_message);
+            }
         }
 
         match (response.status, response.command.clone()) {
@@ -336,14 +343,23 @@ fn map_host_error(code: cgpt_bridge_protocol::ErrorCode) -> AgentExitKind {
     }
 }
 
-fn collect_task(positional: &[String]) -> Result<String, AgentExitKind> {
+fn collect_task(positional: &[String], buffer: bool) -> Result<String, AgentExitKind> {
     use std::io::IsTerminal;
     let from_args = if positional.is_empty() {
         None
     } else {
         Some(positional.join(" "))
     };
-    let from_stdin = if io::stdin().is_terminal() {
+    let secondary = if buffer {
+        match clipboard::read() {
+            Ok(s) if !s.trim().is_empty() => Some(s),
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("cgpt: --buffer: failed to read clipboard: {}", e);
+                return Err(AgentExitKind::Generic);
+            }
+        }
+    } else if io::stdin().is_terminal() {
         None
     } else {
         let mut buf = String::new();
@@ -357,7 +373,7 @@ fn collect_task(positional: &[String]) -> Result<String, AgentExitKind> {
             Some(buf)
         }
     };
-    let combined = match (from_args, from_stdin) {
+    let combined = match (from_args, secondary) {
         (Some(a), Some(b)) => format!("{}\n\n{}", a, b),
         (Some(a), None) => a,
         (None, Some(b)) => b,
@@ -365,7 +381,8 @@ fn collect_task(positional: &[String]) -> Result<String, AgentExitKind> {
             eprintln!(
                 "cgpt: no task given.\n\
                  Usage: cgpt agent \"<task description>\"\n\
-                 Or pipe a task on stdin."
+                 Or pipe a task on stdin, or read from the OS clipboard:\n\
+                   cgpt agent --buffer"
             );
             return Err(AgentExitKind::Generic);
         }

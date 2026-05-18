@@ -84,6 +84,12 @@ Common flags (all subcommands):
 - `--log-level <level>` — `error|warn|info|debug|trace`. Default `warn`.
 - `--no-color` — disable ANSI colors on stderr.
 - `--json` — machine-readable output on stdout where applicable (post-v0.1 may extend).
+- `--buffer` — for subcommands that take a prompt/task, read it from the OS
+  clipboard instead of arg/stdin. Applies to `cgpt ask` and `cgpt agent`.
+  Implementation shells out to `pbpaste` on macOS and tries
+  `wl-paste` → `xclip` → `xsel` on Linux. When `--buffer` is set, stdin is
+  not consumed even if piped; positional args, if any, are prepended to the
+  clipboard contents as `<args>\n\n<clipboard>`.
 
 ### 5.1 `cgpt ask`
 
@@ -130,7 +136,7 @@ Behavior:
   - If `run`, executes the command in shell mode (see §8), capturing stdout, stderr, exit code, duration, and timeout status.
   - Redacts likely secrets and truncates output per `send_output` (see `protocol.md` and `security.md`).
   - Sends a `cgpt-command-result-v1` block back to ChatGPT in the next turn.
-- If `command` is null and `status == final`, prints the final message and exits 0.
+- If `command` is null and `status == final`, prints the final message and exits 0. When `glow` is installed on `PATH` and stdout is a TTY, the final `user_message` is rendered as pretty markdown; otherwise raw markdown is emitted. `--no-pretty` forces the raw path.
 - Loops until: `status == final`, user quits, repair fails, policy block, timeout, tab unavailable, or fatal error.
 
 There is **no fixed maximum step count** in interactive mode. Each iteration still requires explicit user confirmation, so the user is the rate limit.

@@ -48,6 +48,13 @@ pub struct AskArgs {
     /// and the time the assistant takes to stabilize its response.
     #[arg(long = "timeout-ms", default_value_t = 120_000)]
     pub timeout_ms: u64,
+
+    /// Read the prompt from the OS clipboard instead of arg/stdin. When set,
+    /// stdin is not consumed even if piped. Positional args, if any, are
+    /// prepended to the clipboard contents as: `<args>\n\n<clipboard>`.
+    /// Uses `pbpaste` on macOS and `wl-paste`/`xclip`/`xsel` on Linux.
+    #[arg(long = "buffer", default_value_t = false)]
+    pub buffer: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -71,6 +78,21 @@ pub struct AgentArgs {
     /// sandboxes / disposable VMs. Implies `--auto-readonly`.
     #[arg(long = "yolo", default_value_t = false)]
     pub yolo: bool,
+
+    /// Read the task from the OS clipboard instead of arg/stdin. When set,
+    /// stdin is not consumed even if piped. Positional args, if any, are
+    /// prepended to the clipboard contents as: `<args>\n\n<clipboard>`.
+    /// Uses `pbpaste` on macOS and `wl-paste`/`xclip`/`xsel` on Linux.
+    #[arg(long = "buffer", default_value_t = false)]
+    pub buffer: bool,
+
+    /// Disable rendering the final assistant message through `glow`. By
+    /// default, when stdout is a TTY and `glow` is on PATH, the final
+    /// markdown is pretty-printed. With this flag the raw markdown is
+    /// emitted verbatim. Note: piped/redirected stdout already disables
+    /// rendering automatically.
+    #[arg(long = "no-pretty", default_value_t = false)]
+    pub no_pretty: bool,
 }
 
 pub fn parse() -> Result<Cli, clap::Error> {
@@ -139,6 +161,34 @@ mod tests {
             Command::Agent(a) => {
                 assert_eq!(a.task, vec!["diagnose", "tests"]);
                 assert_eq!(a.timeout_ms, 120_000);
+                assert!(!a.buffer);
+                assert!(!a.no_pretty);
+            }
+            Command::Ask(_) => panic!("expected Agent"),
+        }
+    }
+
+    #[test]
+    fn ask_buffer_flag_parses_without_prompt() {
+        let cli = Cli::try_parse_from(["cgpt", "ask", "--buffer"]).unwrap();
+        match cli.command {
+            Command::Ask(a) => {
+                assert!(a.buffer);
+                assert!(a.prompt.is_empty());
+            }
+            Command::Agent(_) => panic!("expected Ask"),
+        }
+    }
+
+    #[test]
+    fn agent_buffer_and_no_pretty_parse() {
+        let cli =
+            Cli::try_parse_from(["cgpt", "agent", "--buffer", "--no-pretty", "lead"]).unwrap();
+        match cli.command {
+            Command::Agent(a) => {
+                assert!(a.buffer);
+                assert!(a.no_pretty);
+                assert_eq!(a.task, vec!["lead"]);
             }
             Command::Ask(_) => panic!("expected Agent"),
         }

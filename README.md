@@ -55,6 +55,20 @@ The only third-party software you need on the target machine is **Google
 Chrome** (or Chromium). All Rust / Node toolchains are baked into the
 prebuilt bundle.
 
+Optional runtime extras (no install blocker — `cgpt` falls back gracefully):
+
+- **`glow`** — used to pretty-print the final assistant message of a
+  `cgpt agent` run when stdout is a TTY. Without it, the raw markdown is
+  printed and a one-line install hint is emitted on stderr.
+  - macOS: `brew install glow`
+  - Linux: `sudo apt install glow` (Debian/Ubuntu) /
+    `sudo pacman -S glow` (Arch) / see
+    [charmbracelet/glow](https://github.com/charmbracelet/glow#installation)
+    for other distros.
+- **Clipboard reader** — only needed if you use `--buffer`. macOS ships
+  `pbpaste` by default. On Linux install one of `wl-clipboard` (Wayland,
+  provides `wl-paste`), `xclip`, or `xsel`.
+
 Two artifact formats — pick one:
 
 **Option A — `.dmg` (macOS, GUI-friendly)**
@@ -173,6 +187,20 @@ Run an interactive agent loop where ChatGPT proposes commands you approve one at
 ```sh
 cgpt agent "diagnose failing tests"
 ```
+
+Pass the task via the OS clipboard (no typing, no piping):
+
+```sh
+# copy a long task description to the clipboard, then:
+cgpt agent --buffer
+# ...or prepend a short lead-in:
+cgpt agent --buffer "fix this:"
+```
+
+`--buffer` also works for `cgpt ask`. When the final agent message arrives,
+it is rendered through `glow` if installed (pretty markdown in your terminal);
+otherwise the raw markdown is printed. Use `--no-pretty` to force the raw
+path.
 
 Check that your install is healthy:
 

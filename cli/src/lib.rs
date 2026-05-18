@@ -6,9 +6,11 @@
 
 pub mod agent;
 pub mod args;
+pub mod clipboard;
 pub mod denylist;
 pub mod plan;
 pub mod redact;
+pub mod render;
 pub mod runner;
 pub mod spinner;
 pub mod transport;
