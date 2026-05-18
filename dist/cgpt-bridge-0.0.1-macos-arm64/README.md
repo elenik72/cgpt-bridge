@@ -62,7 +62,9 @@ Optional runtime extras (no install blocker — `cgpt` falls back gracefully):
   provides `wl-paste`), `xclip`, or `xsel`.
 
 Pretty markdown rendering of the final agent message is built in via
-`termimad` — no external binary required.
+`termimad` + `syntect` — no external binary required. Code blocks inside
+the final message are syntax-highlighted from the fence info string
+(```` ```rust ````, ```` ```sh ````, etc.).
 
 Two artifact formats — pick one:
 
@@ -192,11 +194,43 @@ cgpt agent --buffer
 cgpt agent --buffer "fix this:"
 ```
 
-`--buffer` also works for `cgpt ask`. When the final agent message arrives
-and stdout is a TTY, it is rendered as pretty markdown via the built-in
-`termimad` skin (headers, lists, tables, code blocks). When stdout is piped
-or redirected, raw markdown is emitted automatically. Use `--no-pretty` to
-force the raw path even on a TTY.
+Compose a longer prompt in your editor (uses `$EDITOR`, falls back to `vi`
+then `nano`):
+
+```sh
+cgpt ask --editor
+cgpt agent --editor
+```
+
+Continue the last agent session in this project (skips re-sending the
+prompt contract — ChatGPT already has the context in its tab):
+
+```sh
+cgpt agent -c "follow-up question"
+cgpt agent --resume s19e3c30c179_151c2 "another follow-up"
+```
+
+Browse and replay past sessions offline (no ChatGPT round-trip):
+
+```sh
+cgpt history               # list sessions, newest first
+cgpt last                  # re-render the latest final message
+cgpt last --copy           # ...and copy it to the clipboard
+cgpt replay <session-id>
+```
+
+Copy the final assistant message to the clipboard as part of any run:
+
+```sh
+cgpt ask "summarise X" --copy
+cgpt agent "produce a report" --copy
+```
+
+`--buffer`/`--editor`/`--copy` work for both `ask` and `agent`. When the
+final agent message arrives and stdout is a TTY, it is rendered as pretty
+markdown via the built-in `termimad` + `syntect` pipeline. When stdout is
+piped or redirected, raw markdown is emitted automatically. Use
+`--no-pretty` to force the raw path even on a TTY.
 
 Check that your install is healthy:
 
@@ -268,6 +302,10 @@ Windows, other Chromium browsers, and Firefox are out of scope for v0.1 (see `do
 - [x] macOS and Linux native-host install scripts
 - [x] Release bundler (`scripts/build-release.sh`) and macOS `.dmg` builder (`scripts/build-dmg.sh`)
 - [x] Pinned extension id via the manifest `key` field — installs no longer require copying the id from `chrome://extensions`
+- [x] In-process markdown rendering of final agent message (`termimad` + `syntect` syntax-highlighted fenced blocks)
+- [x] Convenience flags: `--buffer`, `--editor`, `--copy`, `--no-pretty`
+- [x] Session continuity: `--continue`/`-c`, `--resume <id>`
+- [x] Offline subcommands: `cgpt history`, `cgpt replay`, `cgpt last`
 - [ ] `cgpt doctor` (M10) — see `plans/roadmap-remaining.md`
 - [ ] Full end-to-end v0.1 hardening across CLI, host, extension, and active ChatGPT tab
 

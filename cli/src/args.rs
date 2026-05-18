@@ -36,6 +36,17 @@ pub enum Command {
     /// Hand a task to ChatGPT and let it propose shell commands one at a
     /// time, each gated by an interactive confirmation. See `docs/protocol.md`.
     Agent(AgentArgs),
+
+    /// List past agent sessions stored under `.cgpt-bridge/runs/`.
+    History(HistoryArgs),
+
+    /// Re-render the final markdown of a stored session without contacting
+    /// ChatGPT. Pass a session id from `cgpt history`.
+    Replay(ReplayArgs),
+
+    /// Shortcut for `cgpt replay <latest>`. Re-renders the most recent
+    /// session's final message.
+    Last(LastArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -55,6 +66,18 @@ pub struct AskArgs {
     /// Uses `pbpaste` on macOS and `wl-paste`/`xclip`/`xsel` on Linux.
     #[arg(long = "buffer", default_value_t = false)]
     pub buffer: bool,
+
+    /// Open `$EDITOR` (fallback: `vi`, then `nano`) on a tmpfile to compose
+    /// the prompt. The tmpfile is pre-populated with whatever combination
+    /// of positional args / stdin / `--buffer` would have produced, so the
+    /// flag also acts as a "review before send" gate.
+    #[arg(long = "editor", default_value_t = false)]
+    pub editor: bool,
+
+    /// After printing, also copy the assistant response to the OS clipboard
+    /// via `pbcopy` (macOS) / `wl-copy`/`xclip`/`xsel` (Linux).
+    #[arg(long = "copy", default_value_t = false)]
+    pub copy: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -94,6 +117,60 @@ pub struct AgentArgs {
     /// rendering automatically.
     #[arg(long = "no-pretty", default_value_t = false)]
     pub no_pretty: bool,
+
+    /// Open `$EDITOR` (fallback: `vi`, then `nano`) on a tmpfile to compose
+    /// the task. Pre-populated with the combined positional args / stdin /
+    /// clipboard, mirroring `cgpt ask --editor`.
+    #[arg(long = "editor", default_value_t = false)]
+    pub editor: bool,
+
+    /// After the final message is printed, also copy it to the OS clipboard.
+    #[arg(long = "copy", default_value_t = false)]
+    pub copy: bool,
+
+    /// Continue the most recent agent session in this project: reuse its
+    /// `session_id`, skip the prompt contract preamble (ChatGPT already has
+    /// the context in its tab), and append further turns to the same
+    /// `plan.jsonl` + `runs/<id>/`. Equivalent to `--resume $(cgpt last)`.
+    #[arg(long = "continue", short = 'c', default_value_t = false)]
+    pub continue_session: bool,
+
+    /// Continue a specific session by id. Mutually exclusive with
+    /// `--continue`. The session id is the one shown by `cgpt history`.
+    #[arg(long = "resume", value_name = "SESSION_ID", conflicts_with = "continue_session")]
+    pub resume: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct HistoryArgs {
+    /// Maximum number of past sessions to print. Newest first.
+    #[arg(long = "limit", default_value_t = 20)]
+    pub limit: usize,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ReplayArgs {
+    /// Session id to render. Use `cgpt history` to list available ids.
+    pub session_id: String,
+
+    /// Disable termimad rendering and print the raw final markdown.
+    #[arg(long = "no-pretty", default_value_t = false)]
+    pub no_pretty: bool,
+
+    /// After printing, also copy the rendered content to the OS clipboard.
+    #[arg(long = "copy", default_value_t = false)]
+    pub copy: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct LastArgs {
+    /// Disable termimad rendering and print the raw final markdown.
+    #[arg(long = "no-pretty", default_value_t = false)]
+    pub no_pretty: bool,
+
+    /// After printing, also copy the rendered content to the OS clipboard.
+    #[arg(long = "copy", default_value_t = false)]
+    pub copy: bool,
 }
 
 pub fn parse() -> Result<Cli, clap::Error> {
@@ -113,7 +190,7 @@ mod tests {
                 assert_eq!(a.prompt, vec!["hello", "world"]);
                 assert_eq!(a.timeout_ms, 120_000);
             }
-            Command::Agent(_) => panic!("expected Ask"),
+            _ => panic!("expected Ask"),
         }
     }
 
@@ -125,7 +202,7 @@ mod tests {
                 assert_eq!(a.timeout_ms, 5000);
                 assert_eq!(a.prompt, vec!["hi"]);
             }
-            Command::Agent(_) => panic!("expected Ask"),
+            _ => panic!("expected Ask"),
         }
     }
 
@@ -145,7 +222,7 @@ mod tests {
         let cli = Cli::try_parse_from(["cgpt", "ask"]).unwrap();
         match cli.command {
             Command::Ask(a) => assert!(a.prompt.is_empty()),
-            Command::Agent(_) => panic!("expected Ask"),
+            _ => panic!("expected Ask"),
         }
     }
 
@@ -165,7 +242,7 @@ mod tests {
                 assert!(!a.buffer);
                 assert!(!a.no_pretty);
             }
-            Command::Ask(_) => panic!("expected Agent"),
+            _ => panic!("expected Agent"),
         }
     }
 
@@ -177,7 +254,7 @@ mod tests {
                 assert!(a.buffer);
                 assert!(a.prompt.is_empty());
             }
-            Command::Agent(_) => panic!("expected Ask"),
+            _ => panic!("expected Ask"),
         }
     }
 
@@ -191,7 +268,77 @@ mod tests {
                 assert!(a.no_pretty);
                 assert_eq!(a.task, vec!["lead"]);
             }
-            Command::Ask(_) => panic!("expected Agent"),
+            _ => panic!("expected Agent"),
+        }
+    }
+
+    #[test]
+    fn history_subcommand_parses() {
+        let cli = Cli::try_parse_from(["cgpt", "history", "--limit", "5"]).unwrap();
+        match cli.command {
+            Command::History(h) => assert_eq!(h.limit, 5),
+            _ => panic!("expected History"),
+        }
+    }
+
+    #[test]
+    fn replay_subcommand_parses() {
+        let cli = Cli::try_parse_from(["cgpt", "replay", "s123", "--copy"]).unwrap();
+        match cli.command {
+            Command::Replay(r) => {
+                assert_eq!(r.session_id, "s123");
+                assert!(r.copy);
+            }
+            _ => panic!("expected Replay"),
+        }
+    }
+
+    #[test]
+    fn last_subcommand_parses() {
+        let cli = Cli::try_parse_from(["cgpt", "last", "--no-pretty"]).unwrap();
+        match cli.command {
+            Command::Last(l) => assert!(l.no_pretty),
+            _ => panic!("expected Last"),
+        }
+    }
+
+    #[test]
+    fn agent_continue_short_flag() {
+        let cli = Cli::try_parse_from(["cgpt", "agent", "-c", "follow-up"]).unwrap();
+        match cli.command {
+            Command::Agent(a) => {
+                assert!(a.continue_session);
+                assert!(a.resume.is_none());
+            }
+            _ => panic!("expected Agent"),
+        }
+    }
+
+    #[test]
+    fn agent_resume_with_id() {
+        let cli = Cli::try_parse_from(["cgpt", "agent", "--resume", "abc", "x"]).unwrap();
+        match cli.command {
+            Command::Agent(a) => assert_eq!(a.resume.as_deref(), Some("abc")),
+            _ => panic!("expected Agent"),
+        }
+    }
+
+    #[test]
+    fn continue_and_resume_are_mutually_exclusive() {
+        let r =
+            Cli::try_parse_from(["cgpt", "agent", "--continue", "--resume", "abc", "x"]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn ask_copy_and_editor_flags() {
+        let cli = Cli::try_parse_from(["cgpt", "ask", "--editor", "--copy"]).unwrap();
+        match cli.command {
+            Command::Ask(a) => {
+                assert!(a.editor);
+                assert!(a.copy);
+            }
+            _ => panic!("expected Ask"),
         }
     }
 }

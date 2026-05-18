@@ -72,11 +72,15 @@ Windows, Brave, Edge, Chromium forks, and Firefox are out of scope for v0.1 but 
 
 ## 5. User-facing commands
 
-The CLI is named `cgpt`. v0.1 ships three subcommands:
+The CLI is named `cgpt`. v0.1 ships these subcommands:
 
 - `cgpt ask` — single-shot prompt/response.
 - `cgpt agent` — interactive agent loop with confirmed command execution.
 - `cgpt doctor` — health and connectivity diagnostics.
+- `cgpt history` — list past agent sessions from `.cgpt-bridge/runs/`.
+- `cgpt replay <session-id>` — re-render the final markdown of a stored
+  session without contacting ChatGPT.
+- `cgpt last` — shortcut for `cgpt replay <most-recent-session>`.
 
 Common flags (all subcommands):
 
@@ -90,6 +94,14 @@ Common flags (all subcommands):
   `wl-paste` → `xclip` → `xsel` on Linux. When `--buffer` is set, stdin is
   not consumed even if piped; positional args, if any, are prepended to the
   clipboard contents as `<args>\n\n<clipboard>`.
+- `--editor` — open `$EDITOR` (fallback `vi`, then `nano`) on a tmpfile
+  pre-populated with whatever the combination of positional args / stdin /
+  `--buffer` would have produced. The user's saved buffer becomes the final
+  prompt/task. Applies to `cgpt ask` and `cgpt agent`.
+- `--copy` — after printing the final assistant message (or the response in
+  `cgpt ask` / the rendered final in `cgpt replay`, `cgpt last`), copy the
+  same text to the OS clipboard via `pbcopy` / `wl-copy` / `xclip` /
+  `xsel`.
 
 ### 5.1 `cgpt ask`
 
@@ -136,7 +148,17 @@ Behavior:
   - If `run`, executes the command in shell mode (see §8), capturing stdout, stderr, exit code, duration, and timeout status.
   - Redacts likely secrets and truncates output per `send_output` (see `protocol.md` and `security.md`).
   - Sends a `cgpt-command-result-v1` block back to ChatGPT in the next turn.
-- If `command` is null and `status == final`, prints the final message and exits 0. When stdout is a TTY, the final `user_message` is rendered as pretty markdown via the built-in `termimad` renderer (headers, lists, tables, code blocks, inline emphasis). When stdout is piped or redirected, raw markdown is emitted so downstream consumers get clean text. `--no-pretty` forces the raw path unconditionally.
+- If `command` is null and `status == final`, prints the final message and exits 0. When stdout is a TTY, the final `user_message` is rendered as pretty markdown via the built-in `termimad` renderer (headers, lists, tables, inline emphasis). Fenced code blocks inside the final message are passed through `syntect` so the code is syntax-highlighted (the info string after the opening fence — e.g. ```` ```rust ```` — chooses the syntax; unknown/missing falls back to plain). When stdout is piped or redirected, raw markdown is emitted so downstream consumers get clean text. `--no-pretty` forces the raw path unconditionally.
+- The final `user_message` is additionally archived to
+  `.cgpt-bridge/runs/<session-id>/final.md`, and each session writes a
+  `meta.json` describing the task and start time, so
+  `cgpt history` / `cgpt replay` / `cgpt last` can enumerate and re-render
+  past sessions without contacting ChatGPT.
+- `--continue` / `-c` reuses the most recent session's id, skips the
+  prompt-contract preamble (ChatGPT already has it in the tab's context),
+  and appends new turns to the same `plan.jsonl` and `runs/<id>/` dir.
+  `--resume <session-id>` is the explicit-id variant; the two are mutually
+  exclusive.
 - Loops until: `status == final`, user quits, repair fails, policy block, timeout, tab unavailable, or fatal error.
 
 There is **no fixed maximum step count** in interactive mode. Each iteration still requires explicit user confirmation, so the user is the rate limit.

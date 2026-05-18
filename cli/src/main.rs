@@ -12,7 +12,7 @@
 use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
 
-use cgpt_bridge_cli::{args, clipboard, spinner::Phase, transport};
+use cgpt_bridge_cli::{args, clipboard, editor, history, spinner::Phase, transport};
 use cgpt_bridge_protocol::{AskRequest, BridgeResponse, ErrorCode};
 
 use args::{Cli, Command};
@@ -69,11 +69,14 @@ fn run(cli: Cli) -> ExitKind {
             // agent loop's chosen code; ExitKind only models the ask path.
             std::process::exit(code as i32);
         }
+        Command::History(h) => std::process::exit(history::run_history(h) as i32),
+        Command::Replay(r) => std::process::exit(history::run_replay(r) as i32),
+        Command::Last(l) => std::process::exit(history::run_last(l) as i32),
     }
 }
 
 fn run_ask(cmd: args::AskArgs, socket_override: &Option<std::path::PathBuf>) -> ExitKind {
-    let prompt = match collect_prompt(&cmd.prompt, cmd.buffer) {
+    let prompt = match collect_prompt(&cmd.prompt, cmd.buffer, cmd.editor) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -103,6 +106,11 @@ fn run_ask(cmd: args::AskArgs, socket_override: &Option<std::path::PathBuf>) -> 
             print!("{}", text);
             if !text.ends_with('\n') {
                 println!();
+            }
+            if cmd.copy {
+                if let Err(e) = clipboard::write(&text) {
+                    eprintln!("cgpt: --copy: clipboard write failed: {}", e);
+                }
             }
             ExitKind::Ok
         }
@@ -156,16 +164,19 @@ fn map_error_code(code: ErrorCode) -> ExitKind {
     }
 }
 
-/// Combine positional args and the secondary source (stdin or clipboard)
-/// into the prompt text. Rules:
-///   - If `--buffer` is set, the secondary source is the OS clipboard and
-///     stdin is left untouched. Otherwise the secondary source is stdin when
-///     piped (non-TTY).
-///   - If positional args are present: join with spaces. If a secondary
-///     source is present, append it as `\n\n<secondary>`.
-///   - If only the secondary source: use it verbatim.
-///   - If neither: usage error to stderr, exit code 2.
-fn collect_prompt(positional: &[String], buffer: bool) -> Result<String, ExitKind> {
+/// Combine positional args, optional secondary input source, and optional
+/// editor pass into the prompt text. Source resolution:
+///   - `--buffer`  : secondary is the OS clipboard, stdin untouched.
+///   - otherwise   : secondary is stdin when piped (non-TTY).
+///   - `--editor`  : the combined prompt is fed to `$EDITOR` as an initial
+///                   template; the user's final saved buffer wins.
+///
+/// If after all of the above the result is empty, exit code 2.
+fn collect_prompt(
+    positional: &[String],
+    buffer: bool,
+    editor_flag: bool,
+) -> Result<String, ExitKind> {
     let positional_text = if positional.is_empty() {
         None
     } else {
@@ -196,23 +207,36 @@ fn collect_prompt(positional: &[String], buffer: bool) -> Result<String, ExitKin
         }
     };
 
-    let combined = match (positional_text, secondary) {
+    let mut combined = match (positional_text, secondary) {
         (Some(a), Some(b)) => format!("{}\n\n{}", a, b),
         (Some(a), None) => a,
         (None, Some(b)) => b,
-        (None, None) => {
-            eprintln!(
-                "cgpt: no prompt given.\n\
-                 Usage: cgpt ask \"<prompt>\"\n\
-                 Or pipe text on stdin, e.g.:\n\
-                   echo \"hello\" | cgpt ask\n\
-                   cargo test 2>&1 | cgpt ask \"explain this failure\"\n\
-                 Or read from the OS clipboard:\n\
-                   cgpt ask --buffer"
-            );
-            return Err(ExitKind::Usage);
-        }
+        (None, None) => String::new(),
     };
+
+    if editor_flag {
+        combined = match editor::capture(&combined) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cgpt: --editor: {}", e);
+                return Err(ExitKind::Generic);
+            }
+        };
+    }
+
+    if combined.trim().is_empty() {
+        eprintln!(
+            "cgpt: no prompt given.\n\
+             Usage: cgpt ask \"<prompt>\"\n\
+             Or pipe text on stdin, e.g.:\n\
+               echo \"hello\" | cgpt ask\n\
+               cargo test 2>&1 | cgpt ask \"explain this failure\"\n\
+             Or read from the OS clipboard / open editor:\n\
+               cgpt ask --buffer\n\
+               cgpt ask --editor"
+        );
+        return Err(ExitKind::Usage);
+    }
 
     Ok(combined)
 }

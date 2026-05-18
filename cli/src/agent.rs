@@ -37,6 +37,7 @@ use cgpt_bridge_protocol::{AskRequest, BridgeResponse};
 
 use crate::args::AgentArgs;
 use crate::clipboard;
+use crate::editor;
 use crate::plan::{new_session_id, PlanStore};
 use crate::render;
 use crate::runner::{prompt_and_run, RunConfig, RunOutcome};
@@ -65,23 +66,55 @@ pub fn run(args: AgentArgs, socket_override: Option<PathBuf>) -> u8 {
         }
     };
 
-    let task = match collect_task(&args.task, args.buffer) {
+    let task = match collect_task(&args.task, args.buffer, args.editor) {
         Ok(t) => t,
         Err(code) => return code as u8,
     };
 
-    let session_id = new_session_id();
-    let plan = match PlanStore::open(&project_root, session_id.clone(), &task) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("cgpt: cannot initialise .cgpt-bridge/: {}", e);
-            return AgentExitKind::Setup as u8;
+    // Resolve session id and decide whether to skip the prompt contract.
+    // Priority: --resume <id>  > --continue  > fresh session.
+    let resume_id: Option<String> = if let Some(id) = args.resume.clone() {
+        Some(id)
+    } else if args.continue_session {
+        match PlanStore::latest_session_id(&project_root) {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => {
+                eprintln!(
+                    "cgpt: --continue: no prior session found in {}",
+                    project_root.display()
+                );
+                return AgentExitKind::Setup as u8;
+            }
+            Err(e) => {
+                eprintln!("cgpt: --continue: cannot read sessions: {}", e);
+                return AgentExitKind::Setup as u8;
+            }
         }
+    } else {
+        None
+    };
+
+    let (plan, resuming) = match &resume_id {
+        Some(id) => match PlanStore::open_existing(&project_root, id.clone()) {
+            Ok(p) => (p, true),
+            Err(e) => {
+                eprintln!("cgpt: cannot resume session `{}`: {}", id, e);
+                return AgentExitKind::Setup as u8;
+            }
+        },
+        None => match PlanStore::open(&project_root, new_session_id(), &task) {
+            Ok(p) => (p, false),
+            Err(e) => {
+                eprintln!("cgpt: cannot initialise .cgpt-bridge/: {}", e);
+                return AgentExitKind::Setup as u8;
+            }
+        },
     };
     eprintln!(
-        "cgpt: agent session {} (project {})",
+        "cgpt: agent session {} (project {}){}",
         plan.session_id(),
-        project_root.display()
+        project_root.display(),
+        if resuming { " — resuming" } else { "" }
     );
     if args.yolo {
         eprintln!(
@@ -102,8 +135,15 @@ pub fn run(args: AgentArgs, socket_override: Option<PathBuf>) -> u8 {
         }
     };
 
-    // First turn: prepend the prompt contract.
-    let mut next_prompt = format!("{}\n\n{}", AGENT_PROMPT_CONTRACT, task);
+    // First turn: prepend the prompt contract on fresh sessions only. On
+    // --continue / --resume the active ChatGPT tab still has the contract
+    // in its conversation context, so repeating it would just burn tokens
+    // and confuse the model.
+    let mut next_prompt = if resuming {
+        task.clone()
+    } else {
+        format!("{}\n\n{}", AGENT_PROMPT_CONTRACT, task)
+    };
     let mut turn_index = 0u32;
     // What we are sending this turn — used purely for the user-visible
     // progress phase label. "initial task" on turn 1; flipped to
@@ -194,6 +234,11 @@ pub fn run(args: AgentArgs, socket_override: Option<PathBuf>) -> u8 {
             (Status::Final, _) => {
                 let _ = plan.record_final(&response);
                 let _ = plan.update_session_status("final");
+                if args.copy && !response.user_message.is_empty() {
+                    if let Err(e) = clipboard::write(&response.user_message) {
+                        eprintln!("cgpt: --copy: clipboard write failed: {}", e);
+                    }
+                }
                 return AgentExitKind::Ok as u8;
             }
             (Status::Blocked, _) => {
@@ -343,7 +388,11 @@ fn map_host_error(code: cgpt_bridge_protocol::ErrorCode) -> AgentExitKind {
     }
 }
 
-fn collect_task(positional: &[String], buffer: bool) -> Result<String, AgentExitKind> {
+fn collect_task(
+    positional: &[String],
+    buffer: bool,
+    editor_flag: bool,
+) -> Result<String, AgentExitKind> {
     use std::io::IsTerminal;
     let from_args = if positional.is_empty() {
         None
@@ -373,20 +422,32 @@ fn collect_task(positional: &[String], buffer: bool) -> Result<String, AgentExit
             Some(buf)
         }
     };
-    let combined = match (from_args, secondary) {
+    let mut combined = match (from_args, secondary) {
         (Some(a), Some(b)) => format!("{}\n\n{}", a, b),
         (Some(a), None) => a,
         (None, Some(b)) => b,
-        (None, None) => {
-            eprintln!(
-                "cgpt: no task given.\n\
-                 Usage: cgpt agent \"<task description>\"\n\
-                 Or pipe a task on stdin, or read from the OS clipboard:\n\
-                   cgpt agent --buffer"
-            );
-            return Err(AgentExitKind::Generic);
-        }
+        (None, None) => String::new(),
     };
+    if editor_flag {
+        combined = match editor::capture(&combined) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cgpt: --editor: {}", e);
+                return Err(AgentExitKind::Generic);
+            }
+        };
+    }
+    if combined.trim().is_empty() {
+        eprintln!(
+            "cgpt: no task given.\n\
+             Usage: cgpt agent \"<task description>\"\n\
+             Or pipe a task on stdin, or read from the OS clipboard, or compose in $EDITOR:\n\
+               cgpt agent --buffer\n\
+               cgpt agent --editor\n\
+               cgpt agent --continue \"follow-up question\""
+        );
+        return Err(AgentExitKind::Generic);
+    }
     Ok(combined)
 }
 

@@ -6,7 +6,7 @@
 //! clipboard tool already installed (preinstalled on macOS; one apt/pacman
 //! install on Linux).
 
-use std::io;
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
 /// Try the platform's standard clipboard reader. Returns the captured
@@ -24,6 +24,59 @@ pub fn read() -> io::Result<String> {
         io::ErrorKind::NotFound,
         platform_install_hint(),
     ))
+}
+
+/// Write `text` to the OS clipboard. Symmetric to `read()`: shells out to
+/// `pbcopy` (macOS) or `wl-copy`/`xclip`/`xsel` (Linux).
+pub fn write(text: &str) -> io::Result<()> {
+    for (bin, args) in write_candidates() {
+        match try_write(bin, args, text) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        platform_install_hint(),
+    ))
+}
+
+fn try_write(bin: &str, args: &[&str], text: &str) -> io::Result<()> {
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    drop(child.stdin.take());
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(io::Error::other(format!("{} exited {}", bin, status)));
+    }
+    Ok(())
+}
+
+fn write_candidates() -> &'static [(&'static str, &'static [&'static str])] {
+    #[cfg(target_os = "macos")]
+    {
+        &[("pbcopy", &[])]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        &[]
+    }
 }
 
 fn candidates() -> &'static [(&'static str, &'static [&'static str])] {

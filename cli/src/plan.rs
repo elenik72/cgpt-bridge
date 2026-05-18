@@ -108,6 +108,28 @@ pub struct SessionMetadata {
     pub status: String,
 }
 
+/// Static per-session metadata. Written once when the session opens and
+/// then read by `cgpt history` / `cgpt replay` / `cgpt last` to enumerate
+/// past runs without scanning the project-wide `plan.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMeta {
+    pub session_id: String,
+    pub started_at_unix_ms: u64,
+    pub cwd: String,
+    pub task: String,
+}
+
+/// Public view of a past session for listing UIs.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub started_at_unix_ms: u64,
+    pub task: String,
+    pub cwd: String,
+    /// True if a `final.md` file is present in the run dir.
+    pub has_final: bool,
+}
+
 pub struct PlanStore {
     root: PathBuf,
     plan_jsonl: PathBuf,
@@ -150,15 +172,114 @@ impl PlanStore {
             at_unix_ms: now,
         })?;
         store.write_session_metadata(&SessionMetadata {
-            session_id,
+            session_id: session_id.clone(),
             started_at_unix_ms: now,
             cwd: project_root.display().to_string(),
             task_summary: task.to_string(),
             last_turn_at_unix_ms: now,
             status: "active".into(),
         })?;
+        let meta = SessionMeta {
+            session_id,
+            started_at_unix_ms: now,
+            cwd: project_root.display().to_string(),
+            task: task.to_string(),
+        };
+        write_atomic(
+            &store.runs_dir.join("meta.json"),
+            serde_json::to_vec_pretty(&meta).unwrap().as_slice(),
+        )?;
         store.regenerate_plan_md()?;
         Ok(store)
+    }
+
+    /// Re-open an existing session for `--continue`. Does not append a
+    /// SessionStarted entry — the original run already did. Used to keep
+    /// `plan.jsonl` and `runs/<id>/` growing for the same session id.
+    pub fn open_existing(project_root: &Path, session_id: String) -> io::Result<Self> {
+        let root = project_root.join(DEFAULT_DIR_NAME);
+        let runs_dir = root.join("runs").join(&session_id);
+        if !runs_dir.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("session not found: {}", session_id),
+            ));
+        }
+        let store = PlanStore {
+            plan_jsonl: root.join("plan.jsonl"),
+            plan_md: root.join("plan.md"),
+            session_json: root.join("session.json"),
+            logs_dir: root.join("logs"),
+            runs_dir,
+            root,
+            session_id,
+        };
+        Ok(store)
+    }
+
+    /// Enumerate past sessions, newest first. Sessions without a
+    /// `runs/<id>/meta.json` (older format) are still returned with empty
+    /// task/cwd so the user can still see them in `cgpt history`.
+    pub fn list_sessions(project_root: &Path) -> io::Result<Vec<SessionSummary>> {
+        let runs = project_root.join(DEFAULT_DIR_NAME).join("runs");
+        if !runs.is_dir() {
+            return Ok(vec![]);
+        }
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&runs)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let session_id = entry.file_name().to_string_lossy().to_string();
+            let dir = entry.path();
+            let meta: Option<SessionMeta> = fs::read(dir.join("meta.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok());
+            let has_final = dir.join("final.md").is_file();
+            let (started, task, cwd) = match meta {
+                Some(m) => (m.started_at_unix_ms, m.task, m.cwd),
+                None => {
+                    // Fallback: use directory mtime so list_sessions still
+                    // sorts something useful for pre-meta runs.
+                    let started = entry
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    (started, String::new(), String::new())
+                }
+            };
+            out.push(SessionSummary {
+                session_id,
+                started_at_unix_ms: started,
+                task,
+                cwd,
+                has_final,
+            });
+        }
+        out.sort_by(|a, b| b.started_at_unix_ms.cmp(&a.started_at_unix_ms));
+        Ok(out)
+    }
+
+    /// Read the archived final markdown for a given session, if any.
+    pub fn read_final_markdown(project_root: &Path, session_id: &str) -> io::Result<String> {
+        let p = project_root
+            .join(DEFAULT_DIR_NAME)
+            .join("runs")
+            .join(session_id)
+            .join("final.md");
+        fs::read_to_string(&p)
+    }
+
+    /// Convenience: id of the most recent session, if any.
+    pub fn latest_session_id(project_root: &Path) -> io::Result<Option<String>> {
+        Ok(Self::list_sessions(project_root)?
+            .into_iter()
+            .next()
+            .map(|s| s.session_id))
     }
 
     pub fn session_id(&self) -> &str {
@@ -248,12 +369,19 @@ impl PlanStore {
     }
 
     /// On `status: final`, archive the final assistant message text.
+    /// Writes both the per-event `Final` entry to `plan.jsonl` *and* a
+    /// `runs/<id>/final.md` copy so `cgpt replay`/`cgpt last` can render
+    /// the message later without re-scanning the project-wide event log.
     pub fn record_final(&self, response: &AgentResponseV1) -> io::Result<()> {
         if matches!(response.status, Status::Final) {
             self.append_entry(&PlanEntry::Final {
                 text: response.user_message.clone(),
                 at_unix_ms: now_ms(),
             })?;
+            write_atomic(
+                &self.runs_dir.join("final.md"),
+                response.user_message.as_bytes(),
+            )?;
         }
         Ok(())
     }

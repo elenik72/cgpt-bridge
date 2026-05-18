@@ -8,6 +8,8 @@ pub mod agent;
 pub mod args;
 pub mod clipboard;
 pub mod denylist;
+pub mod editor;
+pub mod history;
 pub mod plan;
 pub mod redact;
 pub mod render;
