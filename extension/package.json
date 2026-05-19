@@ -9,8 +9,9 @@
     "typecheck": "tsc --noEmit",
     "build:background": "cross-env ENTRY=background vite build",
     "build:content": "cross-env ENTRY=content vite build",
+    "build:pageShim": "cross-env ENTRY=pageShim vite build",
     "copy:manifest": "node scripts/copy-manifest.mjs",
-    "build": "npm run clean && npm run build:background && npm run build:content && npm run copy:manifest"
+    "build": "npm run clean && npm run build:background && npm run build:content && npm run build:pageShim && npm run copy:manifest"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.270",

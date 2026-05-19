@@ -533,20 +533,60 @@ export async function waitForNewAnswer(
     let done = false;
     let observer: MutationObserver | null = null;
     let scheduled: ReturnType<typeof setTimeout> | null = null;
+    let shimText: string | null = null;
+    let shimDone = false;
 
     const finish = (err: Error | null, value: string | null): void => {
       if (done) return;
       done = true;
       if (observer !== null) observer.disconnect();
       if (scheduled !== null) clearTimeout(scheduled);
+      window.removeEventListener("message", onShimMessage);
       stopKeepAlive();
       if (err !== null) reject(err);
       else resolve(value as string);
     };
 
+    // Listen for the shim's SSE-hijack messages. Independent of DOM
+    // rendering: the shim parses the conversation stream and forwards
+    // every accumulated-text update plus a final `sse-done` event. When
+    // the hidden tab's React scheduler is throttled and DOM mutations
+    // stop arriving, this path still resolves the wait.
+    const onShimMessage = (ev: MessageEvent): void => {
+      if (ev.source !== window) return;
+      const d = ev.data;
+      if (!d || typeof d !== "object") return;
+      if ((d as Record<string, unknown>).__cgptBridge !== true) return;
+      const kind = (d as Record<string, unknown>).kind;
+      const text = (d as Record<string, unknown>).text;
+      if (typeof text === "string") {
+        shimText = text;
+        if (kind === "sse-done") {
+          shimDone = true;
+          if (text.length > 0) {
+            finish(null, text);
+          } else if (lastSeenText) {
+            finish(null, lastSeenText);
+          }
+        }
+      }
+    };
+    window.addEventListener("message", onShimMessage);
+
     const tick = (): void => {
       if (done) return;
       if (Date.now() - start > timeoutMs) {
+        // Last-ditch: if the shim observed a complete SSE stream but the
+        // DOM never rendered it (typical on hidden tabs with throttled
+        // React), prefer the shim's text over a timeout error.
+        if (shimDone && shimText) {
+          finish(null, shimText);
+          return;
+        }
+        if (shimText && shimText.length > 100) {
+          finish(null, shimText);
+          return;
+        }
         finish(
           new AnswerTimeoutError(
             `Assistant response did not stabilize within ${timeoutMs}ms.`,

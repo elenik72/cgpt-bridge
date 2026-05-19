@@ -116,15 +116,6 @@ async function handleTestAsk(
     stopKeepAlive();
   }
 
-  // Debug log — dump first 400 chars of what we are about to ship back so we
-  // can verify in the page console that ``` fences are present.
-  // eslint-disable-next-line no-console
-  console.log(
-    "[cgpt-bridge][content] assistant text (first 400 chars):\n" +
-      text.slice(0, 400) +
-      (text.length > 400 ? "\n... [+" + (text.length - 400) + " chars]" : ""),
-  );
-
   return { id: req.id, ok: true, kind: "test.ask", text };
 }
 

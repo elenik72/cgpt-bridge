@@ -345,18 +345,49 @@
       let done = false;
       let observer = null;
       let scheduled = null;
+      let shimText = null;
+      let shimDone = false;
       const finish = (err, value) => {
         if (done) return;
         done = true;
         if (observer !== null) observer.disconnect();
         if (scheduled !== null) clearTimeout(scheduled);
+        window.removeEventListener("message", onShimMessage);
         stopKeepAlive();
         if (err !== null) reject(err);
         else resolve(value);
       };
+      const onShimMessage = (ev) => {
+        if (ev.source !== window) return;
+        const d = ev.data;
+        if (!d || typeof d !== "object") return;
+        if (d.__cgptBridge !== true) return;
+        const kind = d.kind;
+        const text = d.text;
+        if (typeof text === "string") {
+          shimText = text;
+          if (kind === "sse-done") {
+            shimDone = true;
+            if (text.length > 0) {
+              finish(null, text);
+            } else if (lastSeenText) {
+              finish(null, lastSeenText);
+            }
+          }
+        }
+      };
+      window.addEventListener("message", onShimMessage);
       const tick = () => {
         if (done) return;
         if (Date.now() - start > timeoutMs) {
+          if (shimDone && shimText) {
+            finish(null, shimText);
+            return;
+          }
+          if (shimText && shimText.length > 100) {
+            finish(null, shimText);
+            return;
+          }
           finish(
             new AnswerTimeoutError(
               `Assistant response did not stabilize within ${timeoutMs}ms.`
@@ -504,9 +535,6 @@
     } finally {
       stopKeepAlive();
     }
-    console.log(
-      "[cgpt-bridge][content] assistant text (first 400 chars):\n" + text.slice(0, 400) + (text.length > 400 ? "\n... [+" + (text.length - 400) + " chars]" : "")
-    );
     return { id: req.id, ok: true, kind: "test.ask", text };
   }
   async function handleDiagnose(req) {
