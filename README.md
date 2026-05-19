@@ -313,4 +313,7 @@ Windows, other Chromium browsers, and Firefox are out of scope for v0.1 (see `do
 
 ## License
 
-To be decided before any code is published. Until a `LICENSE` file is added, no license is granted.
+[The Unlicense](LICENSE) — public domain dedication. Do whatever you want
+with this code: copy, modify, sell, sublicense, vendor it, fork it, ship it.
+No attribution required, no warranty, no strings. SPDX identifier:
+`Unlicense`.

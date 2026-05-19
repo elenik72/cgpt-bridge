@@ -4,6 +4,7 @@
   "version": "0.0.1",
   "type": "module",
   "description": "cgpt-bridge Chrome extension (Stage 2 MVP).",
+  "license": "Unlicense",
   "scripts": {
     "clean": "rimraf dist",
     "typecheck": "tsc --noEmit",
