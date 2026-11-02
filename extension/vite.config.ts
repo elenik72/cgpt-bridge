@@ -20,7 +20,14 @@ const LIB_NAMES: Record<Entry, string> = {
 };
 const libName = LIB_NAMES[entry];
 
+// The build id (the release scripts set the commit's short SHA), read by
+// bridgeProtocol.ts as EXTENSION_BUILD; `dev` without it.
+const build = process.env.CGPT_BUILD || "dev";
+
 export default defineConfig({
+  define: {
+    __CGPT_BUILD__: JSON.stringify(build),
+  },
   build: {
     outDir: "dist",
     emptyOutDir: false,
@@ -33,9 +40,13 @@ export default defineConfig({
       name: libName,
       fileName: () => `${entry}.js`,
     },
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         extend: true,
+        // Keep the bundles strict. Rolldown's default "auto" keeps only source
+        // directives (ours have none); with true it puts "use strict" at the
+        // top of each bundle file, before the IIFE (Rollup put it inside).
+        strict: true,
       },
     },
   },

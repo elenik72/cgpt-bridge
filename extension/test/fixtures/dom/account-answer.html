@@ -1,0 +1,41 @@
+<!-- "account" markup (signed in), two turns: the earlier answer must not be read. Synthetic, minimal. -->
+<main>
+  <div>
+    <div data-talvt-turn-state="complete">
+      <div>First question</div>
+      <h4 data-conversation-role="assistant" class="sr-only">ChatGPT said:</h4>
+      <div data-dil-source-message-id="msg-acc-1" data-markdown-copy=""><p>Earlier answer.</p></div>
+    </div>
+    <div data-talvt-turn-state="complete">
+      <div>Second question</div>
+      <div data-dil-source-message-id="msg-acc-2" data-markdown-copy="">
+        <h4 data-conversation-role="assistant" class="sr-only">ChatGPT said:</h4>
+        <p>Rust is fast.<span data-d-component="popover-trigger"><span data-d-component="badge">Rust Blog</span></span> See the list:</p>
+        <ul><li>one</li><li>two <strong>bold</strong></li></ul>
+        <div data-code-block="true">
+          <div data-markdown-copy="exclude"><span>Bash</span><button type="button"><span>Copy code</span></button></div>
+          <pre data-code-block-source=""><code><span>echo</span><span> hello</span>
+<span>ls -la</span>
+</code></pre>
+        </div>
+        <p>Plain text:</p>
+        <div data-code-block="true">
+          <div data-markdown-copy="exclude"><span>Plain text</span></div>
+          <pre data-code-block-source=""><code>no language here</code></pre>
+        </div>
+        <div data-code-block="true">
+          <div data-markdown-copy="exclude"><span>Markdown</span></div>
+          <pre data-code-block-source=""><code>```rust
+fn main() {}
+```
+</code></pre>
+        </div>
+        <p>Done.</p>
+      </div>
+    </div>
+  </div>
+  <form>
+    <div class="ProseMirror" contenteditable="true" role="textbox" data-composer-markdown=""></div>
+    <button type="submit" aria-label="Send prompt"></button>
+  </form>
+</main>

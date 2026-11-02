@@ -1,0 +1,12 @@
+<!-- "octane" markup, the moment a reply has started but has no body yet: only reasoning is on screen. -->
+<main>
+  <div data-message-role="user">Question</div>
+  <div data-message-role="assistant" data-message-streaming="">
+    <div data-assistant-reasoning-summary="">Thinking</div>
+    <div data-assistant-reasoning-transient="">Working it out</div>
+  </div>
+  <form>
+    <textarea name="prompt"></textarea>
+    <button data-composer-submit="" data-send-label="Send" data-stop-label="Stop"></button>
+  </form>
+</main>

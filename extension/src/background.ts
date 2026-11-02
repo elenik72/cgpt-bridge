@@ -3,22 +3,51 @@ import {
   type ExtensionRequest,
   type ExtensionResponse,
 } from "./bridgeProtocol";
-import { pingNative } from "./nativeHost";
-import { startBridge } from "./bridge";
+import { noteBrowserStart, startBridge } from "./bridge";
+import { injectIntoOpenChatTabs } from "./reinject";
 
 // Boot the persistent native bridge as soon as the service worker loads.
 // Idempotent — safe even if Chrome wakes us multiple times.
 startBridge();
-chrome.runtime.onStartup.addListener(() => startBridge());
-chrome.runtime.onInstalled.addListener(() => startBridge());
+chrome.runtime.onStartup.addListener(() => {
+  startBridge();
+  // A gateway window Chrome restored comes back with new ids.
+  void noteBrowserStart();
+});
+chrome.runtime.onInstalled.addListener((details) => {
+  startBridge();
+  // ChatGPT tabs open from before this install or update have no content
+  // script that reaches this version.
+  if (details.reason === "install" || details.reason === "update") {
+    void injectIntoOpenChatTabs(chrome);
+  }
+});
 
 const TEST_PROMPT = 'Say "pong" in one short sentence.';
 const DEFAULT_TIMEOUT_MS = 120_000;
 const CHATGPT_URL_PREFIX = "https://chatgpt.com/";
 const BADGE_CLEAR_MS = 4000;
 
+// Developer flag: a toolbar click sends a real test prompt into the ChatGPT
+// tab, i.e. a message in the user's account. It does that only when this key
+// is true in chrome.storage.local (set it from the service-worker console:
+// `chrome.storage.local.set({ devTestAsk: true })`); otherwise a click does
+// nothing.
+const DEV_TEST_ASK_KEY = "devTestAsk";
+
 chrome.action.onClicked.addListener((tab) => {
-  void runTestAsk(tab);
+  void (async () => {
+    const stored = await chrome.storage.local.get(DEV_TEST_ASK_KEY);
+    if (stored[DEV_TEST_ASK_KEY] !== true) {
+      console.log(
+        `[cgpt-bridge] toolbar click ignored: set chrome.storage.local ${DEV_TEST_ASK_KEY}=true to send a test prompt`,
+      );
+      return;
+    }
+    await runTestAsk(tab);
+  })().catch((err) => {
+    console.error("[cgpt-bridge] toolbar click failed:", err);
+  });
 });
 
 async function runTestAsk(tab: chrome.tabs.Tab): Promise<void> {
@@ -82,15 +111,7 @@ function sendToTab(
       (response: ExtensionResponse | undefined) => {
         const lastError = chrome.runtime.lastError;
         if (lastError) {
-          // Most common cause: content script not injected because the tab was
-          // opened before the extension was loaded. Ask the user to reload the
-          // ChatGPT tab.
-          reject(
-            new Error(
-              `chrome.runtime.lastError: ${lastError.message ?? "unknown"}. ` +
-                "Try reloading the ChatGPT tab after installing/reloading the extension.",
-            ),
-          );
+          reject(new Error(`chrome.runtime.lastError: ${lastError.message ?? "unknown"}`));
           return;
         }
         if (!response) {
@@ -111,14 +132,3 @@ async function setBadge(text: string, color: string): Promise<void> {
 async function clearBadge(): Promise<void> {
   await chrome.action.setBadgeText({ text: "" });
 }
-
-// Expose pingNative on the service-worker global so it can be invoked from the
-// SW DevTools console for ad-hoc M4 testing. Not part of any production API;
-// later milestones replace this with a proper bridge request type.
-(self as unknown as Record<string, unknown>)["pingNative"] = async (
-  payload?: unknown,
-) => {
-  const out = await pingNative(payload === undefined ? {} : { payload });
-  console.log("[cgpt-bridge] pingNative:", out);
-  return out;
-};

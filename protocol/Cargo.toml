@@ -10,6 +10,17 @@ description = "Shared framing + message types between cgpt CLI, host, and (later
 [lib]
 path = "src/lib.rs"
 
+[features]
+# The shared fenced-block corpus (`fence::corpus`) for other crates' tests;
+# enabled only through their `[dev-dependencies]`.
+test-support = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+interprocess = { workspace = true }
+
+# Owner-only security descriptor of the Windows pipe: interprocess takes the
+# SDDL string as a `widestring::U16CStr`.
+[target.'cfg(windows)'.dependencies]
+widestring = "1.2.1"

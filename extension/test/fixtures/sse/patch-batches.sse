@@ -1,0 +1,23 @@
+event: delta_encoding
+data: "v1"
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "msg-asst-1", "author": {"role": "assistant", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "text", "parts": [""]}, "status": "in_progress", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "all", "channel": null}, "conversation_id": "conv-fixture-0001"}, "c": 0}
+
+event: delta
+data: {"p": "", "o": "patch", "v": [{"p": "/message/content/parts/0", "o": "append", "v": "Batched"}, {"p": "/message/status", "o": "replace", "v": "in_progress"}]}
+
+event: delta
+data: {"v": [{"p": "/message/content/parts/0", "o": "append", "v": " text"}, {"v": " arrives"}]}
+
+event: delta
+data: {"v": [{"p": "/message/content/parts/0", "o": "append", "v": " in"}]}
+
+event: delta
+data: {"v": " patches"}
+
+event: delta
+data: {"p": "", "o": "patch", "v": [{"p": "/message/content/parts/0", "o": "append", "v": "."}, {"p": "/message/end_turn", "o": "replace", "v": true}, {"p": "/message/status", "o": "replace", "v": "finished_successfully"}]}
+
+data: [DONE]
+

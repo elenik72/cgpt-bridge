@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent of cgpt-gateway. install.sh copies this template to
+  ~/Library/LaunchAgents/ and fills in the absolute paths with plutil.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cgpt-bridge.gateway</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>GATEWAY_BIN</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- The bridge socket lives in the per-user temp dir; the gateway must
+         look in the same place as the host started by Chrome. -->
+    <key>TMPDIR</key>
+    <string>USER_TMPDIR</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Restart after a crash, not after a clean exit. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <!-- A gateway that keeps failing on start (say, its port is taken) is
+       retried once a minute, not every 10 s. -->
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>GATEWAY_LOG</string>
+  <key>StandardErrorPath</key>
+  <string>GATEWAY_LOG</string>
+</dict>
+</plist>

@@ -1,0 +1,7 @@
+# Line endings. Everything text is LF in the repository and in every checkout,
+# so shell scripts, plists and test fixtures stay byte-identical on
+# windows-latest, where Git would otherwise check them out with CRLF.
+# PowerShell scripts get CRLF, their native Windows form (PowerShell reads
+# either).
+* text=auto eol=lf
+*.ps1 text eol=crlf

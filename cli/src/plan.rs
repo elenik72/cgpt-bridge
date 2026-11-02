@@ -6,8 +6,9 @@
 //! .cgpt-bridge/
 //!   plan.jsonl                       # append-only event log, source of truth
 //!   plan.md                          # regenerated from plan.jsonl
-//!   session.json                     # current session metadata
+//!   session.json                     # metadata of the latest session
 //!   runs/<session-id>/
+//!     session.json                   # this session's own metadata (status, chat)
 //!     transcript.jsonl               # message-level transcript (redacted)
 //!     command-<id>.json              # per-command (redacted) record
 //!   logs/                            # reserved; CLI/host text logs (future)
@@ -28,6 +29,9 @@ use cgpt_bridge_protocol::agent::{
     AgentResponseV1, CommandRequest, CommandResultV1, PlanEvent, PlanUpdate, Status, TaskStatus,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::history;
+use crate::redact;
 
 pub const DEFAULT_DIR_NAME: &str = ".cgpt-bridge";
 
@@ -106,6 +110,11 @@ pub struct SessionMetadata {
     pub task_summary: String,
     pub last_turn_at_unix_ms: u64,
     pub status: String,
+    /// The ChatGPT chat the session's first reply came from (AUD-009). Absent
+    /// in files written before the field existed and while no reply had an
+    /// address yet. Kept in `runs/<id>/session.json`, one per session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_url: Option<String>,
 }
 
 /// Static per-session metadata. Written once when the session opens and
@@ -146,6 +155,7 @@ impl PlanStore {
     pub fn open(project_root: &Path, session_id: String, task: &str) -> io::Result<Self> {
         let root = project_root.join(DEFAULT_DIR_NAME);
         fs::create_dir_all(&root)?;
+        ensure_gitignore(&root)?;
         let plan_jsonl = root.join("plan.jsonl");
         let plan_md = root.join("plan.md");
         let session_json = root.join("session.json");
@@ -171,14 +181,19 @@ impl PlanStore {
             task: task.to_string(),
             at_unix_ms: now,
         })?;
-        store.write_session_metadata(&SessionMetadata {
-            session_id: session_id.clone(),
-            started_at_unix_ms: now,
-            cwd: project_root.display().to_string(),
-            task_summary: task.to_string(),
-            last_turn_at_unix_ms: now,
-            status: "active".into(),
-        })?;
+        // A new session is the latest one: it takes over the root file too.
+        store.write_session_metadata(
+            &SessionMetadata {
+                session_id: session_id.clone(),
+                started_at_unix_ms: now,
+                cwd: project_root.display().to_string(),
+                task_summary: task.to_string(),
+                last_turn_at_unix_ms: now,
+                status: "active".into(),
+                conversation_url: None,
+            },
+            true,
+        )?;
         let meta = SessionMeta {
             session_id,
             started_at_unix_ms: now,
@@ -197,6 +212,21 @@ impl PlanStore {
     /// SessionStarted entry — the original run already did. Used to keep
     /// `plan.jsonl` and `runs/<id>/` growing for the same session id.
     pub fn open_existing(project_root: &Path, session_id: String) -> io::Result<Self> {
+        // The id comes straight from `--resume` and becomes a path: only the
+        // characters of a generated id (`s{hex}_{hex}`) are accepted.
+        if session_id.is_empty()
+            || !session_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid session id `{}`: only letters, digits, `_` and `-` are allowed",
+                    session_id.escape_default()
+                ),
+            ));
+        }
         let root = project_root.join(DEFAULT_DIR_NAME);
         let runs_dir = root.join("runs").join(&session_id);
         if !runs_dir.is_dir() {
@@ -205,6 +235,7 @@ impl PlanStore {
                 format!("session not found: {}", session_id),
             ));
         }
+        ensure_gitignore(&root)?;
         let store = PlanStore {
             plan_jsonl: root.join("plan.jsonl"),
             plan_md: root.join("plan.md"),
@@ -336,7 +367,9 @@ impl PlanStore {
         let entry = PlanEntry::CommandProposed {
             command_id: cmd.id.clone(),
             cwd: cmd.cwd.clone(),
-            command: cmd.command.clone(),
+            // The log is stored: the command text goes through the same
+            // redaction as command output (the command itself is not touched).
+            command: redact::redact(&cmd.command, "").stdout,
             risk_declared: format!("{:?}", cmd.risk).to_lowercase(),
             at_unix_ms: now_ms(),
         };
@@ -345,9 +378,26 @@ impl PlanStore {
 
     pub fn record_command_result(&self, result: &CommandResultV1) -> io::Result<()> {
         // Persist the per-command file (already-redacted contents).
-        let path = self
-            .runs_dir
-            .join(format!("command-{}.json", result.command_id));
+        // `command_id` is model-controlled: keep only safe characters in the
+        // file name and refuse anything that would land outside `runs_dir`.
+        let safe_id: String = result
+            .command_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = self.runs_dir.join(format!("command-{}.json", safe_id));
+        if path.parent() != Some(self.runs_dir.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "command id resolves outside the runs directory",
+            ));
+        }
         write_atomic(&path, serde_json::to_vec_pretty(result).unwrap().as_slice())?;
         // Append a compact summary to plan.jsonl.
         let entry = PlanEntry::CommandResult {
@@ -398,27 +448,74 @@ impl PlanStore {
 
     pub fn update_session_status(&self, status: &str) -> io::Result<()> {
         // Load existing, mutate, write back atomically.
-        let mut meta = self.read_session_metadata().unwrap_or(SessionMetadata {
+        let mut meta = self
+            .read_session_metadata()
+            .unwrap_or_else(|| self.fresh_session_metadata(status));
+        meta.status = status.into();
+        meta.last_turn_at_unix_ms = now_ms();
+        self.write_session_metadata(&meta, false)
+    }
+
+    /// The chat this session is bound to, if one was recorded.
+    pub fn conversation_url(&self) -> Option<String> {
+        self.read_session_metadata()?.conversation_url
+    }
+
+    /// Record the chat this session is bound to.
+    pub fn set_conversation_url(&self, url: &str) -> io::Result<()> {
+        let mut meta = self
+            .read_session_metadata()
+            .unwrap_or_else(|| self.fresh_session_metadata("active"));
+        meta.conversation_url = Some(url.to_string());
+        self.write_session_metadata(&meta, false)
+    }
+
+    fn fresh_session_metadata(&self, status: &str) -> SessionMetadata {
+        SessionMetadata {
             session_id: self.session_id.clone(),
             started_at_unix_ms: now_ms(),
             cwd: String::new(),
             task_summary: String::new(),
             last_turn_at_unix_ms: now_ms(),
             status: status.into(),
-        });
-        meta.status = status.into();
-        meta.last_turn_at_unix_ms = now_ms();
-        self.write_session_metadata(&meta)
+            conversation_url: None,
+        }
     }
 
+    /// This session's metadata: its own `runs/<id>/session.json`, or, for a
+    /// session written before that file existed, the root `session.json`
+    /// when it belongs to this session.
     fn read_session_metadata(&self) -> Option<SessionMetadata> {
+        let own = fs::read(self.runs_dir.join("session.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<SessionMetadata>(&b).ok());
+        own.or_else(|| {
+            self.read_root_metadata()
+                .filter(|m| m.session_id == self.session_id)
+        })
+    }
+
+    fn read_root_metadata(&self) -> Option<SessionMetadata> {
         let bytes = fs::read(&self.session_json).ok()?;
         serde_json::from_slice(&bytes).ok()
     }
 
-    fn write_session_metadata(&self, meta: &SessionMetadata) -> io::Result<()> {
+    /// Always writes the session's own file. The root `session.json` shows
+    /// the latest session, so it is written only when it already belongs to
+    /// this session, is missing or unreadable, or `take_over` says this
+    /// session is the new latest one: stopping an older session must not
+    /// rewrite another session's status.
+    fn write_session_metadata(&self, meta: &SessionMetadata, take_over: bool) -> io::Result<()> {
         let bytes = serde_json::to_vec_pretty(meta).unwrap();
-        write_atomic(&self.session_json, &bytes)
+        write_atomic(&self.runs_dir.join("session.json"), &bytes)?;
+        let root_is_ours = match self.read_root_metadata() {
+            Some(m) => m.session_id == self.session_id,
+            None => true,
+        };
+        if take_over || root_is_ours {
+            write_atomic(&self.session_json, &bytes)?;
+        }
+        Ok(())
     }
 
     /// Rebuild plan.md from plan.jsonl. Cheap because plans stay small;
@@ -552,7 +649,7 @@ fn render_plan_md(entries: &[PlanEntry], session_id: &str) -> String {
     );
     out.push_str("# Agent plan\n\n");
     out.push_str(&format!("- Session: `{}`\n", session_id));
-    out.push_str(&format!("- Started: {}\n", format_unix_ms(started_at)));
+    out.push_str(&format!("- Started: {}\n", history::format_ts(started_at)));
     if !task_text_summary.is_empty() {
         out.push_str(&format!("- Task: {}\n", task_text_summary));
     }
@@ -627,22 +724,25 @@ fn render_plan_md(entries: &[PlanEntry], session_id: &str) -> String {
     if let Some(t) = final_text {
         out.push_str("## Final\n\n");
         out.push_str(&t);
-        out.push_str("\n");
+        out.push('\n');
     }
 
     out
 }
 
-fn format_unix_ms(ms: u64) -> String {
-    // Minimal ISO-ish format without pulling chrono.
-    if ms == 0 {
-        return "(unknown)".into();
+/// Keep the folder out of git: write `.gitignore` with `*` unless one exists.
+/// `create_new` never overwrites a file the user already has, and is safe when
+/// the folder was made by an earlier run or a parallel one.
+fn ensure_gitignore(root: &Path) -> io::Result<()> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join(".gitignore"))
+    {
+        Ok(mut f) => f.write_all(b"*\n"),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
     }
-    let secs = (ms / 1000) as i64;
-    let nanos = ((ms % 1000) * 1_000_000) as u32;
-    // Best-effort: format via SystemTime so the OS does the calendar math.
-    let st = std::time::UNIX_EPOCH + std::time::Duration::new(secs as u64, nanos);
-    format!("{:?}", st)
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -695,6 +795,126 @@ mod tests {
     }
 
     #[test]
+    fn conversation_url_is_stored_and_survives_status_updates() {
+        let root = tmp_root();
+        let store = PlanStore::open(&root, new_session_id(), "t").unwrap();
+        assert_eq!(store.conversation_url(), None);
+        store
+            .set_conversation_url("https://chatgpt.com/c/abc")
+            .unwrap();
+        store.update_session_status("final").unwrap();
+        let again = PlanStore::open_existing(&root, store.session_id().to_string()).unwrap();
+        assert_eq!(
+            again.conversation_url().as_deref(),
+            Some("https://chatgpt.com/c/abc")
+        );
+    }
+
+    #[test]
+    fn session_json_without_the_field_still_loads() {
+        let root = tmp_root();
+        let store = PlanStore::open(&root, new_session_id(), "t").unwrap();
+        let raw = fs::read_to_string(root.join(".cgpt-bridge/session.json")).unwrap();
+        assert!(!raw.contains("conversation_url"), "{}", raw);
+        assert_eq!(store.conversation_url(), None);
+        // Setting it on such a file works, and so does a status update on it.
+        store
+            .set_conversation_url("https://chatgpt.com/c/x")
+            .unwrap();
+        store.update_session_status("idle").unwrap();
+        assert!(store.conversation_url().is_some());
+    }
+
+    #[test]
+    fn each_session_keeps_its_own_conversation_url() {
+        let root = tmp_root();
+        let first = PlanStore::open(&root, "s-first".into(), "t").unwrap();
+        first
+            .set_conversation_url("https://chatgpt.com/c/one")
+            .unwrap();
+        let second = PlanStore::open(&root, "s-second".into(), "t").unwrap();
+        assert_eq!(second.conversation_url(), None);
+        second
+            .set_conversation_url("https://chatgpt.com/c/two")
+            .unwrap();
+        // The older session still has its own chat, and can still change it.
+        let reopened = PlanStore::open_existing(&root, "s-first".into()).unwrap();
+        assert_eq!(
+            reopened.conversation_url().as_deref(),
+            Some("https://chatgpt.com/c/one")
+        );
+        reopened
+            .set_conversation_url("https://chatgpt.com/c/three")
+            .unwrap();
+        assert_eq!(
+            second.conversation_url().as_deref(),
+            Some("https://chatgpt.com/c/two")
+        );
+    }
+
+    #[test]
+    fn a_status_update_of_an_older_session_leaves_the_root_file_alone() {
+        let root = tmp_root();
+        let first = PlanStore::open(&root, "s-first".into(), "t").unwrap();
+        let second = PlanStore::open(&root, "s-second".into(), "t").unwrap();
+        second.update_session_status("needs_user_input").unwrap();
+        first.update_session_status("final").unwrap();
+        let root_json: SessionMetadata =
+            serde_json::from_slice(&fs::read(root.join(".cgpt-bridge/session.json")).unwrap())
+                .unwrap();
+        assert_eq!(root_json.session_id, "s-second");
+        assert_eq!(root_json.status, "needs_user_input");
+        // Its own file did take the update.
+        let own: SessionMetadata = serde_json::from_slice(
+            &fs::read(root.join(".cgpt-bridge/runs/s-first/session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(own.status, "final");
+    }
+
+    #[test]
+    fn a_session_from_before_the_per_session_file_reads_the_root_file() {
+        let root = tmp_root();
+        let store = PlanStore::open(&root, "s-old".into(), "t").unwrap();
+        store
+            .set_conversation_url("https://chatgpt.com/c/old")
+            .unwrap();
+        // Old layout: only the root file has the address.
+        fs::remove_file(root.join(".cgpt-bridge/runs/s-old/session.json")).unwrap();
+        let again = PlanStore::open_existing(&root, "s-old".into()).unwrap();
+        assert_eq!(
+            again.conversation_url().as_deref(),
+            Some("https://chatgpt.com/c/old")
+        );
+        // A session with no file of its own and a foreign root file has none.
+        fs::create_dir_all(root.join(".cgpt-bridge/runs/s-older")).unwrap();
+        let older = PlanStore::open_existing(&root, "s-older".into()).unwrap();
+        assert_eq!(older.conversation_url(), None);
+        older.update_session_status("final").unwrap();
+        assert!(root
+            .join(".cgpt-bridge/runs/s-older/session.json")
+            .is_file());
+    }
+
+    #[test]
+    fn open_existing_rejects_a_session_id_that_is_not_a_plain_name() {
+        let root = tmp_root();
+        PlanStore::open(&root, "s-real".into(), "t").unwrap();
+        // A directory that exists outside runs/, reachable through `..`.
+        fs::create_dir_all(root.join(".cgpt-bridge/x")).unwrap();
+        for bad in ["..", "../x", "a/b", "", ".", "s-real/..", "/tmp"] {
+            let err = match PlanStore::open_existing(&root, bad.into()) {
+                Ok(_) => panic!("`{}` was accepted", bad),
+                Err(e) => e,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "`{}`", bad);
+        }
+        assert!(PlanStore::open_existing(&root, "s-real".into()).is_ok());
+        // Nothing was written through the rejected ids.
+        assert!(!root.join(".cgpt-bridge/x/session.json").exists());
+    }
+
+    #[test]
     fn open_creates_layout() {
         let root = tmp_root();
         let store = PlanStore::open(&root, new_session_id(), "diagnose failing tests").unwrap();
@@ -703,6 +923,66 @@ mod tests {
         assert!(store.logs_dir().is_dir());
         assert!(root.join(".cgpt-bridge/plan.jsonl").is_file());
         assert!(root.join(".cgpt-bridge/session.json").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_writes_gitignore_that_ignores_everything() {
+        let root = tmp_root();
+        PlanStore::open(&root, new_session_id(), "t").unwrap();
+        let body = fs::read_to_string(root.join(".cgpt-bridge/.gitignore")).unwrap();
+        assert_eq!(body, "*\n");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_keeps_an_existing_gitignore() {
+        let root = tmp_root();
+        fs::create_dir_all(root.join(".cgpt-bridge")).unwrap();
+        fs::write(root.join(".cgpt-bridge/.gitignore"), "mine\n").unwrap();
+        PlanStore::open(&root, "s-a".into(), "t").unwrap();
+        PlanStore::open(&root, "s-b".into(), "t").unwrap();
+        let body = fs::read_to_string(root.join(".cgpt-bridge/.gitignore")).unwrap();
+        assert_eq!(body, "mine\n");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn open_existing_adds_a_missing_gitignore_and_keeps_an_existing_one() {
+        let root = tmp_root();
+        PlanStore::open(&root, "s-old".into(), "t").unwrap();
+        let ignore = root.join(".cgpt-bridge/.gitignore");
+        // A folder from an older version has no .gitignore.
+        fs::remove_file(&ignore).unwrap();
+        PlanStore::open_existing(&root, "s-old".into()).unwrap();
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), "*\n");
+        fs::write(&ignore, "mine\n").unwrap();
+        PlanStore::open_existing(&root, "s-old".into()).unwrap();
+        assert_eq!(fs::read_to_string(&ignore).unwrap(), "mine\n");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn record_command_proposed_redacts_the_command() {
+        let root = tmp_root();
+        let store = PlanStore::open(&root, "s-red".into(), "task").unwrap();
+        let cmd = CommandRequest {
+            id: "cmd_001".into(),
+            kind: CommandKind::Shell,
+            cwd: ".".into(),
+            command: "curl -H 'x: sk-abcdefghijklmnopqrstuvwxyz123' example.test".into(),
+            description: "x".into(),
+            expected_effect: "e".into(),
+            risk: Risk::ReadOnly,
+            timeout_ms: 1000,
+            send_output: SendOutput::Summary,
+        };
+        store.record_command_proposed(&cmd).unwrap();
+        let jsonl = fs::read_to_string(root.join(".cgpt-bridge/plan.jsonl")).unwrap();
+        let md = fs::read_to_string(root.join(".cgpt-bridge/plan.md")).unwrap();
+        assert!(!jsonl.contains("sk-abcdefghijklmnopqrstuvwxyz123"));
+        assert!(jsonl.contains("«redacted:openai_api_key»"));
+        assert!(!md.contains("sk-abcdefghijklmnopqrstuvwxyz123"));
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -767,6 +1047,147 @@ mod tests {
         assert!(jsonl.contains("\"command_proposed\""));
         assert!(jsonl.contains("\"command_result\""));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn tree(dir: &Path) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                out.push(p.clone());
+                if p.is_dir() {
+                    walk(&p, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    fn result_with_id(id: &str) -> CommandResultV1 {
+        CommandResultV1 {
+            version: 1,
+            command_id: id.into(),
+            cwd: ".".into(),
+            command: "ls".into(),
+            exit_code: Some(0),
+            duration_ms: 5,
+            timed_out: false,
+            stdout: "a\n".into(),
+            stderr: "".into(),
+            output_truncated: false,
+            redactions_applied: vec![],
+        }
+    }
+
+    #[test]
+    fn command_result_with_hostile_id_stays_inside_runs_dir() {
+        // AUD-001: a model-controlled `id` must not create or overwrite files
+        // outside `runs/<session>/`. Under the old code the `../` ids climbed
+        // out of the session dir, so "victim.json" files are planted at every
+        // level they could reach (runs/, .cgpt-bridge/, project root, `outer`)
+        // and must stay byte-identical; the tree outside the session dir must
+        // not gain new files either.
+        // docs/security.md §9 is updated by TASK-048.
+        let outer = tmp_root();
+        let root = outer.join("project");
+        fs::create_dir_all(&root).unwrap();
+        let store = PlanStore::open(&root, "s4".into(), "task").unwrap();
+        let runs = store.runs_dir().to_path_buf();
+        let victims = [
+            runs.parent().unwrap().join("victim.json"),
+            root.join(".cgpt-bridge/victim.json"),
+            root.join("victim.json"),
+            outer.join("victim.json"),
+        ];
+        for v in &victims {
+            fs::write(v, b"precious").unwrap();
+        }
+        for id in [
+            "../../../victim",
+            "../../../../victim",
+            "../../../../../victim",
+            "../../../../../../victim",
+            "../../escape",
+            "/tmp/cgb-abs-victim",
+            "a/b",
+            "a\\..\\..\\b",
+            "..",
+            "",
+            "x\0y",
+            "bad id\n",
+        ] {
+            let outside = |outer: &Path| -> Vec<PathBuf> {
+                tree(outer)
+                    .into_iter()
+                    .filter(|p| !p.starts_with(&runs))
+                    .collect()
+            };
+            let before = outside(&outer);
+            store.record_command_result(&result_with_id(id)).unwrap();
+            assert_eq!(
+                before,
+                outside(&outer),
+                "id {:?} touched files outside runs/<session>/",
+                id
+            );
+            for v in &victims {
+                assert_eq!(
+                    fs::read(v).unwrap(),
+                    b"precious",
+                    "id {:?} modified {:?}",
+                    id,
+                    v
+                );
+            }
+            // Also covers absolute ids: everything written must be a direct
+            // child of the session dir.
+            for p in tree(&runs) {
+                assert_eq!(p.parent().unwrap(), runs, "id {:?} nested under runs/", id);
+            }
+        }
+        let _ = fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn command_result_sanitizes_id_in_file_name() {
+        let root = tmp_root();
+        let store = PlanStore::open(&root, "s5".into(), "task").unwrap();
+        store
+            .record_command_result(&result_with_id("a.b/c"))
+            .unwrap();
+        assert!(store.runs_dir().join("command-a_b_c.json").is_file());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn started_line(started_at_unix_ms: u64) -> String {
+        let entries = [PlanEntry::SessionStarted {
+            session_id: "s".into(),
+            cwd: ".".into(),
+            task: "t".into(),
+            at_unix_ms: started_at_unix_ms,
+        }];
+        render_plan_md(&entries, "s")
+            .lines()
+            .find(|l| l.starts_with("- Started: "))
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn plan_md_started_line_uses_the_history_time_format() {
+        // 2026-10-27 12:34:56 UTC, with milliseconds that must not show.
+        let ms = 1_793_104_496_789;
+        assert_eq!(history::format_ts(ms), "2026-10-27 12:34:56");
+        assert_eq!(started_line(ms), "- Started: 2026-10-27 12:34:56");
+        assert!(!started_line(ms).contains("SystemTime"));
+        // A plan without a start entry renders as `history` does.
+        assert_eq!(started_line(0), "- Started: (unknown)");
+        assert_eq!(
+            started_line(0),
+            format!("- Started: {}", history::format_ts(0))
+        );
     }
 
     #[test]

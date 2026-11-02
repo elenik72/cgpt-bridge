@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::fence::fenced_blocks;
+
 // ---------------------------------------------------------------------------
 // AgentResponseV1 (ChatGPT -> CLI)
 // ---------------------------------------------------------------------------
@@ -289,10 +291,69 @@ fn validate_version(raw: &serde_json::Value) -> Result<(), ParseError> {
     }
 }
 
+/// Longest accepted command `id`.
+const MAX_COMMAND_ID_LEN: usize = 64;
+
+/// `id` comes from the model and ends up in a file name (`command-<id>.json`),
+/// so it must be a plain token: `[A-Za-z0-9_.-]{1,64}` with no `..`.
+fn is_safe_command_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_COMMAND_ID_LEN
+        && !id.contains("..")
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Unicode bidirectional controls (LRM/RLM/ALM, embeddings, overrides,
+/// isolates) and zero-width characters (ZWSP, ZWNJ, ZWJ, word joiner, BOM).
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{061c}'
+            | '\u{200b}'..='\u{200d}'
+            | '\u{2060}'
+            | '\u{feff}'
+    )
+}
+
 fn validate_command(cmd: &CommandRequest) -> Result<(), ParseError> {
+    if !is_safe_command_id(&cmd.id) {
+        return Err(ParseError::InvalidCommand {
+            detail: format!(
+                "id must match [A-Za-z0-9_.-]{{1,{}}} and not contain \"..\"",
+                MAX_COMMAND_ID_LEN
+            ),
+        });
+    }
     if cmd.command.trim().is_empty() {
         return Err(ParseError::InvalidCommand {
             detail: "command string is empty".into(),
+        });
+    }
+    // Control characters (CR and ESC can repaint the terminal, the rest make
+    // the confirmation panel ambiguous) have no place in a shell command.
+    // Newline and tab are fine.
+    if cmd
+        .command
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+    {
+        return Err(ParseError::InvalidCommand {
+            detail: "command must not contain control characters other than newline and tab".into(),
+        });
+    }
+    // Invisible formatting characters reorder or hide what the panel shows
+    // (a reversed-looking command, a word that differs from what runs).
+    // Right-to-left letters and emoji stay legal in prose fields; only the
+    // command is held to this.
+    if cmd.command.chars().any(is_invisible_format_char) {
+        return Err(ParseError::InvalidCommand {
+            detail: "command must not contain bidirectional or zero-width characters".into(),
         });
     }
     if cmd.timeout_ms == 0 {
@@ -306,57 +367,27 @@ fn validate_command(cmd: &CommandRequest) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// Extract the body of every fenced code block whose info string matches
-/// `info` exactly. We only recognise triple-backtick fences (the only kind
-/// ChatGPT renders), and the info string must match case-sensitively.
+/// Extract the body of every top-level, closed fenced code block whose
+/// fence is three or more backticks indented by at most three spaces, and
+/// whose info string is exactly `info` (case-sensitive). Blocks come from
+/// `crate::fence`: an example quoted inside another code block is content of
+/// that block, and a fence indented by four or more spaces or a tab is an
+/// indented code sample in CommonMark — neither is a protocol block. An
+/// unclosed block is dropped — the assistant text was malformed and the
+/// caller will see NoBlock or DuplicateBlocks depending on what else is
+/// there.
 fn extract_fenced_bodies(text: &str, info: &str) -> Vec<String> {
-    let mut bodies = Vec::new();
-    let mut lines = text.lines().peekable();
-    while let Some(line) = lines.next() {
-        if let Some(rest) = fence_open(line) {
-            if rest == info {
-                // Collect until the matching closing fence (any ``` at line start).
-                let mut body = String::new();
-                let mut closed = false;
-                for inner in lines.by_ref() {
-                    if is_fence_close(inner) {
-                        closed = true;
-                        break;
-                    }
-                    body.push_str(inner);
-                    body.push('\n');
-                }
-                if closed {
-                    bodies.push(body);
-                }
-                // If the fence never closed we drop the partial block — the
-                // assistant text was malformed and the caller will see
-                // NoBlock or DuplicateBlocks depending on what else is there.
-            }
-        }
-    }
-    bodies
-}
-
-/// Returns `Some(info)` if the line opens a triple-backtick fence with an
-/// info string. Whitespace at line start is allowed, info string is trimmed.
-fn fence_open(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("```") {
-        let rest = rest.trim();
-        if rest.is_empty() {
-            None
-        } else {
-            Some(rest)
-        }
-    } else {
-        None
-    }
-}
-
-fn is_fence_close(line: &str) -> bool {
-    let trimmed = line.trim_start().trim_end();
-    trimmed == "```"
+    fenced_blocks(text)
+        .into_iter()
+        .filter(|b| {
+            b.closed
+                && b.fence.ch == '`'
+                && b.indent.len() <= 3
+                && b.indent.bytes().all(|c| c == b' ')
+                && b.info == info
+        })
+        .map(|b| b.body)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +552,161 @@ mod tests {
         assert!(matches!(err, ParseError::InvalidCommand { .. }));
     }
 
+    fn command_with_id(id: &str) -> String {
+        let mut v = minimal_final();
+        v["status"] = serde_json::json!("continue");
+        v["command"] = serde_json::json!({
+            "id": id, "kind":"shell","description":"x","cwd":".",
+            "command":"ls",
+            "expected_effect":"x","risk":"read_only","timeout_ms":1000,"send_output":"summary",
+        });
+        block(&v.to_string())
+    }
+
+    #[test]
+    fn unsafe_command_ids_rejected() {
+        let long = "a".repeat(65);
+        for id in [
+            "../x",
+            "a/b",
+            "a\\b",
+            "a..b",
+            "..",
+            "",
+            "has space",
+            "tab\there",
+            "nl\nx",
+            "nul\u{0}x",
+            "ctl\u{7f}",
+            "ünï",
+            long.as_str(),
+        ] {
+            let err = parse_agent_response(&command_with_id(id)).unwrap_err();
+            assert!(
+                matches!(err, ParseError::InvalidCommand { .. }),
+                "id {:?} should be rejected, got {:?}",
+                id,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn safe_command_ids_accepted() {
+        let max = "a".repeat(64);
+        for id in [
+            "cmd_001",
+            "c",
+            "run-1.2",
+            "A_b-C.9",
+            ".hidden",
+            max.as_str(),
+        ] {
+            let parsed = parse_agent_response(&command_with_id(id)).unwrap();
+            assert_eq!(parsed.response.command.unwrap().id, id);
+        }
+    }
+
+    fn command_with_text(command: &str) -> String {
+        let mut v = minimal_final();
+        v["status"] = serde_json::json!("continue");
+        v["command"] = serde_json::json!({
+            "id": "c", "kind":"shell","description":"x","cwd":".",
+            "command": command,
+            "expected_effect":"x","risk":"read_only","timeout_ms":1000,"send_output":"summary",
+        });
+        block(&v.to_string())
+    }
+
+    #[test]
+    fn command_with_cr_or_esc_rejected() {
+        for cmd in [
+            "ls\rrm -rf x",
+            "echo hi\r",
+            "\rls",
+            "echo \u{1b}[2K\u{1b}[1Aok",
+            "\u{1b}]0;title\u{7}ls",
+            "ls\r\nrm x",
+        ] {
+            let err = parse_agent_response(&command_with_text(cmd)).unwrap_err();
+            assert!(
+                matches!(err, ParseError::InvalidCommand { .. }),
+                "command {:?} should be rejected, got {:?}",
+                cmd,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn command_with_any_other_control_char_rejected() {
+        for cmd in [
+            "ls\u{0}x",
+            "echo \u{7}",
+            "rm a\u{8}b",
+            "ls\u{7f}",
+            "echo \u{9b}31m",
+            "echo \u{85}x",
+            "echo \u{b}x",
+            "echo \u{c}x",
+        ] {
+            let err = parse_agent_response(&command_with_text(cmd)).unwrap_err();
+            assert!(
+                matches!(err, ParseError::InvalidCommand { .. }),
+                "command {:?} should be rejected, got {:?}",
+                cmd,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn command_with_bidi_or_zero_width_chars_rejected() {
+        for c in [
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}', '\u{200e}', '\u{200f}', '\u{061c}', '\u{200b}', '\u{200c}',
+            '\u{200d}', '\u{2060}', '\u{feff}',
+        ] {
+            let cmd = format!("echo {}ok", c);
+            let err = parse_agent_response(&command_with_text(&cmd)).unwrap_err();
+            assert!(
+                matches!(err, ParseError::InvalidCommand { .. }),
+                "command {:?} should be rejected, got {:?}",
+                cmd,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn command_with_rtl_letters_still_accepted() {
+        let cmd = "echo \u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{627}\u{644}\u{633}\u{644}\u{627}\u{645}";
+        let parsed = parse_agent_response(&command_with_text(cmd)).unwrap();
+        assert_eq!(parsed.response.command.unwrap().command, cmd);
+    }
+
+    #[test]
+    fn prose_fields_may_carry_rtl_text_and_zwj_sequences() {
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let desc = format!("\u{5e9}\u{5dc}\u{5d5}\u{5dd} {} \u{200f}end", family);
+        let mut v = minimal_final();
+        v["status"] = serde_json::json!("continue");
+        v["command"] = serde_json::json!({
+            "id": "c", "kind":"shell","description": desc,"cwd":".",
+            "command": "ls",
+            "expected_effect": desc,"risk":"read_only","timeout_ms":1000,"send_output":"summary",
+        });
+        let parsed = parse_agent_response(&block(&v.to_string())).unwrap();
+        assert_eq!(parsed.response.command.unwrap().description, desc);
+    }
+
+    #[test]
+    fn multiline_command_with_lf_and_tab_still_accepted() {
+        let cmd = "set -e\n\tls\n\techo ok";
+        let parsed = parse_agent_response(&command_with_text(cmd)).unwrap();
+        assert_eq!(parsed.response.command.unwrap().command, cmd);
+    }
+
     #[test]
     fn zero_timeout_rejected() {
         let mut v = minimal_final();
@@ -582,7 +768,7 @@ mod tests {
         let text = format!(
             "hello\nsome prose\n```{}\n{}\n```\ntrailing prose\n",
             AGENT_FENCE_INFO,
-            minimal_final().to_string()
+            minimal_final()
         );
         let parsed = parse_agent_response(&text).unwrap();
         assert_eq!(parsed.response.status, Status::Final);
@@ -593,10 +779,141 @@ mod tests {
         let text = format!(
             "```json\n{{}}\n```\n```{}\n{}\n```\n",
             AGENT_FENCE_INFO,
-            minimal_final().to_string()
+            minimal_final()
         );
         let parsed = parse_agent_response(&text).unwrap();
         assert_eq!(parsed.response.status, Status::Final);
+    }
+
+    #[test]
+    fn corpus_counts_only_top_level_backtick_blocks_with_the_exact_label() {
+        for case in crate::fence::corpus::FENCE_CORPUS {
+            // Closed, backticks, exact label, and at most three spaces before
+            // the opening fence (more, or a tab, makes an indented code
+            // sample in CommonMark).
+            let ours = case
+                .blocks
+                .iter()
+                .filter(|e| {
+                    e.closed
+                        && e.fence == '`'
+                        && e.info == AGENT_FENCE_INFO
+                        && e.indent.len() <= 3
+                        && e.indent.bytes().all(|b| b == b' ')
+                })
+                .count();
+            let got = parse_agent_response(case.input);
+            match ours {
+                0 => assert_eq!(got, Err(ParseError::NoBlock), "{}", case.name),
+                1 => assert!(got.is_ok(), "{}: {:?}", case.name, got),
+                n => assert_eq!(
+                    got,
+                    Err(ParseError::DuplicateBlocks { count: n }),
+                    "{}",
+                    case.name
+                ),
+            }
+        }
+    }
+
+    fn ls_command() -> String {
+        let mut v = minimal_final();
+        v["status"] = serde_json::json!("continue");
+        v["command"] = serde_json::json!({
+            "id":"cmd_001","kind":"shell","description":"x","cwd":".",
+            "command":"ls -la",
+            "expected_effect":"x","risk":"read_only","timeout_ms":1000,"send_output":"summary",
+        });
+        v.to_string()
+    }
+
+    #[test]
+    fn example_nested_in_a_code_block_is_not_a_command() {
+        // A quoted example is content of the outer block (CommonMark), never
+        // a proposal: four-backtick, tilde and longer-run outer fences.
+        let inner = block(&ls_command());
+        for (open, close) in [
+            ("````markdown", "````"),
+            ("~~~md", "~~~"),
+            ("`````", "``````"),
+        ] {
+            let text = format!("Format:\n{}\n{}{}\nThat is all.\n", open, inner, close);
+            assert_eq!(
+                parse_agent_response(&text),
+                Err(ParseError::NoBlock),
+                "outer fence {:?}",
+                open
+            );
+        }
+        // Quoted example next to a real block: the real one wins, alone.
+        let text = format!(
+            "````markdown\n{}````\n{}",
+            inner,
+            block(&minimal_final().to_string())
+        );
+        let parsed = parse_agent_response(&text).unwrap();
+        assert!(parsed.response.command.is_none());
+    }
+
+    #[test]
+    fn lookalike_labels_are_not_the_protocol_block() {
+        let body = ls_command();
+        for info in [
+            "cgpt-agent-response-v1x",
+            "CGPT-AGENT-RESPONSE-V1",
+            "Cgpt-agent-response-v1",
+            "cgpt-agent-response-v1 json",
+            "json cgpt-agent-response-v1",
+        ] {
+            let text = format!("```{}\n{}\n```\n", info, body);
+            assert_eq!(
+                parse_agent_response(&text),
+                Err(ParseError::NoBlock),
+                "info {:?}",
+                info
+            );
+        }
+        // Tilde fences are display-only: the protocol block uses backticks.
+        let text = format!("~~~{}\n{}\n~~~\n", AGENT_FENCE_INFO, body);
+        assert_eq!(parse_agent_response(&text), Err(ParseError::NoBlock));
+    }
+
+    #[test]
+    fn indented_agent_fence_is_a_code_sample() {
+        // CommonMark: four or more spaces (or a tab) before the fence make
+        // an indented code block, i.e. a quoted sample. Never a proposal.
+        let body = ls_command();
+        for indent in ["    ", "      ", "\t", " \t", "   \t", "\u{a0}"] {
+            let text = format!(
+                "Example:\n\n{i}```{}\n{i}{}\n{i}```\n",
+                AGENT_FENCE_INFO,
+                body,
+                i = indent
+            );
+            assert_eq!(
+                parse_agent_response(&text),
+                Err(ParseError::NoBlock),
+                "indent {:?}",
+                indent
+            );
+        }
+        for indent in ["", " ", "  ", "   "] {
+            let text = format!(
+                "1. Step:\n\n{i}```{}\n{i}{}\n{i}```\n",
+                AGENT_FENCE_INFO,
+                body,
+                i = indent
+            );
+            let parsed = parse_agent_response(&text).unwrap();
+            assert_eq!(parsed.response.command.unwrap().command, "ls -la");
+        }
+    }
+
+    #[test]
+    fn longer_backtick_fence_with_the_label_is_accepted() {
+        let text = format!("````{}\n{}\n````\n", AGENT_FENCE_INFO, ls_command());
+        let parsed = parse_agent_response(&text).unwrap();
+        assert_eq!(parsed.response.command.unwrap().command, "ls -la");
     }
 
     #[test]

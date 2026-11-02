@@ -9,29 +9,14 @@
 //!   - All progress, warnings, and errors go to stderr.
 //!   - Exit codes are categorized.
 
-use std::io::{self, IsTerminal, Read};
 use std::process::ExitCode;
 
-use cgpt_bridge_cli::{args, clipboard, editor, history, spinner::Phase, transport};
-use cgpt_bridge_protocol::{AskRequest, BridgeResponse, ErrorCode};
+use cgpt_bridge_cli::exit::{interrupted_message, no_answer_message, too_large_message, ExitKind};
+use cgpt_bridge_cli::{args, clipboard, history, input, spinner::Phase, transport};
+use cgpt_bridge_protocol::{AskRequest, BridgeResponse};
 
 use args::{Cli, Command};
 use transport::AskOutcome;
-
-/// CLI exit codes (subset of docs/requirements.md §9 that M5-phase-1 can
-/// produce). Stable, do not reorder.
-#[repr(u8)]
-enum ExitKind {
-    Ok = 0,
-    Generic = 1,
-    Usage = 2,
-    Setup = 3,
-    Transport = 4,
-    Tab = 5,
-    Dom = 6,
-    Protocol = 7,
-    Internal = 11,
-}
 
 fn main() -> ExitCode {
     let cli = match args::parse() {
@@ -44,7 +29,7 @@ fn main() -> ExitCode {
             let _ = e.print();
             return ExitCode::from(match e.exit_code() {
                 0 => 0,
-                _ => ExitKind::Usage as u8,
+                _ => ExitKind::Usage.code(),
             });
         }
     };
@@ -57,7 +42,7 @@ fn main() -> ExitCode {
     }
 
     let code = run(cli);
-    ExitCode::from(code as u8)
+    ExitCode::from(code.code())
 }
 
 fn run(cli: Cli) -> ExitKind {
@@ -65,8 +50,6 @@ fn run(cli: Cli) -> ExitKind {
         Command::Ask(ask) => run_ask(ask, &cli.socket_override),
         Command::Agent(agent_args) => {
             let code = cgpt_bridge_cli::agent::run(agent_args, cli.socket_override.clone());
-            // Bypass the local ExitKind enum and exit directly with the
-            // agent loop's chosen code; ExitKind only models the ask path.
             std::process::exit(code as i32);
         }
         Command::History(h) => std::process::exit(history::run_history(h) as i32),
@@ -75,8 +58,23 @@ fn run(cli: Cli) -> ExitKind {
     }
 }
 
+const ASK_USAGE: &str = "cgpt: no prompt given.\n\
+     Usage: cgpt ask \"<prompt>\"\n\
+     Or pipe text on stdin, e.g.:\n\
+       echo \"hello\" | cgpt ask\n\
+       cargo test 2>&1 | cgpt ask \"explain this failure\"\n\
+     Or read from the OS clipboard / open editor:\n\
+       cgpt ask --buffer\n\
+       cgpt ask --editor";
+
 fn run_ask(cmd: args::AskArgs, socket_override: &Option<std::path::PathBuf>) -> ExitKind {
-    let prompt = match collect_prompt(&cmd.prompt, cmd.buffer, cmd.editor) {
+    let prompt = match input::collect(
+        &cmd.prompt,
+        cmd.buffer,
+        cmd.editor,
+        !cmd.no_redact,
+        ASK_USAGE,
+    ) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -89,22 +87,32 @@ fn run_ask(cmd: args::AskArgs, socket_override: &Option<std::path::PathBuf>) -> 
         }
     };
 
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|dir| transport::project_for(&dir));
     let request = AskRequest {
         id: transport::new_request_id("ask"),
         text: prompt,
         timeout_ms: cmd.timeout_ms,
+        target: None,
+        project,
     };
 
     let phase = Phase::start("asking ChatGPT…");
     let outcome = transport::ask_once(&socket_path, &request, cmd.timeout_ms);
+    let kind = ExitKind::for_outcome(&outcome);
 
     match outcome {
-        AskOutcome::Ok(BridgeResponse::AskResult { text, .. }) => {
+        AskOutcome::Ok(BridgeResponse::AskResult { text, warning, .. }) => {
             phase.done(format!("reply received ({} chars)", text.chars().count()));
+            transport::show_warning(warning.as_deref());
             // Stdout = assistant text only. Single trailing newline so
             // `cgpt ask "x" | wc -l` behaves like other CLIs.
-            print!("{}", text);
-            if !text.ends_with('\n') {
+            // Model text, so control characters are escaped the same way as
+            // in `cgpt agent`; the clipboard keeps the answer as received.
+            let shown = cgpt_bridge_cli::runner::safe_text(&text);
+            print!("{}", shown);
+            if !shown.ends_with('\n') {
                 println!();
             }
             if cmd.copy {
@@ -112,17 +120,25 @@ fn run_ask(cmd: args::AskArgs, socket_override: &Option<std::path::PathBuf>) -> 
                     eprintln!("cgpt: --copy: clipboard write failed: {}", e);
                 }
             }
-            ExitKind::Ok
+            kind
         }
-        AskOutcome::Ok(BridgeResponse::Pong { .. }) => {
-            phase.fail("host returned pong (protocol bug)");
-            eprintln!("cgpt: host returned pong for an ask request (protocol bug)");
-            ExitKind::Protocol
+        AskOutcome::Ok(
+            BridgeResponse::Pong { .. }
+            | BridgeResponse::Stopped { .. }
+            | BridgeResponse::StatusResult { .. },
+        ) => {
+            phase.fail("host returned a non-ask response (protocol bug)");
+            eprintln!("cgpt: host returned a non-ask response for an ask request (protocol bug)");
+            kind
         }
         AskOutcome::Ok(BridgeResponse::Error { code, message, .. }) => {
             phase.fail(format!("host error: {:?}", code));
-            eprintln!("cgpt: host error ({:?}): {}", code, message);
-            map_error_code(code)
+            eprintln!(
+                "cgpt: host error ({:?}): {}",
+                code,
+                cgpt_bridge_cli::runner::escape_control(&message)
+            );
+            kind
         }
         AskOutcome::SocketMissing => {
             phase.fail("native host socket missing");
@@ -131,112 +147,31 @@ fn run_ask(cmd: args::AskArgs, socket_override: &Option<std::path::PathBuf>) -> 
                  The native host is not running. Verify that:\n\
                  - The cgpt-bridge Chrome extension is installed and enabled.\n\
                  - Chrome is open with the extension active.\n\
-                 - The native messaging manifest has been installed via\n\
-                 install/macos/install-host.sh (M5 phase 2 wires this up).",
-                socket_path.display(),
+                 - The native messaging manifest has been installed (macOS: install.sh\n\
+                 or install/macos/install-host.sh; Linux: install/linux/install-host.sh).",
+                socket_path,
             );
-            ExitKind::Setup
+            kind
         }
         AskOutcome::SocketIo(e) => {
             phase.fail(format!("transport error: {}", e));
-            ExitKind::Transport
+            kind
         }
         AskOutcome::Timeout => {
-            phase.fail(format!("timed out after {}ms", cmd.timeout_ms));
-            ExitKind::Tab
+            phase.fail(no_answer_message(cmd.timeout_ms));
+            kind
+        }
+        AskOutcome::TooLarge { len, cap } => {
+            phase.fail(too_large_message(len, cap));
+            kind
         }
         AskOutcome::BadResponse(msg) => {
             phase.fail(format!("bad host response: {}", msg));
-            ExitKind::Protocol
+            kind
+        }
+        AskOutcome::Interrupted(stop) => {
+            phase.fail(interrupted_message(&stop));
+            cgpt_bridge_cli::interrupt::die()
         }
     }
-}
-
-fn map_error_code(code: ErrorCode) -> ExitKind {
-    match code {
-        ErrorCode::BadRequest => ExitKind::Usage,
-        ErrorCode::OversizeFrame => ExitKind::Transport,
-        ErrorCode::ExtensionUnavailable => ExitKind::Setup,
-        ErrorCode::TabUnavailable => ExitKind::Tab,
-        ErrorCode::DomFailure => ExitKind::Dom,
-        ErrorCode::Timeout => ExitKind::Tab,
-        ErrorCode::Internal => ExitKind::Internal,
-    }
-}
-
-/// Combine positional args, optional secondary input source, and optional
-/// editor pass into the prompt text. Source resolution:
-///   - `--buffer`  : secondary is the OS clipboard, stdin untouched.
-///   - otherwise   : secondary is stdin when piped (non-TTY).
-///   - `--editor`  : the combined prompt is fed to `$EDITOR` as an initial
-///                   template; the user's final saved buffer wins.
-///
-/// If after all of the above the result is empty, exit code 2.
-fn collect_prompt(
-    positional: &[String],
-    buffer: bool,
-    editor_flag: bool,
-) -> Result<String, ExitKind> {
-    let positional_text = if positional.is_empty() {
-        None
-    } else {
-        Some(positional.join(" "))
-    };
-
-    let secondary = if buffer {
-        match clipboard::read() {
-            Ok(s) if !s.trim().is_empty() => Some(s),
-            Ok(_) => None,
-            Err(e) => {
-                eprintln!("cgpt: --buffer: failed to read clipboard: {}", e);
-                return Err(ExitKind::Usage);
-            }
-        }
-    } else if io::stdin().is_terminal() {
-        None
-    } else {
-        let mut buf = String::new();
-        io::stdin().lock().read_to_string(&mut buf).map_err(|e| {
-            eprintln!("cgpt: failed to read stdin: {}", e);
-            ExitKind::Generic
-        })?;
-        if buf.trim().is_empty() {
-            None
-        } else {
-            Some(buf)
-        }
-    };
-
-    let mut combined = match (positional_text, secondary) {
-        (Some(a), Some(b)) => format!("{}\n\n{}", a, b),
-        (Some(a), None) => a,
-        (None, Some(b)) => b,
-        (None, None) => String::new(),
-    };
-
-    if editor_flag {
-        combined = match editor::capture(&combined) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("cgpt: --editor: {}", e);
-                return Err(ExitKind::Generic);
-            }
-        };
-    }
-
-    if combined.trim().is_empty() {
-        eprintln!(
-            "cgpt: no prompt given.\n\
-             Usage: cgpt ask \"<prompt>\"\n\
-             Or pipe text on stdin, e.g.:\n\
-               echo \"hello\" | cgpt ask\n\
-               cargo test 2>&1 | cgpt ask \"explain this failure\"\n\
-             Or read from the OS clipboard / open editor:\n\
-               cgpt ask --buffer\n\
-               cgpt ask --editor"
-        );
-        return Err(ExitKind::Usage);
-    }
-
-    Ok(combined)
 }

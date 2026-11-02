@@ -8,7 +8,8 @@
 # included Install.command.
 #
 # Output:
-#   dist/cgpt-bridge-<version>-macos-<arch>.dmg
+#   dist/cgpt-bridge-<version>-<build>-macos-<arch>.dmg
+#   dist/SHA256SUMS  (the .tar.gz line from build-release.sh plus the .dmg)
 
 set -euo pipefail
 
@@ -21,6 +22,10 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+# One build id for the bundle and the .dmg (see scripts/build-id.sh).
+CGPT_BUILD="$("$SCRIPT_DIR/build-id.sh")"
+export CGPT_BUILD
+
 # ---------------------------------------------------------------------------
 # Reuse the regular bundle. Idempotent: if you ran build-release.sh already
 # the bundle is reused as-is.
@@ -29,7 +34,7 @@ fi
 
 VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
 ARCH="$(uname -m)"
-BUNDLE_NAME="cgpt-bridge-${VERSION}-macos-${ARCH}"
+BUNDLE_NAME="cgpt-bridge-${VERSION}-${CGPT_BUILD}-macos-${ARCH}"
 BUNDLE_DIR="dist/${BUNDLE_NAME}"
 DMG_NAME="${BUNDLE_NAME}.dmg"
 DMG_PATH="dist/${DMG_NAME}"
@@ -153,9 +158,25 @@ hdiutil create \
 # Tidy up the staging dir; keep the bundle (someone may still want it).
 rm -rf "$STAGE"
 
+# ---------------------------------------------------------------------------
+# Checksum: dist/SHA256SUMS (written by build-release.sh for the tarball)
+# gets the .dmg's line too, in the same `sha256sum` format; both are then
+# checked with `shasum -a 256 -c`.
+# ---------------------------------------------------------------------------
+echo "==> Adding ${DMG_NAME} to dist/SHA256SUMS"
+(
+  cd dist
+  # Drop a line from an earlier run for the same name, then append ours.
+  grep -v -F "  ${DMG_NAME}" SHA256SUMS > SHA256SUMS.tmp || true
+  shasum -a 256 "${DMG_NAME}" >> SHA256SUMS.tmp
+  mv SHA256SUMS.tmp SHA256SUMS
+  shasum -a 256 -c SHA256SUMS
+)
+
 echo ""
 echo "Built DMG: $DMG_PATH"
 echo "          ($(du -h "$DMG_PATH" | cut -f1))"
+echo "Checksums: dist/SHA256SUMS"
 echo ""
 echo "Mount it locally to smoke-test:"
 echo "  open $DMG_PATH"

@@ -1,0 +1,1 @@
+{ "type": "ask", "id": "a1", "text": "hello", "timeout_ms": 60000 }

@@ -1,0 +1,16 @@
+{
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "ChatGPT Web (bridge)",
+  "options": {
+    "baseURL": "http://127.0.0.1:PORT/v1",
+    "apiKey": "TOKEN"
+  },
+  "models": {
+    "chatgpt-web": {
+      "name": "ChatGPT Web"
+    },
+    "local-title": {
+      "name": "Local title"
+    }
+  }
+}

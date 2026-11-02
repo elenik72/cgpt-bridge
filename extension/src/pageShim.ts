@@ -4,38 +4,57 @@
 // origin. Loaded at `document_start` so we monkey-patch globals before
 // the page wires up its own listeners and before any fetch goes out.
 //
-// What this fixes (in order of how critical each piece turned out to be
+// Everything below is DORMANT unless a bridge request is in flight. The
+// content script switches it on right before it submits a prompt and off
+// when the reply is in (see `setPageShimActive` in chatgptAdapter.ts):
+//
+//   { __cgptBridgeControl: true, active: true, ttlMs }   — on, auto-off after ttlMs
+//   { __cgptBridgeControl: true, active: false }         — off
+//   ← { __cgptBridgeAck: true, active, epoch, v }        — acknowledgement
+//
+// `v` is PAGE_SHIM_PROTOCOL (bridgeProtocol.ts), the version of these
+// messages; the page is marked with it too. A tab keeps its shim across an
+// extension update, and content.ts uses only a shim of its own version.
+//
+// Every "on" starts a new `epoch`. A stream belongs to the epoch the shim
+// was in when the page fetched it, and every report about it carries that
+// epoch: a stream outliving its request (the DOM settled first) keeps
+// reporting after the next "on", and the next request must not take it for
+// its own answer.
+//
+// While active (in order of how critical each piece turned out to be
 // during real testing):
 //
 //   1. SSE stream hijack. The conversation endpoint streams assistant
 //      tokens as Server-Sent Events. When the tab loses focus, ChatGPT's
-//      React rendering of those tokens stalls — the audio "audible-tab"
-//      trick is no longer enough on recent Chrome versions. We tee the
-//      response body and parse the SSE events ourselves in MAIN world,
-//      then `postMessage` the accumulated assistant text to the
-//      isolated-world content script. The adapter resolves
-//      `waitForNewAnswer` as soon as the SSE stream completes, with no
-//      dependency on whether React got around to repainting.
+//      React rendering of those tokens stalls. We tee the response body,
+//      parse the events ourselves (sseParser.ts) and `postMessage` the
+//      answer text to the isolated-world content script, which resolves
+//      `waitForNewAnswer` as soon as the stream completes. An HTTP 429 on
+//      that endpoint is reported as `sse-error` with `status: 429`
+//      (rate limit).
 //
 //   2. `stop_conversation` suppression. The moment a visibilitychange
 //      fires, ChatGPT POSTs `/backend-api/stop_conversation` and the
 //      server cooperatively tears down the in-flight stream. We
 //      short-circuit those POSTs with a synthetic 200 OK so the stream
-//      keeps flowing. Side effect: the in-page "Stop" button no longer
-//      works while pageShim is loaded — acceptable for a cgpt-bridge
-//      session.
+//      keeps flowing. Because this is scoped to a bridge request, the
+//      in-page "Stop" button keeps working the rest of the time.
 //
-//   3. Visibility / focus spoof. Defensive. With (2) the stream survives
-//      regardless of page state, but pinning `document.hidden` /
-//      `visibilityState` / `hasFocus` to "visible+focused" and
-//      swallowing `visibilitychange` / `blur` / `pagehide` / `freeze`
-//      stops ChatGPT's UI from briefly reacting to the blur (graying
-//      buttons, showing "background" hints, etc.). Cheap and harmless.
+//   3. Visibility / focus spoof. Pinning `document.hidden` /
+//      `visibilityState` / `hasFocus` to "visible+focused" and swallowing
+//      `visibilitychange` / `blur` / `pagehide` / `freeze` stops ChatGPT's
+//      UI from reacting to the blur. When the request ends the real values
+//      come back and, if the tab is hidden, the page gets one synthetic
+//      `visibilitychange` so it re-syncs.
+
+import { PAGE_SHIM_PROTOCOL } from "./bridgeProtocol";
+import { SseFramer, answerText, isComplete, newSseState, sseAccumulate } from "./sseParser";
 
 (() => {
   const W = window as unknown as Record<string, unknown>;
   if (W.__cgptBridgePageShim) return;
-  W.__cgptBridgePageShim = true;
+  W.__cgptBridgePageShim = PAGE_SHIM_PROTOCOL;
 
   const TAG = "[cgpt-bridge:shim]";
   const debug = (...args: unknown[]) => {
@@ -49,24 +68,78 @@
     }
   };
 
-  // ─── visibility / focus spoof ────────────────────────────────────────
-  const def = (obj: object, key: string, getter: () => unknown) => {
+  // ─── activation ──────────────────────────────────────────────────────
+  let active = false;
+  let epoch = 0;
+  let expiry: ReturnType<typeof setTimeout> | null = null;
+  const setActive = (on: boolean, ttlMs: number): void => {
+    if (expiry !== null) {
+      clearTimeout(expiry);
+      expiry = null;
+    }
+    const was = active;
+    active = on;
+    if (on) {
+      // Safety net: if the content script never switches us off (tab
+      // navigated, extension reloaded mid-request), go dormant anyway.
+      expiry = setTimeout(() => setActive(false, 0), Math.max(ttlMs, 1_000));
+    }
+    if (was !== on) debug(on ? "active" : "dormant");
+    if (was && !on && realHidden()) {
+      try {
+        document.dispatchEvent(new Event("visibilitychange"));
+      } catch {
+        /* */
+      }
+    }
+  };
+  window.addEventListener("message", (ev: MessageEvent) => {
+    if (ev.source !== window) return;
+    const d = ev.data as Record<string, unknown> | null;
+    if (!d || typeof d !== "object" || d.__cgptBridgeControl !== true) return;
+    const ttl = typeof d.ttlMs === "number" ? d.ttlMs : 0;
+    if (d.active === true) epoch++;
+    setActive(d.active === true, ttl);
     try {
-      Object.defineProperty(obj, key, {
+      window.postMessage(
+        { __cgptBridgeAck: true, active, epoch, v: PAGE_SHIM_PROTOCOL },
+        window.location.origin,
+      );
+    } catch {
+      /* */
+    }
+  });
+
+  // ─── visibility / focus spoof ────────────────────────────────────────
+  const protoGetter = (key: string): (() => unknown) | null => {
+    const desc = Object.getOwnPropertyDescriptor(Document.prototype, key);
+    return desc && typeof desc.get === "function" ? desc.get : null;
+  };
+  const realHiddenGetter = protoGetter("hidden");
+  const realHidden = (): boolean =>
+    realHiddenGetter ? Boolean(realHiddenGetter.call(document)) : false;
+
+  const spoof = (key: string, fake: unknown) => {
+    const real = protoGetter(key);
+    if (!real) return;
+    try {
+      Object.defineProperty(document, key, {
         configurable: true,
         enumerable: true,
-        get: getter,
+        get: () => (active ? fake : real.call(document)),
       });
     } catch {
       /* non-configurable on some Chromium builds */
     }
   };
-  def(document, "hidden", () => false);
-  def(document, "visibilityState", () => "visible");
-  def(document, "webkitHidden", () => false);
-  def(document, "webkitVisibilityState", () => "visible");
+  spoof("hidden", false);
+  spoof("visibilityState", "visible");
+  spoof("webkitHidden", false);
+  spoof("webkitVisibilityState", "visible");
   try {
-    (document as Document & { hasFocus: () => boolean }).hasFocus = () => true;
+    const realHasFocus = document.hasFocus.bind(document);
+    (document as Document & { hasFocus: () => boolean }).hasFocus = () =>
+      active ? true : realHasFocus();
   } catch {
     /* readonly on locked-down builds */
   }
@@ -79,6 +152,7 @@
     "freeze",
   ];
   const swallow = (e: Event) => {
+    if (!active) return;
     try {
       e.stopImmediatePropagation();
     } catch {
@@ -103,9 +177,9 @@
     return String(input);
   };
 
-  // Endpoints that cancel an in-flight chat. We short-circuit them with
-  // a fake success response so the SSE stream keeps flowing.
-  const STOP_RE = /\/backend-api\/(stop_conversation|conversation\/stop|f\/conversation\/finalize)/;
+  // Endpoints that cancel an in-flight chat. Prefix-agnostic: the octane
+  // front-end calls `/stop_conversation` without `/backend-api`.
+  const STOP_RE = /\/(?:backend-api\/|backend-anon\/)?(?:stop_conversation|conversation\/stop|f\/conversation\/finalize)(?:[?#]|$)/;
   const fakeOkResponse = (note: string): Response => {
     const body = JSON.stringify({
       success: true,
@@ -120,11 +194,13 @@
   };
 
   // ─── SSE stream hijack ───────────────────────────────────────────────
-  const CONVERSATION_RE = /\/backend-api\/(f\/)?conversation(\?|$|\/?)/;
-  const postToContent = (payload: object) => {
+  // Only the answer stream itself — not `/f/conversation/prepare`, `/init`
+  // or the `/conversations` list, which share the prefix.
+  const CONVERSATION_RE = /\/backend-api\/(f\/)?conversation\/?(\?|$)/;
+  const postToContent = (streamEpoch: number, payload: object) => {
     try {
       window.postMessage(
-        { __cgptBridge: true, ...payload },
+        { __cgptBridge: true, epoch: streamEpoch, ...payload },
         window.location.origin,
       );
     } catch {
@@ -132,109 +208,64 @@
     }
   };
 
-  // Pull assistant text out of a single SSE `data:` JSON event.
-  // ChatGPT uses several shapes: legacy `{message:{content:{parts:[...]}}}`
-  // and newer `{v: "..."} | {p: "/message/content/parts/0", o:"append", v:"..."} | {o:"patch", v:[{p:"...", o:"append", v:"..."}]}`.
-  // We aggregate by walking known patches and patches-of-patches.
-  const sseAccumulate = (
-    state: { text: string },
-    eventData: string,
-  ): void => {
-    if (!eventData || eventData === "[DONE]") return;
-    let obj: unknown;
-    try {
-      obj = JSON.parse(eventData);
-    } catch {
-      return;
-    }
-    const visit = (o: unknown) => {
-      if (o === null || typeof o !== "object") return;
-      const node = o as Record<string, unknown>;
-      // Legacy shape: a full message object.
-      const msg = node.message as Record<string, unknown> | undefined;
-      if (msg && typeof msg === "object") {
-        const content = msg.content as Record<string, unknown> | undefined;
-        if (content) {
-          const parts = content.parts as unknown[] | undefined;
-          if (Array.isArray(parts) && parts.length > 0 && typeof parts[0] === "string") {
-            // Full replacement (most recent text wins).
-            state.text = parts[0] as string;
-          }
-        }
-      }
-      // Newer streaming patch shape: { v: "text" } at the top level,
-      // applied as append to current text.
-      if (typeof node.v === "string" && node.o === undefined && !msg) {
-        state.text += node.v;
-      }
-      // Path-based patch: { p: "/message/content/parts/0", o: "append", v: "text" }
-      if (typeof node.p === "string" && typeof node.v === "string") {
-        if (node.p.indexOf("/message/content/parts/0") >= 0) {
-          if (node.o === "append" || node.o === undefined) {
-            state.text += node.v;
-          } else if (node.o === "replace") {
-            state.text = node.v;
-          }
-        }
-      }
-      // Batched patches: { o: "patch", v: [ { p: "...", o: "append", v: "..." }, ... ] }
-      if (node.o === "patch" && Array.isArray(node.v)) {
-        for (const sub of node.v as unknown[]) visit(sub);
-      }
-    };
-    visit(obj);
-  };
-
-  const teeAndParseSse = (response: Response): Response => {
+  const teeAndParseSse = (response: Response, streamEpoch: number): Response => {
     if (!response.body) return response;
     const ct = response.headers.get("content-type") ?? "";
     if (ct.indexOf("event-stream") < 0) return response;
     const [pageStream, ourStream] = response.body.tee();
     const reader = ourStream.getReader();
     const decoder = new TextDecoder();
-    const state = { text: "" };
-    let buffer = "";
+    const framer = new SseFramer();
+    const state = newSseState();
     let lastReported = "";
     let chunkCount = 0;
+    let doneSent = false;
+    // Lets the content script hold its DOM-based "done" until the stream
+    // has actually produced text (the DOM can look settled before that).
+    postToContent(streamEpoch, { kind: "sse-start", text: "" });
     const reportIfChanged = () => {
-      if (state.text !== lastReported) {
-        lastReported = state.text;
-        postToContent({
-          kind: "sse-tokens",
-          text: state.text,
-        });
+      const text = answerText(state);
+      if (text !== lastReported) {
+        lastReported = text;
+        postToContent(streamEpoch, { kind: "sse-tokens", text });
       }
+    };
+    // ChatGPT aborts the fetch right after `[DONE]`, so "done" is driven by
+    // the stream's own completion markers, not by the body ending.
+    const sendDone = () => {
+      if (doneSent) return;
+      doneSent = true;
+      const text = answerText(state);
+      debug("SSE done; answer chars=", text.length, "messages=", state.messages.length, "chunks=", chunkCount);
+      postToContent(streamEpoch, { kind: "sse-done", text });
+      reader.cancel().catch(() => {});
     };
     const pump = (): Promise<void> =>
       reader.read().then(({ done, value }) => {
         if (done) {
-          // Flush any remaining buffer just in case.
-          if (buffer.length > 0) {
-            for (const line of buffer.split(/\r?\n/)) {
-              if (line.startsWith("data:")) sseAccumulate(state, line.slice(5).trim());
-            }
-            buffer = "";
-          }
+          for (const ev of framer.flush()) sseAccumulate(state, ev);
           reportIfChanged();
-          debug("SSE done; total chars=", state.text.length, "chunks=", chunkCount);
-          postToContent({ kind: "sse-done", text: state.text });
+          sendDone();
           return;
         }
         chunkCount++;
-        buffer += decoder.decode(value, { stream: true });
-        let nl: number;
-        while ((nl = buffer.indexOf("\n")) >= 0) {
-          const raw = buffer.slice(0, nl).trimEnd();
-          buffer = buffer.slice(nl + 1);
-          if (raw.startsWith("data:")) {
-            sseAccumulate(state, raw.slice(5).trim());
-          }
+        for (const ev of framer.push(decoder.decode(value, { stream: true }))) {
+          sseAccumulate(state, ev);
         }
         reportIfChanged();
+        if (isComplete(state)) {
+          sendDone();
+          return;
+        }
         return pump();
       }).catch((err) => {
+        if (doneSent) return;
+        doneSent = true;
+        // A read that breaks off (network cut, the page aborting its fetch)
+        // carries no status: the content script then waits for the page's
+        // own answer instead of failing (waitForNewAnswer, `streamCut`).
         debug("SSE pump error:", err);
-        postToContent({ kind: "sse-error", message: String(err) });
+        postToContent(streamEpoch, { kind: "sse-error", message: String(err) });
       });
     void pump();
     return new Response(pageStream, {
@@ -251,19 +282,30 @@
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> {
-    try {
-      const url = urlOf(input);
-      if (STOP_RE.test(url)) {
-        debug("DROPPED stop_conversation request (URL):", url);
-        return fakeOkResponse("stop_conversation suppressed to keep stream alive");
+    if (active) {
+      try {
+        const url = urlOf(input);
+        if (STOP_RE.test(url)) {
+          debug("DROPPED stop_conversation request (URL):", url);
+          return fakeOkResponse("stop_conversation suppressed to keep stream alive");
+        }
+        if (CONVERSATION_RE.test(url)) {
+          debug("intercepting SSE conversation:", url);
+          // Taken before the await: the shim may be switched over meanwhile.
+          const streamEpoch = epoch;
+          const response = await originalFetch(input, init);
+          if (response.status === 429) {
+            // ChatGPT throttles the account. The page shows its own notice;
+            // the content script turns this into a `rate_limited` error.
+            debug("conversation stream answered HTTP 429");
+            postToContent(streamEpoch, { kind: "sse-error", status: 429, message: "HTTP 429 on the answer stream" });
+            return response;
+          }
+          return teeAndParseSse(response, streamEpoch);
+        }
+      } catch (err) {
+        debug("fetch shim error (passing through):", err);
       }
-      if (CONVERSATION_RE.test(url)) {
-        debug("intercepting SSE conversation:", url);
-        const response = await originalFetch(input, init);
-        return teeAndParseSse(response);
-      }
-    } catch (err) {
-      debug("fetch shim error (passing through):", err);
     }
     return originalFetch(input, init);
   } as typeof window.fetch;
@@ -281,7 +323,7 @@
     ): boolean {
       try {
         const u = typeof url === "string" ? url : url.toString();
-        if (STOP_RE.test(u)) {
+        if (active && STOP_RE.test(u)) {
           debug("DROPPED stop_conversation sendBeacon:", u);
           return true;
         }
@@ -316,7 +358,7 @@
   ): void {
     try {
       const url = this.__cgptUrl ?? "";
-      if (STOP_RE.test(url)) {
+      if (active && STOP_RE.test(url)) {
         debug("DROPPED stop_conversation XHR:", url);
         // Synthesize a 200 OK so callers waiting on readystatechange
         // observe a successful completion. Best-effort; if the consumer
@@ -347,5 +389,5 @@
     return xhrSend.call(this, body);
   };
 
-  debug("page shim installed");
+  debug("page shim installed (dormant)");
 })();

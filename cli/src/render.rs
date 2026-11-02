@@ -17,8 +17,9 @@ use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::sync::OnceLock;
 
+use cgpt_bridge_protocol::fence::{fence_open, fenced_blocks, Fence};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Style, Theme, ThemeSet};
+use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
 use termimad::crossterm::style::Color;
@@ -65,32 +66,21 @@ pub fn autofence_unfenced_code(text: &str) -> String {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
-    let mut in_fence = false;
-    let mut fence_marker: &str = "";
+    let mut open: Option<Fence> = None;
 
     while i < lines.len() {
-        let trimmed = lines[i].trim_start().trim_end_matches('\n');
-
-        // Pass fenced regions through unchanged. Toggle state on each fence.
-        if !in_fence {
-            if let Some(marker) = detect_fence_open(trimmed) {
-                in_fence = true;
-                fence_marker = marker;
-                out.push_str(lines[i]);
-                i += 1;
-                continue;
+        // Pass fenced regions through unchanged (the shared CommonMark
+        // fence rule, so a ```` block may hold ``` lines).
+        if let Some(fence) = &open {
+            if fence.closes(lines[i]) {
+                open = None;
             }
-        } else if trimmed.starts_with(fence_marker)
-            && trimmed[fence_marker.len()..].trim().is_empty()
-        {
-            in_fence = false;
-            fence_marker = "";
             out.push_str(lines[i]);
             i += 1;
             continue;
         }
-
-        if in_fence {
+        if let Some((fence, _)) = fence_open(lines[i]) {
+            open = Some(fence);
             out.push_str(lines[i]);
             i += 1;
             continue;
@@ -294,71 +284,28 @@ enum Segment {
     Code { lang: String, body: String },
 }
 
-/// Walk the markdown line by line, separating fenced code blocks from
-/// non-code prose. Recognises ``` and ~~~ fences with optional language
-/// info string. A fence must start at column 0 (after optional spaces but
-/// not inside another block), matching what termimad treats as a code
-/// fence. This is intentionally tolerant: malformed markdown still renders.
+/// Separate fenced code blocks from non-code prose, using the shared
+/// CommonMark fence scanner: ``` and ~~~ fences (or longer runs) with an
+/// optional language info string, so a ```` block holding ``` lines is one
+/// block. An unterminated fence still renders as code to the end of the
+/// text, so the user sees the content.
 fn split_into_segments(text: &str) -> Vec<Segment> {
     let mut out: Vec<Segment> = Vec::new();
-    let mut prose = String::new();
-    let mut in_code = false;
-    let mut code_lang = String::new();
-    let mut code_body = String::new();
-    let mut fence_marker = "";
-
-    for raw_line in text.split_inclusive('\n') {
-        let line = raw_line.trim_end_matches('\n');
-        let trimmed = line.trim_start();
-
-        if !in_code {
-            if let Some(marker) = detect_fence_open(trimmed) {
-                if !prose.is_empty() {
-                    out.push(Segment::Prose(std::mem::take(&mut prose)));
-                }
-                fence_marker = marker;
-                code_lang = trimmed[marker.len()..].trim().to_string();
-                code_body.clear();
-                in_code = true;
-                continue;
-            }
-            prose.push_str(raw_line);
-        } else if trimmed.starts_with(fence_marker)
-            && trimmed[fence_marker.len()..].trim().is_empty()
-        {
-            // Closing fence.
-            out.push(Segment::Code {
-                lang: std::mem::take(&mut code_lang),
-                body: std::mem::take(&mut code_body),
-            });
-            in_code = false;
-            fence_marker = "";
-        } else {
-            code_body.push_str(raw_line);
+    let mut prose_start = 0;
+    for block in fenced_blocks(text) {
+        if block.start > prose_start {
+            out.push(Segment::Prose(text[prose_start..block.start].to_string()));
         }
-    }
-
-    if in_code {
-        // Unterminated fence: render whatever we have as code anyway, so
-        // the user still sees the content.
+        prose_start = block.end;
         out.push(Segment::Code {
-            lang: code_lang,
-            body: code_body,
+            lang: block.info,
+            body: block.body,
         });
-    } else if !prose.is_empty() {
-        out.push(Segment::Prose(prose));
+    }
+    if prose_start < text.len() {
+        out.push(Segment::Prose(text[prose_start..].to_string()));
     }
     out
-}
-
-fn detect_fence_open(line: &str) -> Option<&'static str> {
-    if line.starts_with("```") {
-        Some("```")
-    } else if line.starts_with("~~~") {
-        Some("~~~")
-    } else {
-        None
-    }
 }
 
 fn highlight_code_block(lang: &str, body: &str) -> String {
@@ -442,12 +389,6 @@ fn terminal_width() -> usize {
     termimad::terminal_size().0 as usize
 }
 
-// Hold onto Style import so the `use` at the top isn't flagged as dead
-// when as_24_bit_terminal_escaped is the only consumer of the type
-// alias chain.
-#[allow(dead_code)]
-fn _style_keepalive(_: Style) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +430,52 @@ mod tests {
             }
             _ => panic!("expected Code"),
         }
+    }
+
+    #[test]
+    fn corpus_code_segments_are_the_top_level_blocks() {
+        for case in cgpt_bridge_protocol::fence::corpus::FENCE_CORPUS {
+            let code: Vec<(String, String)> = split_into_segments(case.input)
+                .into_iter()
+                .filter_map(|s| match s {
+                    Segment::Code { lang, body } => Some((lang, body)),
+                    Segment::Prose(_) => None,
+                })
+                .collect();
+            let want: Vec<(String, String)> = case
+                .blocks
+                .iter()
+                .map(|e| (e.info.to_string(), e.body.to_string()))
+                .collect();
+            assert_eq!(code, want, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn four_backtick_block_renders_as_one_block() {
+        let md = "Format:\n\n````md\n```rust\nfn main() {}\n```\n````\n\ntail\n";
+        let segs = split_into_segments(md);
+        assert_eq!(segs.len(), 3, "prose, one code block, prose");
+        match &segs[1] {
+            Segment::Code { lang, body } => {
+                assert_eq!(lang, "md");
+                assert_eq!(body, "```rust\nfn main() {}\n```\n");
+            }
+            _ => panic!("expected Code"),
+        }
+        match (&segs[0], &segs[2]) {
+            (Segment::Prose(a), Segment::Prose(b)) => {
+                assert_eq!(a, "Format:\n\n");
+                assert_eq!(b, "\ntail\n");
+            }
+            _ => panic!("expected Prose around the block"),
+        }
+    }
+
+    #[test]
+    fn autofence_leaves_code_inside_a_four_backtick_block_alone() {
+        let input = "````markdown\n```js\nconst a = 1;\n```\nconst b = 2;\nconst c = 3;\n````\n";
+        assert_eq!(autofence_unfenced_code(input), input);
     }
 
     #[test]

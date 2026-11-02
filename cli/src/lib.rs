@@ -7,11 +7,13 @@
 pub mod agent;
 pub mod args;
 pub mod clipboard;
-pub mod denylist;
 pub mod editor;
+pub mod exit;
 pub mod history;
+pub mod input;
+pub mod interrupt;
 pub mod plan;
-pub mod redact;
+pub use cgpt_bridge_core::{denylist, redact};
 pub mod render;
 pub mod runner;
 pub mod spinner;

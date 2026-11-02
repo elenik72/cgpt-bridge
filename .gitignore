@@ -7,6 +7,7 @@
 # Node / extension build output
 /extension/node_modules/
 /extension/dist/
+/extension/.test-build/
 
 # Per-project agent state — never commit
 /.cgpt-bridge/
@@ -26,3 +27,6 @@
 # extension/manifest.json (`key` field), the private half lives only here
 # and is needed only if we ever publish to the Chrome Web Store.
 extension/key.pem
+
+# Superpowers scratch (SDD ledgers, brainstorm mockups)
+.superpowers/

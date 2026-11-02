@@ -74,6 +74,14 @@ pub struct AskArgs {
     #[arg(long = "editor", default_value_t = false)]
     pub editor: bool,
 
+    /// Send the text as it is. By default the words, stdin and clipboard
+    /// text are redacted with the same secret rules as command output
+    /// before they are sent to ChatGPT (and, for `agent`, before they are
+    /// saved under `.cgpt-bridge/`); one stderr line names the rules that
+    /// fired. The rules are a heuristic: some secrets pass.
+    #[arg(long = "no-redact", default_value_t = false)]
+    pub no_redact: bool,
+
     /// After printing, also copy the assistant response to the OS clipboard
     /// via `pbcopy` (macOS) / `wl-copy`/`xclip`/`xsel` (Linux).
     #[arg(long = "copy", default_value_t = false)]
@@ -90,7 +98,16 @@ pub struct AgentArgs {
     #[arg(long = "timeout-ms", default_value_t = 120_000)]
     pub timeout_ms: u64,
 
-    /// Auto-approve commands the **local** classifier marks `read_only`.
+    /// Auto-approve commands the **local** classifier marks `read_only` that
+    /// also pass the narrow auto-run list (`ls`, `cat`, `head`, `tail`, `wc`,
+    /// `stat`, `file`, `grep`, `rg`, `find`, `tree`, `sort`, `echo`, `pwd`,
+    /// `which`, each with whitelisted flags; never git, version queries or
+    /// `ps`), if each program is found outside the project and every path
+    /// named in the command, symlinks followed, stays inside the project root
+    /// (a shell expansion such as `$VAR` or `{a,b}` always prompts). Use only
+    /// on repositories you trust. After 20 auto-approved commands in a row
+    /// the next one prompts.
+    /// Their output is sent to ChatGPT after pattern-based redaction.
     /// Everything else still prompts. Denylist hits are always blocked.
     #[arg(long = "auto-readonly", default_value_t = false)]
     pub auto_readonly: bool,
@@ -123,6 +140,14 @@ pub struct AgentArgs {
     /// clipboard, mirroring `cgpt ask --editor`.
     #[arg(long = "editor", default_value_t = false)]
     pub editor: bool,
+
+    /// Send the task as it is. By default the words, stdin and clipboard
+    /// text are redacted with the same secret rules as command output
+    /// before they are sent to ChatGPT and saved under `.cgpt-bridge/`; one
+    /// stderr line names the rules that fired. The rules are a heuristic:
+    /// some secrets pass. (`--resume` text is redacted the same way.)
+    #[arg(long = "no-redact", default_value_t = false)]
+    pub no_redact: bool,
 
     /// After the final message is printed, also copy it to the OS clipboard.
     #[arg(long = "copy", default_value_t = false)]
@@ -339,6 +364,30 @@ mod tests {
                 assert!(a.copy);
             }
             _ => panic!("expected Ask"),
+        }
+    }
+
+    #[test]
+    fn no_redact_flag_parses_for_ask_and_agent_and_is_off_by_default() {
+        let cli = Cli::try_parse_from(["cgpt", "ask", "--no-redact", "x"]).unwrap();
+        match cli.command {
+            Command::Ask(a) => assert!(a.no_redact),
+            _ => panic!("expected ask"),
+        }
+        let cli = Cli::try_parse_from(["cgpt", "agent", "--no-redact", "x"]).unwrap();
+        match cli.command {
+            Command::Agent(a) => assert!(a.no_redact),
+            _ => panic!("expected agent"),
+        }
+        let cli = Cli::try_parse_from(["cgpt", "ask", "x"]).unwrap();
+        match cli.command {
+            Command::Ask(a) => assert!(!a.no_redact),
+            _ => panic!("expected ask"),
+        }
+        let cli = Cli::try_parse_from(["cgpt", "agent", "x"]).unwrap();
+        match cli.command {
+            Command::Agent(a) => assert!(!a.no_redact),
+            _ => panic!("expected agent"),
         }
     }
 }

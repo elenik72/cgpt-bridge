@@ -2,7 +2,7 @@
 
 Staged delivery plan. Each milestone has a clear definition of "done" and a small smoke test. Milestones are ordered to minimize integration risk: documentation and protocol first, then a minimal usable browser path, then the local side, then the safety machinery, then polish.
 
-The current stage is **M1**. No application code has been written.
+Status: the code for M2 to M9 and M11 exists (see the status list in `README.md`); M10 (`cgpt doctor`) is not implemented. The scopes below are the original plan; where a line says "not implemented" it was left out.
 
 ---
 
@@ -85,7 +85,7 @@ Done when:
 Scope:
 
 - Rust CLI binary with subcommand parsing.
-- `cgpt ask` reads args + stdin, opens a connection through the native host to the extension, sends `insert_and_get_response`, prints the response to stdout, logs/errors to stderr.
+- `cgpt ask` reads args + stdin, opens a connection through the native host to the extension, sends an `ask` request, prints the response to stdout, logs/errors to stderr.
 - Per-request timeout flag.
 - Clear stdout/stderr discipline.
 
@@ -122,7 +122,7 @@ Scope:
 - `.cgpt-bridge/plan.md` regenerator from the JSONL log.
 - `.cgpt-bridge/session.json` write/update on session start and on each turn.
 - `.cgpt-bridge/runs/<session-id>/transcript.jsonl` and `command-<id>.json`.
-- Rotating logs under `.cgpt-bridge/logs/`.
+- Rotating logs under `.cgpt-bridge/logs/` (**not implemented**: the folder is created empty; nothing writes to it).
 
 Done when:
 
@@ -169,7 +169,7 @@ Done when:
 
 ## M10 — `cgpt doctor`
 
-Scope:
+**Not implemented.** Scope:
 
 - All checks in `requirements.md` §5.3.
 - Each check prints PASS/FAIL and a remediation hint.
@@ -193,7 +193,7 @@ Scope:
 
 Done when:
 
-- A clean macOS or Linux machine, with Chrome installed and a ChatGPT login, can go from `git clone` to a passing `cgpt doctor` in under ten minutes by following the README.
+- A clean macOS or Linux machine, with Chrome installed and a ChatGPT login, can go from `git clone` to a working `cgpt ask` (the `cgpt doctor` check of the original plan is not implemented) in under ten minutes by following the README.
 
 ---
 

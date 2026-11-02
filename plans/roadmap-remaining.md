@@ -20,7 +20,7 @@ No subcommand exists yet. Required checks:
   origin and the host `path` is executable and matches `bin/cgpt-bridge-host`.
 - UDS socket exists at `default_socket_path()` and accepts a connection.
 - Host responds to a ping frame within a short timeout.
-- Service worker responds to `pingNative()` (extension side).
+- Service worker connects to the host (`[cgpt-bridge] native port opened` in its console).
 - At least one `https://chatgpt.com/*` tab is open in Chrome.
 - Content script in that tab answers a `diagnose` request: composer
   selector resolves, send button resolves, last-assistant `data-message-id`
