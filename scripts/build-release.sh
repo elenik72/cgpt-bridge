@@ -2,11 +2,17 @@
 #
 # cgpt-bridge — release bundler.
 #
-# Builds the CLI and host in release mode, builds the extension, and packs
-# everything into  dist/cgpt-bridge-<version>-<os>-<arch>.tar.gz
+# Builds the CLI, the host and the gateway in release mode, builds the
+# extension, and packs everything into
+#   dist/cgpt-bridge-<version>-<build>-<os>-<arch>.tar.gz
+# (DIST_DIR=<dir> stages somewhere else than dist/.) <build> is the commit's
+# short SHA (scripts/build-id.sh; CGPT_BUILD=<id> overrides it; `-dirty` is
+# appended when the tree has uncommitted changes); the binaries and the
+# extension carry the same id.
 #
-# The tarball is self-contained: drop it on another machine, untar, run the
-# matching install script, load the unpacked extension at chrome://extensions.
+# The tarball is self-contained: drop it on another machine, untar, run
+# ./install.sh (macOS), load the unpacked extension at chrome://extensions.
+# Windows has its own bundler: scripts/build-release.ps1.
 
 set -euo pipefail
 
@@ -28,16 +34,21 @@ case "$OS" in
 esac
 ARCH="$(uname -m)"
 
-BUNDLE_NAME="cgpt-bridge-${VERSION}-${OS_TAG}-${ARCH}"
-STAGE_DIR="dist/${BUNDLE_NAME}"
-TARBALL="dist/${BUNDLE_NAME}.tar.gz"
+# Read by option_env! in the protocol crate and by the extension build.
+CGPT_BUILD="$("$SCRIPT_DIR/build-id.sh")"
+export CGPT_BUILD
+
+BUNDLE_NAME="cgpt-bridge-${VERSION}-${CGPT_BUILD}-${OS_TAG}-${ARCH}"
+DIST_DIR="${DIST_DIR:-dist}"
+STAGE_DIR="${DIST_DIR}/${BUNDLE_NAME}"
+TARBALL="${DIST_DIR}/${BUNDLE_NAME}.tar.gz"
 
 echo "==> Cleaning previous bundle"
 rm -rf "$STAGE_DIR" "$TARBALL"
 mkdir -p "$STAGE_DIR"
 
 # ---------------------------------------------------------------------------
-# Rust release build (cli + host).
+# Rust release build (cli + host + gateway).
 # ---------------------------------------------------------------------------
 resolve_cargo() {
   if command -v cargo >/dev/null 2>&1; then command -v cargo; return; fi
@@ -47,15 +58,15 @@ resolve_cargo() {
   return 1
 }
 CARGO="$(resolve_cargo)" || { echo "error: cargo not found" >&2; exit 1; }
-echo "==> Building Rust release binaries with $CARGO"
-"$CARGO" build --release -p cgpt-bridge-cli -p cgpt-bridge-host
+echo "==> Building Rust release binaries with $CARGO (build $CGPT_BUILD)"
+"$CARGO" build --release --locked -p cgpt-bridge-cli -p cgpt-bridge-host -p cgpt-gateway
 
 # ---------------------------------------------------------------------------
 # Extension build.
 # ---------------------------------------------------------------------------
 echo "==> Building Chrome extension"
 if command -v npm >/dev/null 2>&1; then
-  (cd extension && npm install --silent --no-audit --no-fund && npm run build)
+  (cd extension && npm ci --silent --no-audit --no-fund && npm run build)
 else
   echo "error: npm not found" >&2; exit 1
 fi
@@ -68,12 +79,22 @@ mkdir -p "$STAGE_DIR/bin" "$STAGE_DIR/extension" "$STAGE_DIR/install/macos" "$ST
 
 cp target/release/cgpt              "$STAGE_DIR/bin/cgpt"
 cp target/release/cgpt-bridge-host  "$STAGE_DIR/bin/cgpt-bridge-host"
+cp target/release/cgpt-gateway      "$STAGE_DIR/bin/cgpt-gateway"
 chmod +x "$STAGE_DIR/bin/"*
 
 # Extension dist (background.js, content.js, manifest.json).
 cp -R extension/dist/. "$STAGE_DIR/extension/"
 
-# Installers — point at the bundled binaries instead of target/release/.
+# The macOS installer of the whole set (host, gateway, OpenCode provider and
+# agent, LaunchAgent) sits at the top of the bundle.
+if [[ "$OS_TAG" == "macos" ]]; then
+  cp install/macos/install.sh install/macos/uninstall.sh \
+     install/macos/com.cgpt-bridge.gateway.plist install/opencode-agent-cgpt.md "$STAGE_DIR/"
+  chmod +x "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh"
+fi
+
+# Host-only installers (Linux, and the .dmg's Install.command) — point at the
+# bundled binaries instead of target/release/.
 sed 's|REPO_ROOT/target/release/cgpt-bridge-host|REPO_ROOT/bin/cgpt-bridge-host|g' \
     install/macos/install-host.sh > "$STAGE_DIR/install/macos/install-host.sh"
 sed 's|REPO_ROOT/target/release/cgpt-bridge-host|REPO_ROOT/bin/cgpt-bridge-host|g' \
@@ -91,73 +112,59 @@ rm -f "$STAGE_DIR/install/macos/install-host.sh.bak" "$STAGE_DIR/install/linux/i
 cat > "$STAGE_DIR/INSTALL.md" <<'INSTALL'
 # cgpt-bridge — install on a new machine
 
-This tarball contains:
+This bundle contains:
 
-- `bin/cgpt` — the CLI.
+- `bin/cgpt-gateway` — local OpenAI-compatible server for OpenCode. The
+  gateway is for macOS and Windows only (Windows has its own bundle). On
+  Linux it is built but not supported and has no installer: Linux gets the
+  host and the CLI.
 - `bin/cgpt-bridge-host` — the Chrome Native Messaging host.
-- `extension/` — the unpacked Chrome extension (load this folder at chrome://extensions).
-- `install/macos/install-host.sh` and `install/linux/install-host.sh` — Native Messaging manifest installers.
+- `bin/cgpt` — the CLI (`cgpt ask`, `cgpt agent`).
+- `extension/` — the unpacked Chrome extension.
+- macOS: `install.sh`, `uninstall.sh`, the gateway LaunchAgent template and
+  `opencode-agent-cgpt.md` (the OpenCode agent `cgpt`).
+- `install/linux/install-host.sh` — host-only installer for Linux.
 
-## Steps
+## macOS
 
-1. **Load the extension.**
-   - Open `chrome://extensions`.
-   - Enable *Developer mode* (top right).
-   - Click *Load unpacked*, choose the `extension/` folder from this bundle.
-   - The extension id is fixed via the `key` field in the manifest, so it is
-     the same on every machine. You do not need to copy it — the installer
-     below already knows it.
+1. Run `./install.sh` (no sudo). It copies everything to
+   `~/Library/Application Support/cgpt-bridge/`, registers the native host
+   with Chrome, creates the gateway config with its token, adds provider
+   `cgpt` to `~/.config/opencode/opencode.json` (the previous file is kept as
+   `opencode.json.bak`), adds the OpenCode agent `cgpt`
+   (`~/.config/opencode/agents/cgpt.md`; `--no-agent` skips it) and starts
+   the gateway at login via
+   `~/Library/LaunchAgents/com.cgpt-bridge.gateway.plist`.
+2. Chrome → `chrome://extensions` → *Developer mode* → *Load unpacked* →
+   `~/Library/Application Support/cgpt-bridge/extension` (Cmd+Shift+G in the
+   file dialog). The extension id is pinned by the manifest `key`.
+   After an update press ↻ on the extension card: Chrome keeps running the
+   old native host until then. Then close the old cgpt-bridge window.
+3. Open https://chatgpt.com and log in. Keep chat history on and do not use
+   a temporary chat.
+4. In OpenCode press Tab to switch to the agent `cgpt` (or run
+   `opencode --agent cgpt`). It uses the model `cgpt/chatgpt-web` and asks
+   before every command, file edit and web fetch. It is not the default
+   agent: pick it with Tab each time. The model `cgpt/chatgpt-web` chosen in
+   another agent works too, but nothing asks there.
+5. On the first request the extension opens its own ChatGPT window without
+   focus; OpenCode never uses your own ChatGPT tabs. Leave that window open,
+   do not type in it, and click once inside its page (again after it was
+   fully reloaded) so it keeps streaming in the background. Each OpenCode
+   session becomes a chat in your ChatGPT history.
 
-2. **Install the Native Messaging manifest.**
-   - macOS:  `./install/macos/install-host.sh`
-   - Linux:  `./install/linux/install-host.sh`
-     Use `--chromium` if you loaded the extension in Chromium instead of Chrome.
+Uninstall: `~/Library/Application Support/cgpt-bridge/uninstall.sh`, then
+remove the extension at `chrome://extensions`.
 
-   The script writes a manifest pinning the host to the pinned extension id
-   and pointing it at `bin/cgpt-bridge-host` in this folder. Do not move the
-   folder after running the installer — the manifest stores an absolute path.
+See README.md (section "Install") for OpenCode permissions, skills and
+troubleshooting. This bundle is for Apple silicon (arm64); on an Intel Mac
+build from source.
 
-3. **Reload the extension.** Click the refresh icon on the extension card.
+## Linux (host and CLI only)
 
-4. **Verify.** Open the extension's service-worker DevTools (link on the
-   extension card), and in its Console run:
-   ```
-   pingNative()
-   ```
-   You should see `{ type: "pong", ... }`.
-
-5. **Drop `bin/cgpt` somewhere on your `PATH`** (or call it via its absolute
-   path):
-   ```
-   cp bin/cgpt /usr/local/bin/cgpt          # macOS
-   cp bin/cgpt ~/.local/bin/cgpt            # Linux (typical user-local)
-   ```
-
-6. **Smoke test.** Open https://chatgpt.com in any window, click anywhere
-   inside that tab once (required for the background-tab keep-alive). Then:
-   ```
-   cgpt ask "hello"
-   cgpt agent --yolo "list files"
-   ```
-
-## Hidden-tab caveat
-
-The bridge can drive ChatGPT while the tab is in the background. To prevent
-Chrome from throttling timers on the hidden tab, the extension plays a
-silent audio stream when sending a prompt. Chrome's autoplay policy requires
-the page to have received at least one user gesture (a click, keypress,
-etc.) since it loaded. If you reopen the ChatGPT tab fresh and immediately
-hide it without clicking, the audio context cannot resume and you'll see
-slow responses; a single click anywhere in the tab unblocks it for the
-session.
-
-## Uninstall
-
-- Delete the Native Messaging manifest:
-  - macOS:  `rm "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.cgpt_bridge.host.json"`
-  - Linux:  `rm "$HOME/.config/google-chrome/NativeMessagingHosts/com.cgpt_bridge.host.json"` (or `chromium`)
-- Remove the extension at `chrome://extensions`.
-- Delete this folder.
+1. `./install/linux/install-host.sh` (`--chromium` for Chromium).
+2. Load `extension/` at `chrome://extensions` as above.
+3. `cp bin/cgpt ~/.local/bin/cgpt`, then `cgpt ask "hello"`.
 INSTALL
 
 # Copy top-level project docs that are useful on the install machine.
@@ -172,13 +179,28 @@ echo "$OS_TAG-$ARCH"             > "$STAGE_DIR/PLATFORM"
 # Tar it up.
 # ---------------------------------------------------------------------------
 echo "==> Creating tarball $TARBALL"
-tar -C dist -czf "$TARBALL" "$BUNDLE_NAME"
+tar -C "$DIST_DIR" -czf "$TARBALL" "$BUNDLE_NAME"
+
+# ---------------------------------------------------------------------------
+# Checksum: SHA256SUMS next to the tarball, in `sha256sum` format
+# (lowercase hex, two spaces, file name); verify with `shasum -a 256 -c`.
+# ---------------------------------------------------------------------------
+echo "==> Writing ${DIST_DIR}/SHA256SUMS"
+(
+  cd "$DIST_DIR"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${BUNDLE_NAME}.tar.gz" > SHA256SUMS
+  else
+    shasum -a 256 "${BUNDLE_NAME}.tar.gz" > SHA256SUMS
+  fi
+)
 
 # ---------------------------------------------------------------------------
 # Summary.
 # ---------------------------------------------------------------------------
 echo ""
 echo "Built bundle: $TARBALL"
+echo "Checksum:     ${DIST_DIR}/SHA256SUMS"
 echo "Staged tree:  $STAGE_DIR"
 echo ""
 echo "Smoke check on this machine:"

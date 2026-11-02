@@ -1,0 +1,6 @@
+data: {"message": {"id": "msg-asst-0", "author": {"role": "assistant", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "text", "parts": ["Thinking out loud"]}, "status": "in_progress", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "all", "channel": null}, "conversation_id": "conv-fixture-0001", "error": null}
+
+data: {"message": {"id": "msg-asst-1", "author": {"role": "assistant", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "text", "parts": ["The real answer"]}, "status": "in_progress", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "all", "channel": null}, "conversation_id": "conv-fixture-0001", "error": null}
+
+data: [DONE]
+

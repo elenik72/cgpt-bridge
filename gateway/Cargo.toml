@@ -1,0 +1,23 @@
+[package]
+name = "cgpt-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "cgpt-gateway — local OpenAI-compatible server in front of the ChatGPT bridge, for OpenCode"
+
+[[bin]]
+name = "cgpt-gateway"
+path = "src/main.rs"
+
+[dependencies]
+cgpt-bridge-protocol = { path = "../protocol" }
+cgpt-bridge-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tiny_http = "=0.12.0"
+getrandom = "0.4.3"
+
+[dev-dependencies]
+cgpt-bridge-protocol = { path = "../protocol", features = ["test-support"] }

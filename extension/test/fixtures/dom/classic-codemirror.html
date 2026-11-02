@@ -1,0 +1,18 @@
+<!-- "classic" markup, CodeMirror code blocks (the shape walkNodeForText documents): a header with the label
+     next to #code-block-viewer, one <span> per token and a <br> per line break inside pre.cm-content > code. -->
+<main>
+  <div data-scroll-root="">
+    <div data-message-author-role="assistant" data-message-id="msg-cm-1">
+      <div class="markdown prose">
+        <p>Agent reply:</p>
+        <div class="block">
+          <div class="header"><span>cgpt-agent-response-v1</span><button><span>Copy code</span></button></div>
+          <div>
+            <div id="code-block-viewer" class="cm-editor"><div class="cm-scroller"><pre class="cm-content"><code><span>{</span><br><span>  "status": "done"</span><br><span>}</span></code></pre></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="prompt-textarea" contenteditable="true"></div>
+</main>

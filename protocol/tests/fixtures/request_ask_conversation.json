@@ -1,0 +1,1 @@
+{ "type": "ask", "id": "a2", "text": "hello", "timeout_ms": 60000, "target": { "kind": "conversation", "url": "https://chatgpt.com/c/abc-123" } }

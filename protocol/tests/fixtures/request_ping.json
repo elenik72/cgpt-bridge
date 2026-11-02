@@ -1,0 +1,1 @@
+{ "type": "ping", "id": "p1", "payload": { "probe": 1 } }

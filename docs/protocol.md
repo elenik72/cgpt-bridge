@@ -100,7 +100,7 @@ Unknown event types are dropped with a warning. Known events with missing requir
 
 | Field             | Type    | Required | Notes |
 | ----------------- | ------- | -------- | ----- |
-| `id`              | string  | yes      | Unique within the session, e.g. `cmd_001`. |
+| `id`              | string  | yes      | Unique within the session, e.g. `cmd_001`. A plain token, as it becomes part of a file name (`command-<id>.json`): `[A-Za-z0-9_.-]{1,64}`, without `..`. Any other `id` makes the block invalid (repair, §6). |
 | `kind`            | string  | yes      | Must be `"shell"` in v0.1. |
 | `description`     | string  | yes      | Short human-readable description. |
 | `cwd`             | string  | yes      | Path relative to project root, or `"."`. Must resolve inside project root after normalization. |
@@ -125,21 +125,22 @@ The CLI sends exactly one of these blocks back as the body of the next ChatGPT m
 | `version`            | integer          | yes      | Must be `1`. |
 | `command_id`         | string           | yes      | Echoes `CommandRequest.id`. |
 | `cwd`                | string           | yes      | Normalized cwd that was actually used. |
-| `command`            | string           | yes      | Exact command string actually run (post user edit, if any). |
+| `command`            | string           | yes      | The command string actually run (post user edit, if any), passed through the redaction rules like the output: a secret in it is replaced by the marker. What runs is never rewritten. |
 | `exit_code`          | integer \| null  | yes      | Process exit code. `null` if the process did not exit normally (signal, timeout). |
 | `duration_ms`        | integer          | yes      | Wall-clock duration of the command. |
 | `timed_out`          | boolean          | yes      | True if the timeout fired before the process exited. |
 | `stdout`             | string           | yes      | Possibly truncated and redacted. |
 | `stderr`             | string           | yes      | Possibly truncated and redacted. |
 | `output_truncated`   | boolean          | yes      | True if any output was truncated. |
-| `redactions_applied` | array of string  | yes      | Names of redaction rules that fired (e.g. `["aws_access_key_id", "generic_bearer_token"]`). |
+| `redactions_applied` | array of string  | yes      | Names of redaction rules that fired on the output and on `command` (e.g. `["aws_access_key_id", "generic_bearer_token"]`), sorted, each once. |
 
 When a command is rejected by the user or blocked by local policy, the CLI sends a `cgpt-command-result-v1` block where:
 
 - `exit_code: null`, `duration_ms: 0`, `timed_out: false`.
 - `stdout: ""`.
 - `stderr` contains a short reason (e.g. `"user_rejected"`, `"policy_blocked: denylist:sudo"`).
-- `redactions_applied: []`.
+- `command` is the requested command, redacted as above.
+- `redactions_applied` lists the rules that fired on `command` (`[]` when none did).
 
 This keeps the loop schema-uniform: ChatGPT always sees a result block in response to a command request.
 
@@ -167,7 +168,7 @@ This keeps the loop schema-uniform: ChatGPT always sees a result block in respon
     "kind": "shell",
     "description": "Run the Rust test suite and capture output.",
     "cwd": ".",
-    "command": "cargo test 2>&1 | tee .cgpt-bridge/logs/cargo-test.log",
+    "command": "cargo test 2>&1 | tee /tmp/cargo-test.log",
     "expected_effect": "Runs tests and writes output to a local log file.",
     "risk": "write_local",
     "timeout_ms": 120000,
@@ -206,7 +207,7 @@ This keeps the loop schema-uniform: ChatGPT always sees a result block in respon
   "version": 1,
   "command_id": "cmd_001",
   "cwd": ".",
-  "command": "cargo test 2>&1 | tee .cgpt-bridge/logs/cargo-test.log",
+  "command": "cargo test 2>&1 | tee /tmp/cargo-test.log",
   "exit_code": 101,
   "duration_ms": 42318,
   "timed_out": false,
@@ -244,10 +245,10 @@ This keeps the loop schema-uniform: ChatGPT always sees a result block in respon
 
 The CLI parser applies the following rules to each assistant response in `cgpt agent` mode.
 
-1. **Exactly one block.** The response must contain exactly one fenced block with info string `cgpt-agent-response-v1`. Zero blocks: invalid. Two or more: invalid.
+1. **Exactly one block.** The response must contain exactly one fenced block with info string `cgpt-agent-response-v1`. Zero blocks: invalid. Two or more: invalid. Only a top-level, closed block counts: its opening fence is three or more backticks, indented by at most three spaces (no tabs), with exactly that info string, and it is closed by a line of only backticks, at least as many. A block quoted inside another code block (for example inside ` ````markdown `) is content of the outer block; a fence indented by four or more spaces or a tab is an indented code sample (CommonMark); tilde fences are display-only. None of these is the protocol block.
 2. **Valid JSON.** The block body must parse as a JSON object. Trailing whitespace is allowed. Comments are not allowed.
 3. **Known version.** `version` must be the integer `1`. Any other value (including `"1"`) is rejected as `unknown_version`.
-4. **Unknown fields policy.** Unknown top-level fields are **rejected** (strict). Unknown fields inside `PlanEvent`, `CommandRequest`, or nested objects are **ignored** (lenient), to allow forward-compatible extensions. The CLI logs ignored fields at `debug` level.
+4. **Unknown fields policy.** Unknown top-level fields are **rejected** (strict). Unknown fields inside `PlanEvent`, `CommandRequest`, or nested objects are **ignored** (lenient), to allow forward-compatible extensions. The CLI does not log them: it has no `debug` level and the field is dropped silently (a debug log of ignored fields is not implemented).
 5. **Required fields.** All required fields per §2.1–§2.4 must be present and of the correct type. Missing or wrong-typed required fields cause rejection.
 6. **Empty command rejected.** `command.command` must be non-empty after trimming whitespace. An empty string is treated as no command and rejected.
 7. **Timeout clamp.** `command.timeout_ms` must be a positive integer. Values above the configured hard cap (default 600000 ms) are **clamped** to the cap; a warning is shown to the user. Values `<= 0` are rejected.
@@ -265,6 +266,8 @@ If any rejection rule fires, the CLI **must not execute any command** in that tu
 If parsing fails for any reason, the CLI may send **at most one** repair prompt in the same agent loop turn (configurable, default: enabled, max 1 retry). The repair prompt is sent as the next user message into the ChatGPT composer, with the exact text:
 
 > Your previous response did not match the required protocol. Return exactly one valid `cgpt-agent-response-v1` fenced JSON block. Do not include any other fenced protocol blocks. Do not include prose explanations of the JSON. Do not change the schema. If you cannot continue, return a block with `status: "blocked"` and `command: null`.
+
+preceded by the agent prompt contract of §7 in full and an empty line, the way a first turn puts the contract before the task. A `--continue` or `--resume` turn is sent without the contract (§7), and a chat that has drifted from the protocol may answer it in prose; the repair restates the format so that ChatGPT has it at hand.
 
 If the repair attempt also fails:
 
@@ -323,7 +326,7 @@ The CLI prepends the following **agent prompt contract** to the user's task on t
 To remove ambiguity, the v0.1 spec **locks** the following choices:
 
 - **Unknown top-level fields**: rejected (strict).
-- **Unknown nested fields**: ignored (lenient) with a debug log.
+- **Unknown nested fields**: ignored (lenient), silently; no debug log (not implemented).
 - **Oversized `timeout_ms`**: clamped to the cap with a warning, not rejected.
 - **Multiple `cgpt-agent-response-v1` blocks in one response**: rejected.
 - **Fence info string match**: exact, case-sensitive.

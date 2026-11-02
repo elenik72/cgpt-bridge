@@ -1,0 +1,1 @@
+{ "type": "error", "id": "a1", "code": "oversize_frame", "message": "frame exceeds the size limit" }

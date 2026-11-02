@@ -1,0 +1,17 @@
+<!-- "classic" markup, CodeMirror block headed "tool_calls"; the viewer is found by its cm-editor class alone
+     (no id) and ends with a <br>. -->
+<main>
+  <div data-scroll-root="">
+    <div data-message-author-role="assistant" data-message-id="msg-cm-2">
+      <div class="markdown prose">
+        <div class="block">
+          <div class="header"><span>tool_calls</span><button><span>Copy code</span></button></div>
+          <div>
+            <div class="cm-editor"><div class="cm-scroller"><pre class="cm-content"><code><span>[{"name": "read"}]</span><br></code></pre></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="prompt-textarea" contenteditable="true"></div>
+</main>

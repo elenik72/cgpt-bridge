@@ -1,0 +1,47 @@
+event: delta_encoding
+data: "v1"
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "msg-user-1", "author": {"role": "user", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "text", "parts": ["Say hello"]}, "status": "finished_successfully", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "all", "channel": null}, "conversation_id": "conv-fixture-0001"}, "c": 0}
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "msg-think-1", "author": {"role": "assistant", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "thoughts", "thoughts": []}, "status": "in_progress", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "all", "channel": null}, "conversation_id": "conv-fixture-0001"}, "c": 0}
+
+event: delta
+data: {"p": "/message/content/thoughts", "o": "append", "v": [{"summary": "Planning", "content": "I should search"}]}
+
+event: delta
+data: {"p": "", "o": "patch", "v": [{"p": "/message/content/parts/0", "o": "append", "v": " harder about it"}]}
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "msg-search-1", "author": {"role": "assistant", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "code", "language": "unknown", "text": ""}, "status": "in_progress", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "web.run", "channel": null}, "conversation_id": "conv-fixture-0001"}, "c": 0}
+
+event: delta
+data: {"p": "/message/content/text", "o": "append", "v": "search(\"fixture topic\")"}
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "msg-tool-1", "author": {"role": "tool", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "text", "parts": ["Search results: nothing personal"]}, "status": "finished_successfully", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "all", "channel": null}, "conversation_id": "conv-fixture-0001"}, "c": 0}
+
+event: delta
+data: {"v": {"message": {"id": "msg-pre-1", "author": {"role": "assistant", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "text", "parts": [""]}, "status": "in_progress", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "web.run", "channel": null}, "conversation_id": "conv-fixture-0001"}}
+
+event: delta
+data: {"p": "/message/content/parts/0", "o": "append", "v": "query for the tool, not the user"}
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "msg-asst-1", "author": {"role": "assistant", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "text", "parts": [""]}, "status": "in_progress", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "all", "channel": null}, "conversation_id": "conv-fixture-0001"}, "c": 0}
+
+event: delta
+data: {"p": "/message/content/parts/0", "o": "append", "v": "Based on the "}
+
+event: delta
+data: {"v": "search, the answer is 42."}
+
+event: delta
+data: {"p": "/message/end_turn", "o": "replace", "v": true}
+
+event: delta
+data: {"type": "message_stream_complete", "conversation_id": "conv-fixture-0001"}
+
+data: [DONE]
+

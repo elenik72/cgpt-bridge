@@ -1,0 +1,16 @@
+[package]
+name = "cgpt-bridge-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "cgpt-bridge core: command denylist and output redaction"
+
+[lib]
+name = "cgpt_bridge_core"
+path = "src/lib.rs"
+
+[dependencies]
+cgpt-bridge-protocol = { path = "../protocol" }
+regex = { workspace = true }

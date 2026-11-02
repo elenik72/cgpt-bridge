@@ -1,0 +1,26 @@
+event: delta_encoding
+data: "v1"
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "msg-asst-1", "author": {"role": "assistant", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "text", "parts": [""]}, "status": "in_progress", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "all", "channel": null}, "conversation_id": "conv-fixture-0001"}, "c": 0}
+
+event: delta
+data: {"p": "/message/content/parts/0", "o": "append", "v": "Draft answer that will change"}
+
+event: delta
+data: {"p": "/message/content/parts/0", "o": "replace", "v": "Final answer"}
+
+event: delta
+data: {"p": "/message/content/parts/0", "o": "append", "v": ", edited"}
+
+event: delta
+data: {"p": "/message/content/parts/0", "o": "append", "v": " XXXX"}
+
+event: delta
+data: {"p": "/message/content/parts/0", "o": "truncate", "v": 20}
+
+event: delta
+data: {"p": "/message/end_turn", "o": "replace", "v": true}
+
+data: [DONE]
+

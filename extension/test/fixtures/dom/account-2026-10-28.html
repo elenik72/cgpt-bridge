@@ -1,0 +1,42 @@
+<!-- "account" markup as found live on 2026-10-28 (research/2026-10-28-live-sse-and-markup.md): no
+     data-message-author-role, data-message-id, conversation-turn, .markdown or #prompt-textarea. The
+     user's message is [data-user-message-bubble]; the answer's message id sits on containers
+     ([data-chatgpt-selection-message-id], [data-dil-source-message-id]) and its text in an inner
+     [data-markdown-copy] with p[data-d-text-flow] paragraphs; a finished turn reads
+     data-talvt-turn-state="complete". How these nest was not recorded: here the id containers nest and
+     every message is a turn of its own (the harder case for counting). The composer has no
+     ProseMirror class and a localized label. Synthetic, minimal, no real user text. -->
+<main>
+  <div>
+    <section data-talvt-turn-state="complete">
+      <div data-user-message-bubble=""><div>First question</div></div>
+    </section>
+    <section data-talvt-turn-state="complete">
+      <div data-chatgpt-selection-message-id="msg-new-1">
+        <div data-dil-source-message-id="msg-new-1" data-dil-message-id="msg-new-1">
+          <div data-markdown-copy="" data-markdown-text-style=""><p data-d-text-flow="">Earlier answer.</p></div>
+        </div>
+      </div>
+    </section>
+    <section data-talvt-turn-state="complete">
+      <div data-user-message-bubble=""><div>Second question</div></div>
+    </section>
+    <section data-talvt-turn-state="complete">
+      <h4 data-conversation-role="assistant">ChatGPT said:</h4>
+      <div data-chatgpt-selection-message-id="msg-new-2">
+        <div data-dil-source-message-id="msg-new-2" data-dil-message-id="msg-new-2">
+          <div data-markdown-copy="" data-markdown-text-style="">
+            <p data-d-text-flow="">First paragraph of the answer.</p>
+            <ul><li>one</li><li>two <strong>bold</strong></li></ul>
+            <p data-d-text-flow="">Last paragraph.</p>
+          </div>
+          <div><button type="button" aria-label="Copy"><span>Copy</span></button></div>
+        </div>
+      </div>
+    </section>
+  </div>
+  <form>
+    <div contenteditable="true" role="textbox" data-composer-markdown="" aria-label="Ask anything"></div>
+    <button type="submit" aria-label="Send prompt"></button>
+  </form>
+</main>

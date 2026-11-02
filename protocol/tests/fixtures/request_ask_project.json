@@ -1,0 +1,1 @@
+{ "type": "ask", "id": "a4", "text": "hello", "timeout_ms": 60000, "project": "cgpt-bridge" }

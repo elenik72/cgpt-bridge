@@ -1,0 +1,1 @@
+{ "type": "error", "id": "a1", "code": "rate_limited", "message": "ChatGPT is rate limiting this account (HTTP 429 on the answer stream)." }

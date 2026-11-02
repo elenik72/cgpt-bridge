@@ -31,7 +31,7 @@ This tool is not affiliated with, endorsed by, or approved by any vendor.
 2. Support an interactive agent loop where ChatGPT can propose **one shell command at a time**, which the user reviews and approves before execution.
 3. Persist a local, human-readable plan (`plan.md`) and a structured event log (`plan.jsonl`) for the active task.
 4. Be safe by default: no command runs without explicit user confirmation.
-5. Be diagnosable: `cgpt doctor` should pinpoint setup issues.
+5. Be diagnosable: `cgpt doctor` should pinpoint setup issues (planned, M10; not implemented yet).
 
 ## 3. Non-goals
 
@@ -59,14 +59,15 @@ Specifically excluded for v0.1:
 
 ## 4. Supported platforms (v0.1)
 
-- macOS (Apple Silicon and Intel) and Linux (x86_64) for the local side.
+- macOS and Linux (x86_64) for the `cgpt` CLI and the local side. Prebuilt bundles: macOS Apple silicon (`arm64`) and Linux x86_64, built in CI. **Intel Mac** is supported only as a build from source (`./scripts/build-release.sh`); no Intel binary is built or tested in CI.
+- Windows and macOS for the OpenCode gateway path (gateway, native host, extension, installer); the `cgpt` CLI is not supported on Windows. **WSL** is not a supported setup: see README, "OpenCode in WSL".
 - Google Chrome (stable channel) as the only supported browser.
 - Chrome Extension Manifest V3.
 - TypeScript for the extension.
 - Rust (stable) for the CLI and Native Messaging host.
 - A single host URL: `https://chatgpt.com/*`.
 
-Windows, Brave, Edge, Chromium forks, and Firefox are out of scope for v0.1 but should not be architecturally precluded.
+Brave, Edge, Chromium forks, and Firefox are out of scope for v0.1 but should not be architecturally precluded. (Windows is supported for the gateway path only, see above.)
 
 ---
 
@@ -76,7 +77,7 @@ The CLI is named `cgpt`. v0.1 ships these subcommands:
 
 - `cgpt ask` — single-shot prompt/response.
 - `cgpt agent` — interactive agent loop with confirmed command execution.
-- `cgpt doctor` — health and connectivity diagnostics.
+- `cgpt doctor` — health and connectivity diagnostics. **Not implemented** (planned, M10): the subcommand does not exist yet.
 - `cgpt history` — list past agent sessions from `.cgpt-bridge/runs/`.
 - `cgpt replay <session-id>` — re-render the final markdown of a stored
   session without contacting ChatGPT.
@@ -84,24 +85,29 @@ The CLI is named `cgpt`. v0.1 ships these subcommands:
 
 Common flags (all subcommands):
 
-- `--timeout <seconds>` — overall request timeout (per round-trip to ChatGPT).
-- `--log-level <level>` — `error|warn|info|debug|trace`. Default `warn`.
-- `--no-color` — disable ANSI colors on stderr.
-- `--json` — machine-readable output on stdout where applicable (post-v0.1 may extend).
+- `--timeout-ms <ms>` — overall request timeout (per round-trip to ChatGPT) for `ask` and `agent`. Default 120000.
+- `--no-spinner` — no progress spinner on stderr. `--socket <path>` — the host's socket.
+- Planned, **not implemented** (the CLI rejects them as unknown options): `--log-level <level>` (`error|warn|info|debug|trace`), `--no-color`, `--json`. The CLI has no log levels and writes no log files.
 - `--buffer` — for subcommands that take a prompt/task, read it from the OS
   clipboard instead of arg/stdin. Applies to `cgpt ask` and `cgpt agent`.
   Implementation shells out to `pbpaste` on macOS and tries
   `wl-paste` → `xclip` → `xsel` on Linux. When `--buffer` is set, stdin is
   not consumed even if piped; positional args, if any, are prepended to the
   clipboard contents as `<args>\n\n<clipboard>`.
+- `--no-redact` — by default the collected input (positional args, stdin or
+  clipboard) is run through the secret-redaction rules (`docs/security.md` §7)
+  once, before `--editor` and before it is sent or saved under
+  `.cgpt-bridge/`, and one stderr line names the rules that fired
+  (`cgpt: input redacted before sending (rules: …)`). `--no-redact` sends and
+  stores the text as given. Applies to `cgpt ask` and `cgpt agent`.
 - `--editor` — open `$EDITOR` (fallback `vi`, then `nano`) on a tmpfile
   pre-populated with whatever the combination of positional args / stdin /
-  `--buffer` would have produced. The user's saved buffer becomes the final
-  prompt/task. Applies to `cgpt ask` and `cgpt agent`.
+  `--buffer` would have produced (already redacted unless `--no-redact`). The
+  user's saved buffer becomes the final prompt/task and is not redacted again. Applies to `cgpt ask` and `cgpt agent`.
 - `--copy` — after printing the final assistant message (or the response in
   `cgpt ask` / the rendered final in `cgpt replay`, `cgpt last`), copy the
   same text to the OS clipboard via `pbcopy` / `wl-copy` / `xclip` /
-  `xsel`.
+  `xsel`. The copied text is the answer as received; it is not redacted.
 
 ### 5.1 `cgpt ask`
 
@@ -127,7 +133,7 @@ Constraints:
 
 - `cgpt ask` does **not** parse the response.
 - `cgpt ask` does **not** execute any commands.
-- `cgpt ask` does **not** modify any local files except its own logs.
+- `cgpt ask` does **not** modify any local files.
 
 ### 5.2 `cgpt agent`
 
@@ -165,6 +171,8 @@ There is **no fixed maximum step count** in interactive mode. Each iteration sti
 
 ### 5.3 `cgpt doctor`
 
+**Not implemented** (planned, M10): the `cgpt doctor` subcommand does not exist yet, and neither does the `isReady` probe named in check 8 (the extension's wire messages are `ask`, `stop`, `status` and `ping`). The list below is the design target.
+
 Purpose: verify the installation is healthy.
 
 Checks (each prints PASS/FAIL with remediation hints):
@@ -192,21 +200,22 @@ Exit code: 0 if all PASS, 1 if any FAIL.
 .cgpt-bridge/
   plan.jsonl       # append-only event log (source of truth)
   plan.md          # human-readable, regenerated from plan.jsonl
-  session.json     # current session metadata (id, started_at, last turn, model hints if any)
+  session.json     # latest session's metadata (id, started_at, last turn, model hints if any)
   runs/            # per-run artifacts (one subdir per agent session)
     <session-id>/
+      session.json            # this session's own metadata (status, chat address)
       transcript.jsonl        # full message-level transcript
       command-<id>.json       # per-command record (request + result)
-  logs/            # rotating CLI/host logs (text)
+  logs/            # created empty; reserved for CLI/host logs (not implemented)
 ```
 
 Rules:
 
 - `plan.jsonl` is the source of truth. Each line is one `PlanEvent` (see `protocol.md`).
 - `plan.md` is **derived** and may be regenerated at any time from `plan.jsonl`. Hand edits to `plan.md` are not preserved.
-- `session.json` contains: `session_id`, `started_at`, `cwd`, `last_turn_at`, `status`, optional `task_summary`. It must not contain command output.
+- `session.json` contains: `session_id`, `started_at`, `cwd`, `last_turn_at`, `status`, optional `task_summary`, optional `conversation_url`. It must not contain command output. The root file describes the latest session; every session also has its own `runs/<session-id>/session.json`, and an older session's updates never rewrite the root file of a newer one.
 - `runs/<session-id>/transcript.jsonl` stores prompts, raw assistant responses, parsed blocks, command requests, and (redacted) command results.
-- `logs/` holds rotating diagnostic logs from the CLI and the native host (host logs come via stderr capture).
+- `logs/` is created empty and reserved for diagnostic logs of the CLI and the native host. **Not implemented:** nothing writes there and there is no rotation. The native host logs to its stderr (Chrome captures it in developer mode).
 - Full **raw** command output is not persisted by default (see §8). If a command itself writes a log file (e.g. `tee`), that file is the user's responsibility.
 
 ---
@@ -249,24 +258,28 @@ Requirements:
 
 The CLI must support clean interruption: Ctrl+C cancels the in-flight wait or command, prints a status line, and exits non-zero without corrupting `plan.jsonl`.
 
+Ctrl+C while `cgpt ask` (or the current turn of `cgpt agent`) waits for the answer, once the prompt has been written to the host, stops that answer in ChatGPT: the CLI sends the host `stop_ask` with the ask's id in `ask_id`, on a new connection. The extension stops that ask only (in whatever tab it runs; never another ask, never the gateway's tab instead), and answers `stopped` with `was_generating: false` when it knows no answer of that ask being written. A stop that comes before the prompt was sent — the extension is still choosing the tab (the ask is registered before the tab is chosen), the ask waits behind another one in the same tab, or the page has not sent it yet — cancels the ask: it ends `cancelled`, nothing of it reaches the tab's chat, and the answer is `stopped` with `not_sent: true`. In the user's tab it presses Stop only while the page shows the ask's chat, by the rule of a gateway ask's stop: the saved chat the ask was sent from, by its path (same chat id and project); otherwise (sent from `/`, a project's page or an unsaved chat) the new chat by its content — exactly one user turn, holding the start of the prompt, and inside the project it was sent from — whatever its address is by then (still `/`, a temporary path, or its saved one). Anything else (another chat, the start page) gets no press and the answer `stopped` with `other_chat: true`. The CLI waits at most 3 s, prints one status line on stderr — the answer was interrupted; stopped, as the prompt was not sent (`not_sent`); not stopped, as nothing of this ask was being written; not stopped, as the tab shows another chat; not stopped, as the host is too old (it refuses `stop_ask` as `bad_request`); or the stop was not confirmed (an extension older than `stop_ask` ignores it) — marks a `cgpt agent` session `user_cancelled`, and then ends as killed by Ctrl+C (§9). A second Ctrl+C ends it that way at once. Ctrl+C before the prompt is written ends the CLI as the default SIGINT action (no `stop_ask`).
+
 ---
 
 ## 9. Error handling requirements
 
 - All user-visible errors go to **stderr**. Stdout is reserved for assistant content (`ask`) and for `user_message` text (`agent`).
 - Errors are categorized and include a short remediation hint where possible. Categories: `setup`, `transport`, `tab`, `dom`, `protocol`, `policy`, `command`, `internal`.
-- Exit codes:
+- Exit codes. `cgpt ask` and `cgpt agent` share one table (`cli/src/exit.rs`, pinned by tests):
   - `0` success.
-  - `1` generic failure.
-  - `2` usage / argument error.
-  - `3` setup error (native host, extension, manifest).
+  - `1` generic failure: a clipboard, stdin or editor failure while reading input, a host `rate_limited`, an assistant `blocked`, a runner error.
+  - `2` usage / argument error: an unknown option, no prompt or task given, a host `bad_request`, and a request whose serialized form is over the native host's frame cap (1 MiB): the CLI refuses it before connecting, with its size and the limit; nothing is sent.
+  - `3` setup error (native host, extension, manifest, `.cgpt-bridge/` session store).
   - `4` transport / native messaging error.
-  - `5` tab unavailable / wrong URL / not active.
+  - `5` tab unavailable / wrong URL / not active; also the chat changing under an `agent` session, a host `timeout`, and no answer from the host in time. A signed-out ChatGPT window (`not_logged_in`) reaches the CLI as tab unavailable, so it ends with 5.
   - `6` DOM adapter failure (composer not found, response not detected).
   - `7` protocol violation that could not be repaired.
-  - `8` policy block (denylist).
-  - `9` command failed (non-zero exit).
-  - `10` user cancelled.
+  - `8` busy tab (a host `tab_busy`): `cgpt ask` into a tab whose answer is still generating (`previous_answer_running`) is refused before anything is typed. A second ask while another one runs in the same tab is not refused: the extension queues it per tab and sends it once the first one ends (within its own timeout; otherwise `timeout`, exit 5, nothing sent). Only a page whose service worker lost track of the running ask (a restart mid-ask) refuses it (`ask_running`), with 8. An extension built before the `tab_busy` code, or a current one behind a native host built before it, reports a busy tab as a DOM failure, so it then still ends with 6. (8 was reserved for a policy block before; a blocked command is reported to the assistant and the loop goes on, so that was never returned.)
+  - `9` reserved for a failed command (non-zero exit). Not returned: the result goes back to the assistant.
+  - `10` user cancelled; also a host `cancelled`: Stop was pressed in the ChatGPT page during the ask (or a `stop` request ended it).
+  - Ctrl+C has no code of its own: `cgpt ask` and `cgpt agent` end as killed by it — by SIGINT with its default action on macOS and Linux (shells show `130`, and a shell loop around `cgpt` stops), with `STATUS_CONTROL_C_EXIT` (`0xC000013A`) on Windows. While waiting for an answer the CLI first stops it and prints a status line (§8).
+  - `11` internal error (a host `internal` error). An extension built before the `cancelled` code, or a current one behind a native host built before it, reports a stopped ask as `internal`, so a stop then still ends with 11.
 - Partial state must be safe: a crash mid-loop must leave `plan.jsonl` valid (append-only, newline-terminated JSON).
 
 ---
@@ -277,7 +290,7 @@ The CLI must support clean interruption: Ctrl+C cancels the in-flight wait or co
 - The extension makes no network calls beyond what is required by the active ChatGPT page itself.
 - No remote code loading in the extension. No `eval`. No third-party scripts.
 - No background scraping of chat history.
-- Logs default to local-only and exclude command output. Users opt in for verbose logging.
+- There are no log files and no verbose-logging switch yet (not implemented, see §6 and §5). When logs exist they stay local-only and exclude command output.
 
 ---
 
@@ -312,7 +325,7 @@ Stage 1 is complete when:
 
 v0.1 is complete when **all** of the following hold:
 
-1. On macOS and Linux, with a clean install per the documented install script, `cgpt doctor` reports all checks PASS.
+1. On macOS and Linux, with a clean install per the documented install script, `cgpt doctor` reports all checks PASS. (Not met: `cgpt doctor` is not implemented, see §5.3.)
 2. `cgpt ask "say hello"` inserts the prompt into the user's active ChatGPT tab without using the system clipboard, and prints the assistant's visible response to stdout.
 3. `cargo test 2>&1 | cgpt ask "explain"` works as a single shell pipeline.
 4. `cgpt agent "diagnose failing tests"` performs at least one full loop iteration: receives a valid `cgpt-agent-response-v1`, shows a proposed command, runs it after confirmation, sends back a `cgpt-command-result-v1`, and receives a follow-up turn.

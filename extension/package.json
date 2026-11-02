@@ -5,9 +5,13 @@
   "type": "module",
   "description": "cgpt-bridge Chrome extension (Stage 2 MVP).",
   "license": "Unlicense",
+  "engines": {
+    "node": ">=20.19"
+  },
   "scripts": {
     "clean": "rimraf dist",
     "typecheck": "tsc --noEmit",
+    "test": "rimraf .test-build && esbuild \"test/*.test.ts\" --bundle --platform=node --format=esm --log-level=warning --outdir=.test-build --out-extension:.js=.mjs && node --test \".test-build/*.test.mjs\"",
     "build:background": "cross-env ENTRY=background vite build",
     "build:content": "cross-env ENTRY=content vite build",
     "build:pageShim": "cross-env ENTRY=pageShim vite build",
@@ -15,11 +19,12 @@
     "build": "npm run clean && npm run build:background && npm run build:content && npm run build:pageShim && npm run copy:manifest"
   },
   "devDependencies": {
-    "@types/chrome": "^0.0.270",
-    "@types/node": "^20.12.7",
-    "cross-env": "^7.0.3",
-    "rimraf": "^5.0.5",
-    "typescript": "^5.4.5",
-    "vite": "^5.2.11"
+    "@types/chrome": "0.3.7",
+    "@types/node": "^22.20.5",
+    "cross-env": "^10.1.0",
+    "esbuild": "0.28.2",
+    "rimraf": "^6.1.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
   }
 }

@@ -1,0 +1,28 @@
+<!-- "classic" markup (2026-05): .markdown body, pre > code.language-X, and a bare pre with a header next to it. -->
+<main>
+  <div data-scroll-root="">
+    <article>
+      <div data-message-author-role="user" data-message-id="msg-cl-0"><div>Question</div></div>
+    </article>
+    <article>
+      <div data-message-author-role="assistant" data-message-id="msg-cl-1">
+        <h6 class="sr-only">ChatGPT said:</h6>
+        <div class="markdown prose">
+          <p>Line one<br>line two</p>
+          <h2>Heading</h2>
+          <blockquote><p>quoted</p></blockquote>
+          <pre><code class="hljs language-python">def f():
+    return 1
+</code></pre>
+          <div class="header"><span>tool_calls</span><button><span>Copy</span></button></div>
+          <pre><code>[{"name": "read"}]</code></pre>
+          <div class="header"><span>Python</span></div>
+          <pre><code>print("unlabelled")</code></pre>
+          <p>Closing text.</p>
+        </div>
+      </div>
+    </article>
+  </div>
+  <div id="prompt-textarea" contenteditable="true"></div>
+  <button data-testid="send-button"></button>
+</main>

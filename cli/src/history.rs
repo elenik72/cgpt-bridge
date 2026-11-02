@@ -7,6 +7,7 @@ use crate::args::{HistoryArgs, LastArgs, ReplayArgs};
 use crate::clipboard;
 use crate::plan::{PlanStore, SessionSummary};
 use crate::render;
+use crate::runner::safe_text;
 
 pub fn run_history(args: HistoryArgs) -> u8 {
     let root = match std::env::current_dir() {
@@ -81,13 +82,16 @@ fn render_session(
             return 1;
         }
     };
+    // The stored text came from the model: escape control characters so a
+    // replay cannot drive the terminal.
+    let shown = safe_text(&text);
     if no_pretty {
-        print!("{}", text);
-        if !text.ends_with('\n') {
+        print!("{}", shown);
+        if !shown.ends_with('\n') {
             println!();
         }
     } else {
-        render::print_markdown(&text);
+        render::print_markdown(&shown);
     }
     if copy {
         if let Err(e) = clipboard::write(&text) {
@@ -100,8 +104,8 @@ fn render_session(
 fn print_table(sessions: &[SessionSummary], limit: usize) {
     // Column widths tuned for an 80-wide terminal. Truncate task text.
     println!(
-        "{:<22} {:<19} {:<6} {}",
-        "SESSION", "STARTED", "STATE", "TASK"
+        "{:<22} {:<19} {:<6} TASK",
+        "SESSION", "STARTED", "STATE"
     );
     for s in sessions.iter().take(limit) {
         let when = format_ts(s.started_at_unix_ms);
@@ -111,7 +115,7 @@ fn print_table(sessions: &[SessionSummary], limit: usize) {
     }
 }
 
-fn format_ts(ms: u64) -> String {
+pub(crate) fn format_ts(ms: u64) -> String {
     if ms == 0 {
         return "(unknown)".into();
     }
@@ -122,57 +126,11 @@ fn format_ts(ms: u64) -> String {
     let t = UNIX_EPOCH + Duration::from_secs(secs);
     match t.duration_since(UNIX_EPOCH) {
         Ok(_) => {
-            let s = secs as i64;
-            let (y, mo, d, h, mi, se) = ymdhms_utc(s);
+            let (y, mo, d, h, mi, se) = cgpt_bridge_core::time::ymdhms_utc(secs);
             format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, se)
         }
         Err(_) => "(invalid)".into(),
     }
-}
-
-/// Convert a POSIX timestamp to UTC (Y, M, D, h, m, s). Sufficient for
-/// dates between 1970 and 2099; no leap-second handling. Cheaper than a
-/// chrono dependency for one display string.
-fn ymdhms_utc(t: i64) -> (i32, u32, u32, u32, u32, u32) {
-    let mut t = t;
-    let sec = (t.rem_euclid(60)) as u32;
-    t = t.div_euclid(60);
-    let min = (t.rem_euclid(60)) as u32;
-    t = t.div_euclid(60);
-    let hour = (t.rem_euclid(24)) as u32;
-    let mut days = t.div_euclid(24);
-
-    let mut year: i32 = 1970;
-    loop {
-        let dy = if is_leap(year) { 366 } else { 365 };
-        if days < dy {
-            break;
-        }
-        days -= dy;
-        year += 1;
-    }
-    let months_normal = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let months_leap = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mons = if is_leap(year) {
-        months_leap
-    } else {
-        months_normal
-    };
-    let mut month = 1u32;
-    let mut d = days as i64;
-    for &m in &mons {
-        if d < m {
-            break;
-        }
-        d -= m;
-        month += 1;
-    }
-    let day = (d as u32) + 1;
-    (year, month, day, hour, min, sec)
-}
-
-fn is_leap(y: i32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 fn truncate(s: &str, n: usize) -> String {

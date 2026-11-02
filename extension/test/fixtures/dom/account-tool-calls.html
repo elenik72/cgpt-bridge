@@ -1,0 +1,26 @@
+<!-- "account" markup: the gateway's blocks. Headers: "tool_calls" and a display-cased protocol label;
+     a "json" block that only mentions tool_calls; the earlier `pre > code` variant (no data-code-block-source). -->
+<main>
+  <div data-talvt-turn-state="complete">
+    <div data-dil-source-message-id="msg-tc-1" data-markdown-copy="">
+      <p>Calling tools with <code>tool_calls</code>:</p>
+      <div data-code-block="true">
+        <div data-markdown-copy="exclude"><span>tool_calls</span><button type="button"><span>Copy code</span></button></div>
+        <pre data-code-block-source=""><code>[{"name": "read", "arguments": {"path": "src/main.rs"}}]
+</code></pre>
+      </div>
+      <div data-code-block="true">
+        <div data-markdown-copy="exclude"><span>Json</span></div>
+        <pre data-code-block-source=""><code>{"note": "the tool_calls block is next"}</code></pre>
+      </div>
+      <div data-code-block="true">
+        <div data-markdown-copy="exclude"><span>CGPT-Agent-Response-V1</span></div>
+        <pre data-code-block-source=""><code>{"status": "done"}</code></pre>
+      </div>
+      <div data-code-block="true">
+        <div data-markdown-copy="exclude"><span>tool_calls</span></div>
+        <pre><code>[{"name": "list"}]</code></pre>
+      </div>
+    </div>
+  </div>
+</main>

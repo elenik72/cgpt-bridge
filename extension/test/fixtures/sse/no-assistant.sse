@@ -1,0 +1,15 @@
+event: delta_encoding
+data: "v1"
+
+event: delta
+data: {"p": "", "o": "add", "v": {"message": {"id": "msg-user-1", "author": {"role": "user", "name": null, "metadata": {}}, "create_time": 1700000000.0, "update_time": null, "content": {"content_type": "text", "parts": ["Say hello"]}, "status": "finished_successfully", "end_turn": null, "weight": 1.0, "metadata": {}, "recipient": "all", "channel": null}, "conversation_id": "conv-fixture-0001"}, "c": 0}
+
+data: {"type": "title_generation", "title": "Fixture chat", "conversation_id": "conv-fixture-0001"}
+
+data: {"type": "conversation_detail_metadata", "banner_info": null, "blocked_features": []}
+
+event: delta
+data: {"type": "server_ste_metadata", "metadata": {"model_slug": "fixture-model"}}
+
+data: [DONE]
+

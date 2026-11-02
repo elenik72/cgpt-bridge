@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 cgpt-bridge-protocol = { path = "../protocol" }
+cgpt-bridge-core = { path = "../core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
@@ -24,3 +25,6 @@ syntect = { version = "5.3", default-features = false, features = [
     "regex-fancy",
     "parsing",
 ] }
+
+[dev-dependencies]
+cgpt-bridge-protocol = { path = "../protocol", features = ["test-support"] }

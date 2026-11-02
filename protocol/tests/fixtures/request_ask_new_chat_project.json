@@ -1,0 +1,1 @@
+{ "type": "ask", "id": "a5", "text": "hello", "timeout_ms": 60000, "target": { "kind": "new_chat" }, "project": "cgpt-bridge" }

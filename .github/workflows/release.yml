@@ -1,106 +1,273 @@
-name: release-bundle
+name: build
 
-# Manual-only: open the Actions tab in GitHub, pick "release-bundle",
-# click "Run workflow". The job builds the Rust CLI + host and the Chrome
-# extension on each target platform and uploads the staged tarball as an
-# artifact you can download and install.
+# Tests, builds and packs cgpt-bridge on Windows, macOS and Linux, then runs
+# the installer checks on the packed bundle (temporary profile / HOME; on
+# Windows the profile path has Cyrillic, a space and an apostrophe). The
+# extension typecheck and tests run once, in their own Linux job in parallel
+# with the three bundle jobs (they do not depend on the OS); every bundle job
+# still builds the extension itself, because the bundle contains it. Runs
+# on every push to a branch and by hand: Actions tab -> "build" -> Run
+# workflow. A newer push to a branch cancels the older run still in progress
+# (not on the default branch, not manual runs). The bundle is uploaded as an artifact:
+#   cgpt-bridge-<version>-<build>-windows-x64.zip,
+#   cgpt-bridge-<version>-<build>-macos-<arch>.tar.gz,
+#   cgpt-bridge-<version>-<build>-linux-<arch>.tar.gz
+# with SHA256SUMS (checksum of that archive) next to it. <build> is the
+# commit's 12-character short SHA (plus `-dirty` for a tree with uncommitted
+# changes, which a clean checkout never has); the binaries and the extension
+# report the same id.
+# Linux is CLI + native host only (no gateway installer): its job runs the
+# same tests and packs the same bundle, and checks install/linux/install-host.sh
+# on the unpacked bundle. The macOS and Windows installer steps skip Linux.
+# Third-party actions are pinned to a commit SHA (tag in the trailing
+# comment); to update one, resolve the new tag to its commit and replace both.
 on:
+  push:
+    branches: ["**"]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Optional tag suffix to append to artifact names (e.g. rc1, hotfix)."
-        required: false
-        default: ""
+
+# The job only reads the repository (checkout); the token gets nothing else.
+# Uploading the artifact uses the runner's own channel, not the token.
+permissions:
+  contents: read
+
+concurrency:
+  # The event name is in the group, so a manual run and a push never cancel
+  # each other.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  # A newer push cancels the run in progress for that branch. Runs on the
+  # default branch and manual (workflow_dispatch) runs are never cancelled
+  # while running (GitHub may still drop a run that is only queued behind a
+  # newer one in the same group).
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
 
 jobs:
-  build:
-    name: build (${{ matrix.label }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Only macOS ARM for now. Adding macos-x86_64 or linux-x86_64
-          # later is a one-line append to this include list.
-          - label: macos-arm64
-            os: macos-14          # Apple Silicon runner
-            artifact_os: macos
-            artifact_arch: arm64
-
-    runs-on: ${{ matrix.os }}
+  # Pure Node (fake Chrome), the same on every OS, so one Linux run is enough.
+  extension:
+    name: extension (typecheck + tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Read workspace version
-        id: ver
-        shell: bash
-        run: |
-          VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
-          if [[ -z "$VERSION" ]]; then
-            echo "could not read version from Cargo.toml" >&2
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      # ---- Rust toolchain + cache ----
-      - name: Setup Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          # Key by host + Cargo.lock so each matrix target has its own cache.
-          shared-key: ${{ matrix.label }}
-
-      # ---- Node toolchain + cache ----
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: extension/package-lock.json
 
-      # ---- Build everything via the existing release bundler ----
-      - name: Build release bundle
-        shell: bash
+      - name: Install, typecheck, test
+        working-directory: extension
         run: |
-          chmod +x scripts/build-release.sh
-          ./scripts/build-release.sh
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm test
+
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    runs-on: ${{ matrix.os }}
+    # A hung test must not hold a runner for the 6 h default.
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # ---- Toolchains + caches ----
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch tip as of 2026-10-27
+        with:
+          toolchain: stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ${{ matrix.os }}
+          # No `save-if` gate on purpose: the default branch has no runs
+          # here, so a "default branch only" rule would never write a cache
+          # and every branch would build cold. rust-cache already skips the
+          # save when the exact key was restored, so a branch stores a new
+          # copy only when Cargo.lock or a manifest changed.
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: extension/package-lock.json
+
+      # ---- Tests ----
+      # Local socket first, in a step of its own: on Windows this is the
+      # named pipe with the owner-only security descriptor, and a problem
+      # there shows up here by name instead of inside the workspace run.
+      - name: Local socket (named pipe on Windows)
+        timeout-minutes: 10
+        run: cargo test --locked -p cgpt-bridge-protocol local_socket
+
+      - name: cargo test --workspace
+        timeout-minutes: 15
+        run: cargo test --locked --workspace
+
+      # ---- Bundle: release binaries (host, gateway, CLI) + extension ----
+      # One build id (scripts/build-id.sh: the commit's short SHA) for the
+      # binaries, the extension and the bundle name: the build scripts and
+      # "Locate bundle" read CGPT_BUILD from the environment. Set after the
+      # tests, which keep the default `dev`.
+      # build-id.sh itself, on throwaway repositories (the `-dirty` suffix,
+      # CGPT_BUILD, the 64-character rule). Bash only; Windows takes the same
+      # rule from build-release.ps1.
+      - name: Build id checks (macOS, Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./scripts/check-build-id.sh
+
+      - name: Build id
+        shell: bash
+        # Assigned first: a failing build-id.sh then fails this step (inside
+        # `echo` its exit status would be lost).
+        run: |
+          id="$(bash ./scripts/build-id.sh)"
+          echo "CGPT_BUILD=$id" >> "$GITHUB_ENV"
+
+      # The build scripts run `npm ci` themselves, so there is no separate
+      # install step here (the extension tests are in the "extension" job).
+      - name: Build bundle (macOS, Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./scripts/build-release.sh
+
+      - name: Build bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-release.ps1
 
       - name: Locate bundle
         id: bundle
         shell: bash
         run: |
-          VERSION="${{ steps.ver.outputs.version }}"
-          TAG_SUFFIX=""
-          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
-            TAG_SUFFIX="-${{ github.event.inputs.tag }}"
+          VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            NAME="cgpt-bridge-${VERSION}-${CGPT_BUILD}-windows-x64"; EXT="zip"
+          else
+            NAME="cgpt-bridge-${VERSION}-${CGPT_BUILD}-$(uname -s | tr '[:upper:]' '[:lower:]' | sed 's/darwin/macos/')-$(uname -m)"; EXT="tar.gz"
           fi
-          BUNDLE_NAME="cgpt-bridge-${VERSION}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}${TAG_SUFFIX}"
-          # The bundler always uses the un-suffixed name; rename for upload.
-          SRC_DIR="dist/cgpt-bridge-${VERSION}-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
-          SRC_TAR="${SRC_DIR}.tar.gz"
-          if [[ -n "$TAG_SUFFIX" ]]; then
-            mv "$SRC_DIR" "dist/${BUNDLE_NAME}"
-            mv "$SRC_TAR" "dist/${BUNDLE_NAME}.tar.gz"
-          fi
-          echo "name=$BUNDLE_NAME"           >> "$GITHUB_OUTPUT"
-          echo "tarball=dist/${BUNDLE_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME"             >> "$GITHUB_OUTPUT"
+          echo "file=dist/$NAME.$EXT"   >> "$GITHUB_OUTPUT"
+          echo "sums=dist/SHA256SUMS"   >> "$GITHUB_OUTPUT"
 
-      - name: Smoke-test the bundled CLI
+      # The build script writes SHA256SUMS next to the bundle; check it
+      # really matches the packed file before it is published.
+      - name: Verify SHA256SUMS
+        shell: bash
+        working-directory: dist
+        env:
+          BUNDLE_FILE: ${{ steps.bundle.outputs.file }}
+        run: |
+          cat SHA256SUMS
+          # Exactly one line, and it names the bundle that gets uploaded.
+          [[ "$(awk 'END{print NR}' SHA256SUMS)" == "1" ]] \
+            || { echo "SHA256SUMS must have exactly one line" >&2; exit 1; }
+          [[ "$(awk '{print $2}' SHA256SUMS)" == "$(basename "$BUNDLE_FILE")" ]] \
+            || { echo "SHA256SUMS does not list $(basename "$BUNDLE_FILE")" >&2; exit 1; }
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c SHA256SUMS
+          else
+            shasum -a 256 -c SHA256SUMS
+          fi
+
+      # The checks run on what users get: the unpacked archive.
+      - name: Unpack bundle (macOS, Linux)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          BIN="dist/${{ steps.bundle.outputs.name }}/bin/cgpt"
-          "$BIN" --version
-          "$BIN" agent --help | head -20
+          mkdir -p "$RUNNER_TEMP/unpacked"
+          tar -xzf "${{ steps.bundle.outputs.file }}" -C "$RUNNER_TEMP/unpacked"
+
+      - name: Unpack bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Expand-Archive -LiteralPath "${{ steps.bundle.outputs.file }}" -DestinationPath "$env:RUNNER_TEMP\unpacked"
+
+      # ---- Installer checks on the unpacked bundle ----
+      - name: Installer checks (macOS, temporary HOME)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: ./scripts/check-install-macos.sh "${{ runner.temp }}/unpacked/${{ steps.bundle.outputs.name }}"
+
+      # Linux ships the host-only installer (no gateway, no launchd): run it
+      # from the unpacked bundle with HOME in a temp dir, for Chrome and for
+      # Chromium, and check the manifest it writes. The real HOME and browser
+      # profiles are never touched.
+      - name: Installer checks (Linux host-only, temporary HOME)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          BUNDLE_DIR: ${{ runner.temp }}/unpacked/${{ steps.bundle.outputs.name }}
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/linux-home"
+          unset XDG_CONFIG_HOME
+          mkdir -p "$HOME"
+          "$BUNDLE_DIR/bin/cgpt" --version
+          for browser in google-chrome chromium; do
+            if [[ "$browser" == "chromium" ]]; then
+              "$BUNDLE_DIR/install/linux/install-host.sh" --chromium
+            else
+              "$BUNDLE_DIR/install/linux/install-host.sh"
+            fi
+            nm="$HOME/.config/$browser/NativeMessagingHosts/com.cgpt_bridge.host.json"
+            cat "$nm"
+            python3 - "$nm" "$BUNDLE_DIR/bin/cgpt-bridge-host" "$BUNDLE_DIR/extension/manifest.json" <<'PY'
+          import base64, hashlib, json, os, sys
+          m = json.load(open(sys.argv[1]))
+          # The id Chrome derives from the manifest `key` of the bundled
+          # extension (as scripts/check-install-macos.sh does): first 32 hex
+          # digits of the key's SHA-256, 0-9a-f mapped to a-p.
+          key = json.load(open(sys.argv[3]))["key"]
+          ext_id = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32].translate(
+              str.maketrans("0123456789abcdef", "abcdefghijklmnop"))
+          assert m["name"] == "com.cgpt_bridge.host", m["name"]
+          assert m["type"] == "stdio", m["type"]
+          assert os.path.realpath(m["path"]) == os.path.realpath(sys.argv[2]), (m["path"], sys.argv[2])
+          assert os.access(m["path"], os.X_OK), "host binary is not executable"
+          assert m["allowed_origins"] == ["chrome-extension://" + ext_id + "/"], (m["allowed_origins"], ext_id)
+          PY
+          done
+          # A second run is idempotent.
+          "$BUNDLE_DIR/install/linux/install-host.sh" >/dev/null
+
+      # The temporary profile is a folder named "Тест Пользователь (O'Brien)"
+      # (Cyrillic, space, parentheses, apostrophe), and the check starts the
+      # installed host through `cmd.exe /d /s /c` as Chrome does.
+      - name: Installer checks (Windows PowerShell 5.1, Cyrillic profile path)
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./scripts/check-install-windows.ps1 -Bundle "${{ runner.temp }}/unpacked/${{ steps.bundle.outputs.name }}" -Shell powershell
+
+      - name: Installer checks (PowerShell 7, Cyrillic profile path)
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./scripts/check-install-windows.ps1 -Bundle "${{ runner.temp }}/unpacked/${{ steps.bundle.outputs.name }}" -Shell pwsh
 
       - name: Upload bundle artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # The artifact name doubles as the folder name on download — keep
-          # it identical to the tarball stem for clarity.
           name: ${{ steps.bundle.outputs.name }}
-          path: ${{ steps.bundle.outputs.tarball }}
+          path: |
+            ${{ steps.bundle.outputs.file }}
+            ${{ steps.bundle.outputs.sums }}
           if-no-files-found: error
           retention-days: 30
+          # The .zip / .tar.gz is already compressed; a second zlib pass only
+          # costs time. The two files stay in one artifact (not archive: false).
+          compression-level: 0
