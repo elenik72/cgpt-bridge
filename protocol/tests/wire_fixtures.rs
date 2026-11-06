@@ -59,9 +59,19 @@ fn request_variant(req: &BridgeRequest) -> String {
                 Some(ChatTarget::Conversation { .. }) => "ask_conversation",
                 Some(ChatTarget::NewChat) => "ask_new_chat",
             };
-            match a.project {
-                None => target.into(),
+            let project = match a.project {
+                None => target.to_string(),
                 Some(_) => format!("{target}_project"),
+            };
+            let attachments = if a.attachments.is_empty() {
+                project
+            } else {
+                format!("{project}_attachments")
+            };
+            if a.capture_stream {
+                format!("{attachments}_capture")
+            } else {
+                attachments
             }
         }
         BridgeRequest::Stop(_) => "stop".into(),
@@ -73,6 +83,10 @@ fn request_variant(req: &BridgeRequest) -> String {
 fn response_variant(resp: &BridgeResponse) -> String {
     match resp {
         BridgeResponse::Pong { .. } => "pong".into(),
+        BridgeResponse::AskResult {
+            diagnostics: Some(_),
+            ..
+        } => "ask_result_diagnostics".into(),
         BridgeResponse::AskResult { warning: None, .. } => "ask_result".into(),
         BridgeResponse::AskResult {
             warning: Some(_), ..
@@ -90,7 +104,12 @@ fn response_variant(resp: &BridgeResponse) -> String {
         BridgeResponse::Stopped {
             other_chat: true, ..
         } => "stopped_other_chat".into(),
-        BridgeResponse::StatusResult { .. } => "status_result".into(),
+        BridgeResponse::StatusResult {
+            attachments: false, ..
+        } => "status_result".into(),
+        BridgeResponse::StatusResult {
+            attachments: true, ..
+        } => "status_result_attachments".into(),
         BridgeResponse::Error { code, .. } => format!("error_{}", error_code_name(*code)),
     }
 }
@@ -113,6 +132,8 @@ fn error_code_name(code: ErrorCode) -> &'static str {
 const REQUESTS: &[&str] = &[
     "ask",
     "ask_conversation",
+    "ask_conversation_attachments",
+    "ask_conversation_capture",
     "ask_new_chat",
     "ask_new_chat_project",
     "ask_project",
@@ -124,6 +145,7 @@ const REQUESTS: &[&str] = &[
 
 const RESPONSES: &[&str] = &[
     "ask_result",
+    "ask_result_diagnostics",
     "ask_result_warning",
     "error_bad_request",
     "error_cancelled",
@@ -137,6 +159,7 @@ const RESPONSES: &[&str] = &[
     "error_timeout",
     "pong",
     "status_result",
+    "status_result_attachments",
     "stopped",
     "stopped_not_sent",
     "stopped_other_chat",
@@ -311,4 +334,27 @@ fn a_host_without_project_reads_the_ask_and_forwards_it_without_the_project() {
         want.as_object_mut().unwrap().remove("project");
         assert_eq!(serde_json::to_value(&old).unwrap(), want, "{name}");
     }
+}
+
+/// The same for `attachments`: a host built before it forwards the ask
+/// without the files. The gateway therefore sends files only to an
+/// extension that reports `attachments: true` in `status_result`, which such
+/// a host never passes on (its `status_result` does not declare the field).
+#[test]
+fn a_host_without_attachments_forwards_the_ask_without_them() {
+    let all = fixtures();
+    let (_, text, value) = all
+        .iter()
+        .find(|f| f.0 == "request_ask_conversation_attachments")
+        .unwrap();
+    let old: BeforeProject = serde_json::from_str(text).unwrap();
+    let mut want = value.clone();
+    want.as_object_mut().unwrap().remove("attachments");
+    assert_eq!(serde_json::to_value(&old).unwrap(), want);
+    let (_, text, _) = all
+        .iter()
+        .find(|f| f.0 == "response_status_result_attachments")
+        .unwrap();
+    let old = serde_json::from_str::<BeforeBuild>(text).unwrap();
+    assert!(!format!("{old:?}").contains("attachments"));
 }

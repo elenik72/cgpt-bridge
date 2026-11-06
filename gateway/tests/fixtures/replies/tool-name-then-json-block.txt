@@ -1,0 +1,5 @@
+Запущу тесты через `shell`:
+
+```json
+{"command": "cargo test --workspace", "timeout": 600000}
+```

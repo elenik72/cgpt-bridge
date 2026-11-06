@@ -30,9 +30,9 @@ pub mod request_id;
 pub use framing::{read_frame, write_frame, ReadFrameError, MAX_FRAME_BYTES};
 pub use grace::{CLIENT_TIMEOUT_GRACE_MS, HOST_TIMEOUT_GRACE_MS};
 pub use message::{
-    check_project_name, dispatch_basic, error_response, response_id, AskRequest, BridgeRequest,
-    BridgeResponse, ChatTarget, ErrorCode, PingRequest, StatusRequest, StopAskRequest, StopRequest, BUILD,
-    HOST_VERSION, MAX_PROJECT_NAME_CHARS,
+    check_project_name, dispatch_basic, error_response, response_id, AskDiagnostics, AskRequest,
+    Attachment, BridgeRequest, BridgeResponse, ChatTarget, ErrorCode, PingRequest, StatusRequest,
+    StopAskRequest, StopRequest, StreamCheck, BUILD, HOST_VERSION, MAX_PROJECT_NAME_CHARS,
 };
 pub use request_id::new_request_id;
 #[cfg(unix)]

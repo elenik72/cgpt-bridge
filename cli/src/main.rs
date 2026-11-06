@@ -96,6 +96,8 @@ fn run_ask(cmd: args::AskArgs, socket_override: &Option<std::path::PathBuf>) -> 
         timeout_ms: cmd.timeout_ms,
         target: None,
         project,
+        capture_stream: false,
+        attachments: Vec::new(),
     };
 
     let phase = Phase::start("asking ChatGPT…");

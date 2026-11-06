@@ -1,0 +1,26 @@
+Чтобы посмотреть файл, я бы использовал read, а для команд — shell; glob ищет файлы по маске.
+Вызов read {path} принимает путь, shell(command) — команду.
+
+Вот `package.json` нового проекта:
+
+```json
+{"name": "app", "version": "1.0.0", "scripts": {"test": "jest"}}
+```
+
+Описание инструмента в манифесте:
+
+```json
+{"name": "read", "description": "Read a file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}
+```
+
+А в коде функция вызывается так:
+
+```js
+const text = await read({ path: "a.txt" });
+```
+
+Маска для поиска:
+
+```json
+{"pattern": "**/*.rs"}
+```

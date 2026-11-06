@@ -221,6 +221,9 @@ fn run_accept(
         let pending = Arc::clone(&pending);
         let stdout = Arc::clone(&stdout);
         let served = in_flight.enter();
+        // Shared with the hang-up watcher of an ask (`watch_for_hang_up`),
+        // which may outlive this handler.
+        let stream = Arc::new(stream);
         thread::spawn(move || {
             let _served = served;
             // Flushing to the peer keeps the connection counted as served
@@ -239,12 +242,12 @@ fn run_accept(
 /// is delivered we close the socket; the CLI is expected to reconnect for a
 /// new request.
 fn handle_cli_client(
-    stream: &LocalStream,
+    stream: &Arc<LocalStream>,
     pending: Arc<PendingMap>,
     stdout: SharedStdout,
 ) -> io::Result<()> {
-    let mut reader = BufReader::new(stream);
-    let mut writer = BufWriter::new(stream);
+    let mut reader = BufReader::new(&**stream);
+    let mut writer = BufWriter::new(&**stream);
 
     let body = match read_frame(&mut reader) {
         Ok(b) => b,
@@ -298,11 +301,21 @@ fn handle_cli_client(
                 "extension did not respond within {} ms (+ {} ms grace)",
                 ask.timeout_ms, HOST_TIMEOUT_GRACE_MS
             );
-            let resp =
-                match forward_to_extension(&req, &id, wait_for, timeout_msg, &pending, &stdout) {
-                    Ok(r) => r,
-                    Err(e) => error_response(Some(id), ErrorCode::ExtensionUnavailable, e),
-                };
+            // Once the ask is at the extension, a client that goes away (a
+            // restarted gateway, a killed cgpt) gets its ask stopped there.
+            let watch = || watch_for_hang_up(stream, &id, &pending, &stdout);
+            let resp = match forward_to_extension(
+                &req,
+                &id,
+                wait_for,
+                timeout_msg,
+                &pending,
+                &stdout,
+                watch,
+            ) {
+                Ok(r) => r,
+                Err(e) => error_response(Some(id), ErrorCode::ExtensionUnavailable, e),
+            };
             write_response(&mut writer, &resp)?;
         }
         BridgeRequest::Stop(StopRequest { ref id })
@@ -310,31 +323,47 @@ fn handle_cli_client(
             let id = id.clone();
             let wait_for = Duration::from_millis(CONTROL_TIMEOUT_MS);
             let timeout_msg = format!("extension did not respond within {} ms", CONTROL_TIMEOUT_MS);
-            let resp =
-                match forward_to_extension(&req, &id, wait_for, timeout_msg, &pending, &stdout) {
-                    Ok(r) => r,
-                    Err(e) => error_response(Some(id), ErrorCode::ExtensionUnavailable, e),
-                };
+            let resp = match forward_to_extension(
+                &req,
+                &id,
+                wait_for,
+                timeout_msg,
+                &pending,
+                &stdout,
+                || {},
+            ) {
+                Ok(r) => r,
+                Err(e) => error_response(Some(id), ErrorCode::ExtensionUnavailable, e),
+            };
             write_response(&mut writer, &resp)?;
         }
         BridgeRequest::Status(ref status) => {
             let id = status.id.clone();
             let wait_for = Duration::from_millis(CONTROL_TIMEOUT_MS);
             let timeout_msg = format!("extension did not respond within {} ms", CONTROL_TIMEOUT_MS);
-            let resp =
-                match forward_to_extension(&req, &id, wait_for, timeout_msg, &pending, &stdout) {
-                    Ok(r) => r,
-                    // No extension to ask: a status query is exactly how a client
-                    // finds that out, so answer it instead of failing it.
-                    Err(_) => BridgeResponse::StatusResult {
-                        id,
-                        extension: false,
-                        tab_open: false,
-                        logged_in: false,
-                        conversation_url: None,
-                        build: None,
-                    },
-                };
+            let resp = match forward_to_extension(
+                &req,
+                &id,
+                wait_for,
+                timeout_msg,
+                &pending,
+                &stdout,
+                || {},
+            ) {
+                Ok(r) => r,
+                // No extension to ask: a status query is exactly how a client
+                // finds that out, so answer it instead of failing it.
+                Err(_) => BridgeResponse::StatusResult {
+                    id,
+                    extension: false,
+                    tab_open: false,
+                    logged_in: false,
+                    conversation_url: None,
+                    build: None,
+                    own_tabs: None,
+                    attachments: false,
+                },
+            };
             write_response(&mut writer, &resp)?;
         }
     }
@@ -350,13 +379,16 @@ fn ask_wait(timeout_ms: u64) -> Duration {
 /// Forward a parsed request to the extension (serialized with its `type`
 /// tag) and wait for the response carrying the same `id`. Only the fields the
 /// protocol structs declare are forwarded: the host parses the CLI frame into
-/// them, so a field unknown to the protocol (not `target` or `project`, which
-/// are declared) is dropped here, not passed through.
+/// them, so a field unknown to the protocol (not `target`, `project` or
+/// `attachments`, which are declared) is dropped here, not passed through.
 ///
 /// `Err` means the request never reached the extension (the host is shutting
 /// down, or the stdout write failed);
 /// every other outcome, including a timeout and an id that another caller
 /// already waits on (`bad_request`), is an `Ok` response to hand back.
+///
+/// `forwarded` runs once the request is written to the extension, before the
+/// wait for its answer.
 fn forward_to_extension(
     req: &BridgeRequest,
     id: &str,
@@ -364,6 +396,7 @@ fn forward_to_extension(
     timeout_msg: String,
     pending: &Arc<PendingMap>,
     stdout: &SharedStdout,
+    forwarded: impl FnOnce(),
 ) -> Result<BridgeResponse, String> {
     let envelope_bytes = serde_json::to_vec(req).map_err(|e| format!("serialize: {}", e))?;
 
@@ -390,6 +423,7 @@ fn forward_to_extension(
         pending.remove(id);
         return Err(format!("cannot forward to extension: {}", e));
     }
+    forwarded();
 
     Ok(match rx.recv_timeout(wait_for) {
         Ok(r) => r,
@@ -406,6 +440,76 @@ fn forward_to_extension(
             )
         }
     })
+}
+
+/// Watch the connection of a client whose ask is at the extension. A client
+/// sends nothing after its request, so the read only returns when the client
+/// closes its end: a restarted gateway, a killed `cgpt`. If the ask is still
+/// pending then, nobody will read its answer: the host takes it out of the
+/// pending map (the handler gets `cancelled` and finds the connection gone)
+/// and sends the extension a `stop_ask` for it, so it does not keep a tab
+/// busy until it ends. An ask answered first is left alone. The thread ends
+/// with the connection, which a client closes after reading its reply.
+fn watch_for_hang_up(
+    stream: &Arc<LocalStream>,
+    ask_id: &str,
+    pending: &Arc<PendingMap>,
+    stdout: &SharedStdout,
+) {
+    let stream = Arc::clone(stream);
+    let ask_id = ask_id.to_string();
+    let pending = Arc::clone(pending);
+    let stdout = Arc::clone(stdout);
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        loop {
+            match (&*stream).read(&mut buf) {
+                // Bytes after the request are not part of the protocol.
+                Ok(n) if n > 0 => continue,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                _ => break,
+            }
+        }
+        drop(stream);
+        let Some(tx) = pending.remove(&ask_id) else {
+            return;
+        };
+        let _ = tx.send(error_response(
+            Some(ask_id.clone()),
+            ErrorCode::Cancelled,
+            "the client closed its connection before the answer",
+        ));
+        let stop = BridgeRequest::StopAsk(StopAskRequest {
+            id: format!("{}-hang-up", ask_id),
+            ask_id: ask_id.clone(),
+        });
+        let outcome = match forward_to_extension(
+            &stop,
+            &format!("{}-hang-up", ask_id),
+            Duration::from_millis(CONTROL_TIMEOUT_MS),
+            format!("extension did not respond within {} ms", CONTROL_TIMEOUT_MS),
+            &pending,
+            &stdout,
+            || {},
+        ) {
+            Ok(BridgeResponse::Stopped {
+                was_generating,
+                other_chat,
+                not_sent,
+                ..
+            }) => format!(
+                "was_generating {}, other_chat {}, not_sent {}",
+                was_generating, other_chat, not_sent
+            ),
+            Ok(BridgeResponse::Error { code, .. }) => format!("error {:?}", code),
+            Ok(_) => "unexpected answer".to_string(),
+            Err(e) => e,
+        };
+        eprintln!(
+            "cgpt-bridge-host: the client of ask {} hung up before the answer; stop_ask: {}",
+            ask_id, outcome
+        );
+    });
 }
 
 /// Read messages coming back from the extension (over Chrome stdio stdin),
@@ -777,6 +881,7 @@ mod tests {
             String::new(),
             &pending,
             &stdout,
+            || panic!("a refused request is not forwarded"),
         )
         .expect("a reply, not a forwarding failure");
         let v = serde_json::to_value(&resp).unwrap();

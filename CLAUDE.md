@@ -33,18 +33,19 @@ Terminal / scripts                       OpenCode
   -> Content script on https://chatgpt.com/*
   -> chatgptAdapter.ts (all DOM-specific code lives here)
   -> CLI asks: the user's ChatGPT tab (active one, sticky across agent turns)
-     gateway asks: the extension's own ChatGPT tab, in its own unfocused window
+     gateway asks: the extension's own ChatGPT tabs (a pool of up to 8),
+                   in one own unfocused window
 ```
 
 Load-bearing invariants — do not break these without updating the docs first:
 
-- **Policy lives in the clients.** The CLI applies it for `cgpt agent`; the gateway applies it for OpenCode (denylist on every tool call, redaction of everything sent to ChatGPT). Both take denylist and redaction from `core/`. The native host is a thin pipe. The extension is a router. The content script does DOM work only on request, never in the background.
+- **Policy lives in the clients.** The CLI applies it for `cgpt agent`; the gateway applies it for OpenCode (denylist on every tool call, redaction of all text sent to ChatGPT; images go unredacted, `docs/security.md` §15). Both take denylist and redaction from `core/`. The native host is a thin pipe. The extension is a router. The content script does DOM work only on request, never in the background.
 - **All ChatGPT-specific DOM knowledge is isolated in `chatgptAdapter.ts`.** No selectors, ARIA labels, or stabilization logic outside that file. UI breaks should be one-file fixes. The one exception is ChatGPT's answer stream (endpoint and event format): that knowledge lives in `pageShim.ts` and `sseParser.ts`.
 - **The CLI never executes a command from prose, markdown, inline code, or any code block other than a single valid `cgpt-agent-response-v1.command` field.** Multiple, missing, or malformed protocol blocks are rejected; the CLI may send at most one repair prompt per turn.
 - **The `risk` value supplied by ChatGPT is advisory.** The CLI runs its own classifier and applies the denylist independently. Both values are shown to the user.
 - **Every command requires explicit user confirmation by default.** Two opt-in flags relax this: `--auto-readonly` (auto-runs commands the local classifier marks `read_only`) and `--yolo` (auto-runs every non-denylisted command, with a loud per-command warning). Default is interactive; pressing Enter never auto-runs. Denylist hits remain blocked regardless of flag.
 - **One network listener, and only the gateway's.** `cgpt-gateway` binds `127.0.0.1` only (never another interface) and requires `Authorization: Bearer <token>` on every request. The CLI and the native host never listen on a port: clients reach the host over a local socket, and the host talks to the extension over Chrome Native Messaging only.
-- **Gateway asks never touch the user's tabs.** They run in the extension's own ChatGPT tab (own window, opened without focus); the CLI's untargeted asks never use that tab.
+- **Gateway asks never touch the user's tabs.** They run in the extension's own ChatGPT tabs (a pool of up to 8 in one own window, opened without focus); the CLI's untargeted asks never use any tab of that window. The gateway runs turns of different OpenCode sessions in parallel (up to `max_parallel`, default 3, and no more than the extension reports as `own_tabs`), turns of one session one at a time (`docs/superpowers/specs/2026-11-05-parallel-sessions-design.md`).
 - **No clipboard.** The content script writes the composer text via DOM property + input event dispatch.
 - **Extension host permission is exactly `https://chatgpt.com/*`.** No wildcards. `allowed_origins` in the native messaging manifest is a single specific extension id, no wildcards.
 - **Stdout discipline.** `cgpt ask` stdout = assistant message. `cgpt agent` stdout = `user_message` and final message. Everything else to stderr. The native host writes only length-prefixed JSON to stdout; logs go to stderr.

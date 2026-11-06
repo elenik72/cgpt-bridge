@@ -37,7 +37,10 @@ use cgpt_bridge_protocol::{AskRequest, BridgeResponse};
 
 use crate::args::AgentArgs;
 use crate::clipboard;
-use crate::exit::{interrupted_message, no_answer_message, too_large_message, ExitKind};
+use crate::exit::{
+    command_result_too_large_message, interrupted_message, no_answer_message, too_large_message,
+    ExitKind,
+};
 use crate::input;
 use crate::plan::{new_session_id, PlanStore};
 use crate::render;
@@ -338,11 +341,15 @@ pub fn run(args: AgentArgs, socket_override: Option<PathBuf>) -> u8 {
                     eprintln!("cgpt: cannot persist command result: {}", e);
                 }
                 next_prompt = build_next_user_message(&result_envelope);
-                turn_purpose = "command result";
+                turn_purpose = COMMAND_RESULT;
             }
         }
     }
 }
+
+/// The purpose of a turn that sends a command's result (shown in its phase
+/// line, and choosing the too-large message).
+const COMMAND_RESULT: &str = "command result";
 
 /// The banner of an auto-approving mode, `None` without one. Both modes run
 /// commands unasked, and that output goes to ChatGPT (AUD-012).
@@ -448,6 +455,8 @@ fn send_and_collect(
         timeout_ms,
         target: None,
         project: project.map(str::to_string),
+        capture_stream: false,
+        attachments: Vec::new(),
     };
     let phase = Phase::start(format!(
         "turn {} — sending {} to ChatGPT…",
@@ -509,7 +518,11 @@ fn send_and_collect(
             Err(kind)
         }
         AskOutcome::TooLarge { len, cap } => {
-            phase.fail(too_large_message(len, cap));
+            phase.fail(if purpose == COMMAND_RESULT {
+                command_result_too_large_message(len, cap)
+            } else {
+                too_large_message(len, cap)
+            });
             Err(kind)
         }
         AskOutcome::BadResponse(msg) => {

@@ -111,3 +111,27 @@ test("audit.e5_enter_fallback_into_a_running_generation_is_an_error", async () =
     await settlePage();
   }
 });
+
+// Live 02.11 (Windows): Send showed only some seconds after the prompt was
+// typed (a window the browser slowed down), past the old 5 s wait. The ask
+// waits for it (up to 20 s, within the time it needs to send) and clicks it.
+test("audit.e5_send_that_shows_late_is_still_clicked", async () => {
+  const chat = new AccountChat("/c/abc", [{ id: "m0", text: "An earlier answer." }]);
+  chat.send.remove();
+  later(12_000, () => chat.showSend());
+  chat.onSend = () => {
+    const turn = chat.beginTurn();
+    later(100, () => {
+      turn.render("The answer.");
+      turn.finish();
+    });
+  };
+  try {
+    const reply = await ask("late1", "QUESTION", { timeoutMs: 120_000 });
+    assert.equal(reply.ok, true, JSON.stringify(reply));
+    assert.equal(reply.text, "The answer.");
+    assert.deepEqual(chat.sentPrompts, ["QUESTION"]);
+  } finally {
+    await settlePage();
+  }
+});

@@ -132,6 +132,11 @@ const chromeStub = {
 export function useTabs(tabs: FakeTabs): void {
   chromeStub.tabs = {
     ...tabs.api.tabs,
+    // The gateway window takes no further tab: a second gateway ask waits in
+    // the queue of the one tab, as when the window is full.
+    async create() {
+      throw new Error("fakeChrome: no tab may be opened");
+    },
     sendMessage(
       tabId: number,
       req: ExtensionRequest,

@@ -12,6 +12,22 @@
 //   { __cgptBridgeControl: true, active: false }         — off
 //   ← { __cgptBridgeAck: true, active, epoch, v }        — acknowledgement
 //
+// An "on" with `capture: true` (a debug aid the gateway asks for) also keeps
+// this epoch's answer streams, at most CAPTURE_MAX_CHARS, in the form
+// sseParser.ts `captureEvent` gives them (every event, its text pieces
+// joined at the end so that a split secret can be redacted); the content
+// script takes it once the answer is in:
+//
+//   { __cgptBridgeCaptureTake: true, epoch }              — take it
+//   ← { __cgptBridgeCapture: true, epoch, raw }           — raw: null if none
+//
+// Its acknowledgement then carries `capture: true`. A shim without capture
+// leaves that out and ignores both messages: the content script then skips
+// the take (no wait) and logs that the page script is too old for capture.
+// No PAGE_SHIM_PROTOCOL bump: an older shim misreads nothing, and a bump
+// would make every tab that kept its shim across an update read all its
+// answers from the DOM alone until reloaded, for a debug aid.
+//
 // `v` is PAGE_SHIM_PROTOCOL (bridgeProtocol.ts), the version of these
 // messages; the page is marked with it too. A tab keeps its shim across an
 // extension update, and content.ts uses only a shim of its own version.
@@ -49,7 +65,18 @@
 //      `visibilitychange` so it re-syncs.
 
 import { PAGE_SHIM_PROTOCOL } from "./bridgeProtocol";
-import { SseFramer, answerText, isComplete, newSseState, sseAccumulate } from "./sseParser";
+import {
+  SseFramer,
+  answerText,
+  captureEvent,
+  captureNextStream,
+  isComplete,
+  newSseState,
+  newStreamCapture,
+  renderCapture,
+  sseAccumulate,
+  type StreamCapture,
+} from "./sseParser";
 
 (() => {
   const W = window as unknown as Record<string, unknown>;
@@ -71,6 +98,9 @@ import { SseFramer, answerText, isComplete, newSseState, sseAccumulate } from ".
   // ─── activation ──────────────────────────────────────────────────────
   let active = false;
   let epoch = 0;
+  // The answer streams of epoch `capture.epoch` (debug aid), or null.
+  const CAPTURE_MAX_CHARS = 512 * 1024;
+  let capture: { epoch: number; kept: StreamCapture; streams: number } | null = null;
   let expiry: ReturnType<typeof setTimeout> | null = null;
   const setActive = (on: boolean, ttlMs: number): void => {
     if (expiry !== null) {
@@ -96,13 +126,37 @@ import { SseFramer, answerText, isComplete, newSseState, sseAccumulate } from ".
   window.addEventListener("message", (ev: MessageEvent) => {
     if (ev.source !== window) return;
     const d = ev.data as Record<string, unknown> | null;
+    if (d && typeof d === "object" && d.__cgptBridgeCaptureTake === true) {
+      const mine = capture !== null && capture.epoch === d.epoch ? capture : null;
+      if (mine !== null) capture = null;
+      try {
+        window.postMessage(
+          { __cgptBridgeCapture: true, epoch: d.epoch, raw: mine === null ? null : renderCapture(mine.kept) },
+          window.location.origin,
+        );
+      } catch {
+        /* */
+      }
+      return;
+    }
     if (!d || typeof d !== "object" || d.__cgptBridgeControl !== true) return;
     const ttl = typeof d.ttlMs === "number" ? d.ttlMs : 0;
-    if (d.active === true) epoch++;
+    if (d.active === true) {
+      epoch++;
+      capture = d.capture === true ? { epoch, kept: newStreamCapture(CAPTURE_MAX_CHARS), streams: 0 } : null;
+    }
     setActive(d.active === true, ttl);
     try {
       window.postMessage(
-        { __cgptBridgeAck: true, active, epoch, v: PAGE_SHIM_PROTOCOL },
+        {
+          __cgptBridgeAck: true,
+          active,
+          epoch,
+          v: PAGE_SHIM_PROTOCOL,
+          // Says this shim keeps the capture asked for (a shim from before
+          // captures leaves it out).
+          ...(active && capture !== null ? { capture: true } : {}),
+        },
         window.location.origin,
       );
     } catch {
@@ -217,6 +271,14 @@ import { SseFramer, answerText, isComplete, newSseState, sseAccumulate } from ".
     const decoder = new TextDecoder();
     const framer = new SseFramer();
     const state = newSseState();
+    // This stream goes to the capture of its epoch, if any; a second
+    // stream of the epoch starts with an SSE comment line.
+    const keep = capture !== null && capture.epoch === streamEpoch ? capture : null;
+    if (keep !== null && keep.streams++ > 0) captureNextStream(keep.kept, keep.streams);
+    const feed = (ev: string): void => {
+      if (keep === null) sseAccumulate(state, ev);
+      else captureEvent(state, ev, keep.kept);
+    };
     let lastReported = "";
     let chunkCount = 0;
     let doneSent = false;
@@ -243,14 +305,14 @@ import { SseFramer, answerText, isComplete, newSseState, sseAccumulate } from ".
     const pump = (): Promise<void> =>
       reader.read().then(({ done, value }) => {
         if (done) {
-          for (const ev of framer.flush()) sseAccumulate(state, ev);
+          for (const ev of framer.flush()) feed(ev);
           reportIfChanged();
           sendDone();
           return;
         }
         chunkCount++;
         for (const ev of framer.push(decoder.decode(value, { stream: true }))) {
-          sseAccumulate(state, ev);
+          feed(ev);
         }
         reportIfChanged();
         if (isComplete(state)) {

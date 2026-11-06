@@ -323,6 +323,69 @@ test("projects.a_project_behind_show_more_is_found_not_created_again", async () 
   }
 });
 
+// The new chat may show `/c/<id>` first and its project prefix later: the
+// same chat (same id), not a click to another chat. A chat with another id
+// is the switch.
+for (const [later_path, ok] of [
+  [`/g/${PROJ_ID}-${NAME}/c/chat-1`, true],
+  [`/g/${PROJ_ID}-${NAME}/c/chat-2`, false],
+] as const) {
+  test(`projects.a_new_chat_that_moves_to_${ok ? "its_prefixed_path_answers" : "another_chat_is_a_switch"}`, async () => {
+    try {
+      showPage("/", { rows: row(NAME, PROJ_ID) }, () => {
+        later(150, () => goTo(later_path));
+        return "/c/chat-1";
+      });
+      rowsNavigate();
+      createOpensDialog(NEW_ID);
+      const reply = await ask(`g-prefix-${ok}`, PROMPT, { target: { kind: "new_chat" }, project: NAME });
+      if (ok) {
+        assert.equal(reply.ok, true, JSON.stringify(reply));
+        assert.equal(reply.conversationUrl, `https://chatgpt.com${later_path}`, JSON.stringify(reply));
+      } else {
+        assert.equal(reply.ok, false, JSON.stringify(reply));
+        assert.equal(reply.errorCode, "target_mismatch", JSON.stringify(reply));
+        assert.match(String(reply.message), /switched to another chat by a click/);
+      }
+    } finally {
+      await settlePage();
+    }
+  });
+}
+
+// "Show more" may list the rest in steps (not seen live; the wait used to
+// stop at the first new rows): the older rows first, ours 400 ms later.
+// The list is looked at until it holds still, so the project is found.
+test("projects.show_more_rows_rendered_in_steps_are_all_waited_for", async () => {
+  try {
+    const newest = [1, 2, 3, 4, 5].map((n) => row(`newer-${n}`, `g-p-${String(n).repeat(32)}`)).join("");
+    const played = showPage("/", { rows: newest, more: true }, chatFrom);
+    const more = el("[data-test-show-more]");
+    more.onClick = () => {
+      later(50, () => {
+        el("[data-project-rows]").append(
+          ...parseHtml(row("older-1", `g-p-${"a".repeat(32)}`) + row("older-2", `g-p-${"b".repeat(32)}`)),
+        );
+        more.remove();
+        rowsNavigate();
+      });
+      later(450, () => {
+        el("[data-project-rows]").append(...parseHtml(row(NAME, PROJ_ID)));
+        rowsNavigate();
+      });
+    };
+    rowsNavigate();
+    const dialog = createOpensDialog(NEW_ID);
+    const reply = await ask("g9s", PROMPT, { target: { kind: "new_chat" }, project: NAME });
+    assert.equal(reply.conversationUrl, `https://chatgpt.com/g/${PROJ_ID}-${NAME}/c/chat-1`, JSON.stringify(reply));
+    assert.deepEqual(dialog.typed, [], "no second project is created");
+    assert.equal(more.clicks, 1);
+    assert.deepEqual(played.sentAt, [`/g/${PROJ_ID}/project`]);
+  } finally {
+    await settlePage();
+  }
+});
+
 test("projects.a_closed_header_menu_does_not_stop_the_project_being_found", async () => {
   try {
     const played = showPage("/", { rows: row(NAME, PROJ_ID) }, chatFrom);

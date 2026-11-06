@@ -65,6 +65,7 @@ fn spawn_host(endpoint: String, reply: BridgeResponse) -> thread::JoinHandle<()>
                 text,
                 conversation_url,
                 warning: None,
+                diagnostics: None,
             },
             BridgeResponse::Error { code, message, .. } => BridgeResponse::Error {
                 id: Some(id),
@@ -127,6 +128,7 @@ fn agent_final_user_message_never_emits_cr_or_esc() {
                 text: text.clone(),
                 conversation_url: None,
                 warning: None,
+                diagnostics: None,
             },
         );
         let mut args = vec!["--socket", ep.as_str(), "agent"];
@@ -178,6 +180,7 @@ fn ask_answer_never_emits_cr_or_esc() {
             text: HOSTILE.into(),
             conversation_url: None,
             warning: None,
+            diagnostics: None,
         },
     );
     let out = run_cgpt(&dir, &["--socket", ep.as_str(), "ask", "go"]);
@@ -203,6 +206,7 @@ fn ask_plain_text_is_printed_unchanged() {
             text: "line one\n\tindented `code`\n".into(),
             conversation_url: None,
             warning: None,
+            diagnostics: None,
         },
     );
     let out = run_cgpt(&dir, &["--socket", ep.as_str(), "ask", "go"]);

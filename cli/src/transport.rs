@@ -339,6 +339,8 @@ mod tests {
             timeout_ms: 100,
             target: None,
             project: None,
+            capture_stream: false,
+            attachments: Vec::new(),
         };
         let outcome = ask_once("/tmp/cgpt-bridge.does-not-exist.sock", &req, 100);
         match outcome {

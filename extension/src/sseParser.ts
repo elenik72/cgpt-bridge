@@ -43,6 +43,9 @@ export interface SseState {
   lastSubPath: string | null;
   lastSubOp: string | null;
   complete: boolean;
+  // Called with every string that becomes (part of) a message's text, or is
+  // appended anywhere: the capture's text pieces (`captureEvent`).
+  onText?: ((piece: string) => void) | null;
 }
 
 export function newSseState(): SseState {
@@ -82,6 +85,9 @@ function startMessage(state: SseState, raw: Json): void {
     recipient: typeof raw.recipient === "string" ? raw.recipient : null,
     text: contentType === "text" ? parts.filter((x) => typeof x === "string").join("") : "",
   };
+  if (contentType === "text") {
+    for (const x of parts) if (typeof x === "string") state.onText?.(x);
+  }
   state.messages.push(msg);
   state.current = msg;
 }
@@ -104,6 +110,8 @@ function applyOp(state: SseState, path: string, op: string, value: unknown): voi
     }
     return;
   }
+  // Whatever streams in pieces is appended: all of it is text for the capture.
+  if (op === "append" && typeof value === "string") state.onText?.(value);
   const msg = state.current;
   if (!msg) return;
   if (path === "/message/end_turn" && op === "replace") {
@@ -114,6 +122,7 @@ function applyOp(state: SseState, path: string, op: string, value: unknown): voi
     return;
   }
   if (path !== TEXT_PATH) return;
+  if (op === "replace" && typeof value === "string") state.onText?.(value);
   if (op === "append" && typeof value === "string") {
     msg.text += value;
   } else if (op === "replace" && typeof value === "string") {
@@ -224,4 +233,108 @@ export class SseFramer {
       this.data.push(line.slice(5).replace(/^ /, ""));
     }
   }
+}
+
+// ─── debug capture ─────────────────────────────────────────────────────────
+//
+// What the shim keeps of an answer stream when the gateway asks for it (its
+// `debug_capture_turns`). The stream's text arrives in small pieces, so a
+// secret may be split over several events, where no redaction would find
+// it. The capture therefore keeps every event with each text piece (any
+// string the parser takes as message text or sees appended) replaced by
+// `«text OFF+LEN»`, a reference into the pieces joined in stream order, and
+// that joined text once at the end, where the gateway's redaction sees it
+// whole. Every other string stays as it came (ids, paths, roles, titles:
+// whole values the redaction sees as they are). Offsets count UTF-16 units
+// of the joined text before redaction. All pieces of a stream share one
+// joined text, in arrival order: pieces of two messages streamed at once
+// (say, reasoning and answer interleaved) are joined interleaved, and a
+// secret could be split by the other message's pieces between its halves.
+// Not seen so far: ChatGPT streams one message after another.
+
+export interface StreamCapture {
+  events: string;
+  pieces: string;
+  // Characters kept so far; nothing more once it reaches `max`.
+  max: number;
+  full: boolean;
+}
+
+export function newStreamCapture(max: number): StreamCapture {
+  return { events: "", pieces: "", max, full: false };
+}
+
+function used(c: StreamCapture): number {
+  return c.events.length + c.pieces.length;
+}
+
+/** Feed one SSE event to the parser (as `sseAccumulate`) and to the capture. */
+export function captureEvent(state: SseState, eventData: string, c: StreamCapture): void {
+  const pieces: Array<{ text: string; off: number; taken: boolean }> = [];
+  let joined = c.pieces.length;
+  state.onText = (piece) => {
+    pieces.push({ text: piece, off: joined, taken: false });
+    joined += piece.length;
+  };
+  try {
+    sseAccumulate(state, eventData);
+  } finally {
+    state.onText = null;
+  }
+  if (c.full) return;
+  let line: string;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(eventData);
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed === undefined) {
+    // `[DONE]` and the like; anything else not JSON only by its length.
+    line = /^[A-Za-z0-9_\[\]-]{0,32}$/.test(eventData) ? eventData : `«${eventData.length} chars»`;
+  } else {
+    const swap = (v: unknown): unknown => {
+      if (typeof v === "string") {
+        const p = pieces.find((x) => !x.taken && x.text === v);
+        if (p === undefined) return v;
+        p.taken = true;
+        return `«text ${p.off}+${v.length}»`;
+      }
+      if (Array.isArray(v)) return v.map(swap);
+      if (v !== null && typeof v === "object") {
+        const out: Record<string, unknown> = {};
+        for (const [k, x] of Object.entries(v)) out[k] = swap(x);
+        return out;
+      }
+      return v;
+    };
+    line = JSON.stringify(swap(parsed));
+  }
+  const add = `data: ${line}\n\n`;
+  const text = pieces.map((p) => p.text).join("");
+  if (used(c) + add.length + text.length > c.max) {
+    c.full = true;
+    // The rest of a token split over the last kept event and this one is
+    // not kept: drop the kept part too (back to the last whitespace), so
+    // no half secret is left where redaction cannot match it.
+    c.pieces = c.pieces.replace(/\S+$/, "");
+    c.events += ": cgpt-bridge: capture full, the rest of the stream is not kept\n\n";
+    return;
+  }
+  c.events += add;
+  c.pieces += text;
+}
+
+/** A second stream of the same ask starts here. */
+export function captureNextStream(c: StreamCapture, n: number): void {
+  if (!c.full) c.events += `: cgpt-bridge: stream ${n}\n\n`;
+}
+
+/** The capture as handed to the gateway: the events, then the text pieces. */
+export function renderCapture(c: StreamCapture): string {
+  return (
+    c.events +
+    `: cgpt-bridge: text pieces joined (${c.pieces.length} chars); «text OFF+LEN» above points here\n` +
+    c.pieces
+  );
 }

@@ -1,0 +1,5 @@
+Подготовлю ревью: посмотрю изменённые файлы.
+
+```tool_calls id="me-review-prep"
+[{"name": "shell", "arguments": {"command": "git diff --stat main...HEAD"}}]
+```

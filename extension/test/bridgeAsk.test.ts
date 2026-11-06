@@ -46,7 +46,7 @@ function askReq(over: Partial<TestAskRequest> = {}): TestAskRequest {
 }
 
 function active(over: Partial<ActiveAsk> = {}): ActiveAsk {
-  return { tabId: TAB_ID, hostId: "a1", own: true, contentRequestId: "req_1", cancelled: false, handedToTab: true, ...over };
+  return { tabId: TAB_ID, hostId: "a1", own: true, contentRequestId: "req_1", cancelled: false, handedToTab: true, scriptsGoingIn: false, ...over };
 }
 
 const okAnswer = (id = "req_1"): ExtensionResponse => ({

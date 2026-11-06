@@ -7,7 +7,7 @@ use crate::args::{HistoryArgs, LastArgs, ReplayArgs};
 use crate::clipboard;
 use crate::plan::{PlanStore, SessionSummary};
 use crate::render;
-use crate::runner::safe_text;
+use crate::runner::{escape_control, safe_text};
 
 pub fn run_history(args: HistoryArgs) -> u8 {
     let root = match std::env::current_dir() {
@@ -102,16 +102,62 @@ fn render_session(
 }
 
 fn print_table(sessions: &[SessionSummary], limit: usize) {
-    // Column widths tuned for an 80-wide terminal. Truncate task text.
-    println!(
-        "{:<22} {:<19} {:<6} TASK",
-        "SESSION", "STARTED", "STATE"
-    );
+    println!("{}", table_row("SESSION", "STARTED", "STATE", "TASK"));
     for s in sessions.iter().take(limit) {
         let when = format_ts(s.started_at_unix_ms);
-        let state = if s.has_final { "final" } else { "open" };
-        let task = truncate(&s.task, 60);
-        println!("{:<22} {:<19} {:<6} {}", s.session_id, when, state, task);
+        println!(
+            "{}",
+            table_row(
+                &cell(&s.session_id),
+                &when,
+                &state_of(s),
+                &truncate(&cell(s.task.lines().next().unwrap_or("")), 50)
+            )
+        );
+    }
+}
+
+/// Width of the STATE column: the longest status, `protocol_violation`.
+const STATE_COLS: usize = 18;
+
+/// One line of the table. Task text is truncated by the caller.
+fn table_row(session: &str, started: &str, state: &str, task: &str) -> String {
+    format!(
+        "{:<22} {:<19} {:<w$} {}",
+        session,
+        started,
+        state,
+        task,
+        w = STATE_COLS
+    )
+}
+
+/// A table cell read from `.cgpt-bridge/` (a directory name, meta.json,
+/// session.json): every control character, line breaks and tabs included,
+/// becomes a visible escape, so a crafted file cannot drive the terminal or
+/// break the row.
+fn cell(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c => out.push_str(&escape_control(c.encode_utf8(&mut [0; 4]))),
+        }
+    }
+    out
+}
+
+/// The STATE column: the session's own status (`active`, `final`, `idle`,
+/// `needs_user_input`, `blocked`, `user_cancelled`, `chat_changed`,
+/// `protocol_violation`). A session with no readable status shows `final`
+/// when it has a final answer, else `-`. Escaped and cut: it is read from a
+/// file.
+fn state_of(s: &SessionSummary) -> String {
+    match &s.status {
+        Some(status) => truncate(&cell(status), STATE_COLS),
+        None if s.has_final => "final".into(),
+        None => "-".into(),
     }
 }
 
@@ -141,5 +187,62 @@ fn truncate(s: &str, n: usize) -> String {
         let mut taken: String = one_line.chars().take(n.saturating_sub(1)).collect();
         taken.push('…');
         taken
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(status: Option<&str>, has_final: bool) -> SessionSummary {
+        SessionSummary {
+            session_id: "s19e3c30c179_151c2".into(),
+            started_at_unix_ms: 0,
+            task: "a task".into(),
+            cwd: String::new(),
+            has_final,
+            status: status.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn state_shows_the_sessions_status() {
+        assert_eq!(
+            state_of(&summary(Some("needs_user_input"), false)),
+            "needs_user_input"
+        );
+        assert_eq!(
+            state_of(&summary(Some("user_cancelled"), true)),
+            "user_cancelled"
+        );
+        // Before session.json held a status: final.md decides.
+        assert_eq!(state_of(&summary(None, true)), "final");
+        assert_eq!(state_of(&summary(None, false)), "-");
+        // From a file: escaped and cut to the column.
+        let odd = state_of(&summary(Some("x\u{1b}[2Jyyyyyyyyyyyyyyyyyyyy"), false));
+        assert!(!odd.contains('\u{1b}'), "{odd:?}");
+        assert_eq!(odd.chars().count(), STATE_COLS, "{odd:?}");
+    }
+
+    #[test]
+    fn session_and_task_from_a_crafted_folder_cannot_drive_the_terminal() {
+        let raw = "s1\u{1b}]0;pwned\u{7}\u{9b}2J\tx\ry";
+        let shown = cell(raw);
+        assert!(!shown.chars().any(|c| c.is_control()), "{shown:?}");
+        assert_eq!(shown, "s1\\x1b]0;pwned\\x07\\u{9b}2J\\tx\\ry");
+        assert_eq!(cell("a\nb"), "a\\nb");
+        assert_eq!(cell("plain-id_1"), "plain-id_1");
+    }
+
+    #[test]
+    fn the_longest_status_keeps_the_task_column_in_place() {
+        let head = table_row("SESSION", "STARTED", "STATE", "TASK");
+        let row = table_row(
+            "s1",
+            "2026-11-06 10:00:00",
+            "protocol_violation",
+            "the task",
+        );
+        assert_eq!(head.find("TASK"), row.find("the task"), "{head}\n{row}");
     }
 }

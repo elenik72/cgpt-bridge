@@ -35,6 +35,8 @@
 // it, the account Send button reads as a relabelled Stop), and leave no
 // ask running at the end of a test (chatPage.ts `settlePage`).
 
+import type { AskDiagnostics } from "../../src/bridgeProtocol";
+
 type Listener = (ev: unknown) => void;
 
 class Listeners {
@@ -548,6 +550,7 @@ export interface AskReply {
   conversationUrl?: string | null;
   errorCode?: string;
   message?: string;
+  diagnostics?: AskDiagnostics;
 }
 
 /** A `test.ask` from the background (30 s unless `extra` says otherwise). */

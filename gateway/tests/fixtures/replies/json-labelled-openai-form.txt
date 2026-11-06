@@ -1,0 +1,16 @@
+Сначала посмотрю, какие файлы на Rust есть в проекте.
+
+```json
+{
+  "tool_calls": [
+    {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+        "name": "glob",
+        "arguments": "{\"pattern\": \"**/*.rs\"}"
+      }
+    }
+  ]
+}
+```

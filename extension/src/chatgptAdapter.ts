@@ -84,6 +84,19 @@
 //               presses once when the row is not in view.
 //   Rate limit: no page text observed; detected as HTTP 429 on the answer
 //               stream (pageShim → `sse-error` with `status: 429`).
+//   Attachments (T6, 2026-11-06 — NOT verified live; see attachFiles):
+//               files go in through an `input[type=file]` of the composer's
+//               own form (DataTransfer + `change`), else a synthetic `paste`
+//               on the composer (a DOM event: the system clipboard is never
+//               touched); nothing outside that form is used (a project page
+//               has its own file upload), and without the form nothing is
+//               attached. A tile per file is counted by its remove button
+//               (`aria-label` "Remove file…"/"Удалить файл…", or a
+//               `data-testid` with remove-file) or a `blob:` preview image;
+//               an upload counts as running while the form shows
+//               `[role=progressbar]` or `[aria-busy=true]`. A live check has
+//               to confirm the input, the tile and the progress signs, and
+//               that Send stays disabled until the upload ends.
 //
 // Profile "octane" — new front-end served to signed-out users (2026-10-23):
 //   Composer:   `textarea[name="prompt"]` / `[data-composer-editor-host]`.
@@ -124,6 +137,7 @@ import { PAGE_SHIM_PROTOCOL, type ChatTarget } from "./bridgeProtocol";
 import {
   AnswerNotDetectedError,
   AnswerTimeoutError,
+  AttachmentUploadFailedError,
   CancelledError,
   STOPPED_IN_PAGE_MESSAGE,
   BadTargetError,
@@ -210,8 +224,10 @@ export function startKeepAlive(): void {
 // belong to this request (see `shimReport`). Null without an acknowledged
 // epoch — no shim, one older than epochs — and for a shim of another
 // protocol version (PAGE_SHIM_PROTOCOL; one line says so): a tab keeps the
-// shim it loaded across an extension update.
-export function setPageShimActive(active: boolean, ttlMs = 0): Promise<number | null> {
+// shim it loaded across an extension update. `capture` (debug aid, "on"
+// only) has the shim keep this epoch's answer streams for
+// `takeStreamCapture`; a shim that can do that acknowledges it.
+export function setPageShimActive(active: boolean, ttlMs = 0, capture = false): Promise<number | null> {
   return new Promise((resolve) => {
     const onAck = (ev: MessageEvent): void => {
       if (ev.source !== window) return;
@@ -234,6 +250,7 @@ export function setPageShimActive(active: boolean, ttlMs = 0): Promise<number | 
         done(null);
         return;
       }
+      captureEpoch = active && capture && d.capture === true ? d.epoch : null;
       done(d.epoch);
     };
     const timer = setTimeout(() => done(null), 500);
@@ -245,9 +262,46 @@ export function setPageShimActive(active: boolean, ttlMs = 0): Promise<number | 
     window.addEventListener("message", onAck);
     try {
       window.postMessage(
-        { __cgptBridgeControl: true, active, ttlMs },
+        { __cgptBridgeControl: true, active, ttlMs, ...(active && capture ? { capture: true } : {}) },
         window.location.origin,
       );
+    } catch {
+      done(null);
+    }
+  });
+}
+
+// How long the shim gets to hand over a capture.
+const CAPTURE_TAKE_MS = 500;
+
+// The epoch whose capture the shim acknowledged; null when none was asked
+// for, or the shim predates captures.
+let captureEpoch: number | null = null;
+
+// The raw answer streams the shim kept for `epoch` (see setPageShimActive's
+// `capture`), handed over once; null when it kept none, or a shim without
+// capture does not answer.
+export function takeStreamCapture(epoch: number, waitMs = CAPTURE_TAKE_MS): Promise<string | null> {
+  if (captureEpoch !== epoch) {
+    console.warn("[cgpt-bridge] page script too old for capture (reload the tab): no capture, no wait");
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    const onReply = (ev: MessageEvent): void => {
+      if (ev.source !== window) return;
+      const d = ev.data as Record<string, unknown> | null;
+      if (!d || typeof d !== "object" || d.__cgptBridgeCapture !== true || d.epoch !== epoch) return;
+      done(typeof d.raw === "string" ? d.raw : null);
+    };
+    const timer = setTimeout(() => done(null), waitMs);
+    const done = (raw: string | null): void => {
+      clearTimeout(timer);
+      window.removeEventListener("message", onReply);
+      resolve(raw);
+    };
+    window.addEventListener("message", onReply);
+    try {
+      window.postMessage({ __cgptBridgeCaptureTake: true, epoch }, window.location.origin);
     } catch {
       done(null);
     }
@@ -495,6 +549,177 @@ function setNativeValue(el: HTMLTextAreaElement | HTMLInputElement, value: strin
   }
 }
 
+// ─── attachments ─────────────────────────────────────────────────────────
+// Not verified live (see the inventory at the top): every probe below is a
+// guess at semantic markup, kept here so that a fix is a one-file change.
+
+// The remove button of an attachment tile, one per file.
+const ATTACHMENT_REMOVE_SELECTOR = [
+  "button[aria-label^=\"Remove file\" i]",
+  "button[aria-label^=\"Remove attachment\" i]",
+  "button[aria-label^=\"Удалить файл\" i]",
+  "button[aria-label^=\"Удалить вложение\" i]",
+  "button[data-testid*=\"remove-file\"]",
+].join(",");
+// The preview of an image that is being (or has been) attached.
+const ATTACHMENT_PREVIEW_SELECTOR = "img[src^=\"blob:\"]";
+// An upload still running in the composer.
+const ATTACHMENT_BUSY_SELECTOR = "[role=\"progressbar\"], [aria-busy=\"true\"]";
+const FILE_INPUT_SELECTOR = "input[type=\"file\"]";
+// The page shows no change for this long after the last tile came: the
+// uploads have settled.
+const ATTACHMENT_SETTLE_MS = 500;
+// How long removing leftover files may take.
+const ATTACHMENT_CLEAR_MS = 3_000;
+
+// The composer's own form, where its tiles and its file input are. Never the
+// whole page: a project page has its own file upload and "Remove file"
+// buttons. Null without one (files are then not attached at all).
+function attachmentArea(): HTMLFormElement | null {
+  return findComposer()?.closest("form") ?? null;
+}
+
+// Files the composer holds now: the larger of the two counts, since a tile
+// may show its remove button only after its upload ended. 0 without the
+// composer's form.
+export function composerAttachmentCount(): number {
+  const area = attachmentArea();
+  if (area === null) return 0;
+  return Math.max(
+    area.querySelectorAll(ATTACHMENT_REMOVE_SELECTOR).length,
+    area.querySelectorAll(ATTACHMENT_PREVIEW_SELECTOR).length,
+  );
+}
+
+// An upload still running in the composer.
+export function composerUploading(): boolean {
+  return attachmentArea()?.querySelector(ATTACHMENT_BUSY_SELECTOR) != null;
+}
+
+// Whether `input` takes a file of `mime` named `name` (its `accept`: empty,
+// `image/*`, the type itself or the extension).
+function accepts(input: HTMLInputElement, mime: string, name: string): boolean {
+  const accept = (input.getAttribute("accept") ?? "").trim();
+  if (accept === "") return true;
+  const lower = name.toLowerCase();
+  return accept.split(",").some((token) => {
+    const t = token.trim().toLowerCase();
+    if (t === "*" || t === "*/*" || t === mime) return true;
+    if (t.endsWith("/*")) return mime.startsWith(t.slice(0, -1));
+    return t.startsWith(".") && lower.endsWith(t);
+  });
+}
+
+// A file input of the composer's own form that takes every file.
+function findFileInput(area: HTMLFormElement, files: readonly File[]): HTMLInputElement | null {
+  const inputs = Array.from(area.querySelectorAll<HTMLInputElement>(FILE_INPUT_SELECTOR));
+  return (
+    inputs.find((input) => !input.disabled && files.every((f) => accepts(input, f.type, f.name))) ?? null
+  );
+}
+
+// Remove the files the composer holds (a failed ask's leftovers, which the
+// next Send would carry), pressing each tile's remove button. Best effort,
+// bounded; true when none is left.
+export async function clearComposerAttachments(): Promise<boolean> {
+  const end = Date.now() + ATTACHMENT_CLEAR_MS;
+  while (composerAttachmentCount() > 0 && Date.now() < end) {
+    const button = attachmentArea()?.querySelector<HTMLButtonElement>(ATTACHMENT_REMOVE_SELECTOR) ?? null;
+    if (button === null) return false;
+    const before = composerAttachmentCount();
+    button.click();
+    while (composerAttachmentCount() >= before && Date.now() < end) await sleep(50);
+  }
+  return composerAttachmentCount() === 0;
+}
+
+export interface AttachOptions {
+  // How long the uploads may take in all.
+  timeoutMs: number;
+  // Run on every poll; may throw to abort (a Stop, the deadline, a page that
+  // left its chat). The files are then removed again.
+  check?: () => void;
+}
+
+// Put `files` into the composer and wait until every one has uploaded: a
+// tile per file and no upload running, unchanged for a moment. Fails with
+// AttachmentUploadFailedError when that does not happen in time; nothing is
+// sent either way, and the files that did arrive are removed again so the
+// next Send does not carry them. Call with an empty composer (no leftovers,
+// see clearComposerAttachments) and before typing the text.
+export async function attachFiles(files: readonly File[], options: AttachOptions): Promise<void> {
+  if (files.length === 0) return;
+  const check = options.check ?? (() => {});
+  const composer = findComposer();
+  if (!composer) throw new ComposerNotFoundError();
+  const area = attachmentArea();
+  if (area === null) {
+    throw new AttachmentUploadFailedError(
+      "The ChatGPT composer sits in no form of its own to attach files to; the prompt was not sent.",
+    );
+  }
+  const before = composerAttachmentCount();
+  const want = before + files.length;
+  try {
+    check();
+    insertFiles(area, composer, files);
+    const end = Date.now() + options.timeoutMs;
+    let quietSince = 0;
+    let shown = before;
+    for (;;) {
+      check();
+      const count = composerAttachmentCount();
+      const ready = count >= want && !composerUploading();
+      if (!ready || count !== shown) {
+        quietSince = 0;
+      } else if (quietSince === 0) {
+        quietSince = Date.now();
+      } else if (Date.now() - quietSince >= ATTACHMENT_SETTLE_MS) {
+        return;
+      }
+      shown = count;
+      if (Date.now() >= end) {
+        throw new AttachmentUploadFailedError(
+          count < want
+            ? `ChatGPT showed ${count - before} of ${files.length} attached files within ` +
+              `${Math.round(options.timeoutMs / 1000)} s (upload refused or the attach markup changed); ` +
+              "the prompt was not sent."
+            : `The files did not finish uploading within ${Math.round(options.timeoutMs / 1000)} s; ` +
+              "the prompt was not sent.",
+        );
+      }
+      await sleep(100);
+    }
+  } catch (err) {
+    await clearComposerAttachments().catch(() => false);
+    throw err;
+  }
+}
+
+// The file input of the composer's form when there is one that takes the
+// files, else a paste of the files on the composer. Never an input elsewhere
+// in the page (a project's own file upload, say).
+function insertFiles(area: HTMLFormElement, composer: HTMLElement, files: readonly File[]): void {
+  const data = new DataTransfer();
+  for (const file of files) data.items.add(file);
+  const input = findFileInput(area, files);
+  if (input !== null) {
+    input.files = data.files;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return;
+  }
+  if (typeof ClipboardEvent !== "function") {
+    throw new AttachmentUploadFailedError(
+      "The ChatGPT page has no file input for the composer; the prompt was not sent.",
+    );
+  }
+  composer.focus();
+  composer.dispatchEvent(
+    new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }),
+  );
+}
+
 // `beforeSend` runs right before the click (or the Enter fallback); it may
 // throw to abort without sending — the last moment to check for a Stop or a
 // page that left the target chat. `shimEpoch` is the pageShim's epoch for
@@ -503,13 +728,23 @@ function setNativeValue(el: HTMLTextAreaElement | HTMLInputElement, value: strin
 // epoch's reports posted since the click, in order: a short (say, empty)
 // answer's stream may end before the send sign is seen, and its reports
 // belong to the answer wait (`WaitForAnswerOptions.earlyShimReports`).
+// `sendBy` (epoch ms): the last moment the prompt may still be sent (the
+// caller's checkpoint refuses later); the wait for Send does not run past it.
 export async function submit(
   beforeSend: () => void = () => {},
   shimEpoch: number | null = null,
   deadline = Infinity,
+  sendBy = Infinity,
 ): Promise<ShimReport[]> {
-  // Give the framework a tick to enable the send button after the input event.
-  const button = await waitForSendButton(5000);
+  // The page shows Send once it has taken the typed text. That can take long
+  // in a window the browser slows down (live 02.11, Windows: a gateway ask
+  // found no Send within 5 s, and Send was there a little later), so the
+  // wait is long, but never past `sendBy`.
+  const buttonWaitMs = Math.min(
+    SEND_BUTTON_WAIT_MS,
+    Math.max(SEND_BUTTON_MIN_WAIT_MS, sendBy - Date.now()),
+  );
+  const button = await waitForSendButton(buttonWaitMs);
   if (button) {
     beforeSend();
     submittedLabel = button.getAttribute("aria-label");
@@ -542,7 +777,8 @@ export async function submit(
     // If keydown was not cancelled, no submission likely occurred.
     if (accepted) {
       throw new SendButtonNotFoundError(
-        "Send button not found and Enter-key fallback was not consumed by the page.",
+        `Send button not found within ${Math.round(buttonWaitMs / 1000)} s and the Enter-key fallback ` +
+          `was not consumed by the page; the prompt was not sent. ${SLOW_WINDOW_HINT}`,
       );
     }
     // A consumed Enter is not a send either (an editor consumes it while it
@@ -557,8 +793,9 @@ export async function submit(
     );
     if (!(await waitForPage(watch.sent, signWaitMs))) {
       throw new SendButtonNotFoundError(
-        "Send button not found; the Enter-key fallback shows no sign the prompt was sent. " +
-          "It may still have been sent: check the ChatGPT tab before asking again.",
+        `Send button not found within ${Math.round(buttonWaitMs / 1000)} s; the Enter-key fallback ` +
+          "shows no sign the prompt was sent. It may still have been sent: check the ChatGPT tab " +
+          `before asking again. ${SLOW_WINDOW_HINT}`,
       );
     }
   } finally {
@@ -673,6 +910,16 @@ async function waitForSendButton(timeoutMs: number): Promise<HTMLButtonElement |
   return null;
 }
 
+// How long the page gets to show Send after the prompt is typed: at most
+// SEND_BUTTON_WAIT_MS, and at least SEND_BUTTON_MIN_WAIT_MS however close
+// the deadline is.
+const SEND_BUTTON_WAIT_MS = 20_000;
+const SEND_BUTTON_MIN_WAIT_MS = 5_000;
+// What a Send that does not show usually means.
+const SLOW_WINDOW_HINT =
+  "A ChatGPT window that is minimized or fully covered by other windows can be slowed " +
+  "down by the browser (on Windows above all): keep it at least partly visible.";
+
 // How long a Send click gets to empty the composer, and how often it is repeated.
 const SEND_CONFIRM_MS = 4_000;
 const SEND_RETRIES = 2;
@@ -712,10 +959,14 @@ const TURN_STATE_SELECTOR = "[data-talvt-turn-state]";
 const PROTOCOL_LANG_RE = /cgpt-(?:agent-response|command-result)-v\d+/i;
 // The gateway's tool-call label. Prose and inline code mention it often, so
 // it counts only as the whole label of the block's own header.
-const TOOL_CALLS_LANG_RE = /^tool_calls$/i;
+// `tool_calls`, alone or with attributes ChatGPT sometimes adds to the info
+// string (live 05.11: `tool_calls id="me-review-prep"`); the gateway reads
+// the first word as well.
+const TOOL_CALLS_LANG_RE = /^tool_calls(?:\s+[A-Za-z_][\w-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"']+))*$/i;
 
 /** The fence label for a block whose header reads `header`, if it is one the
- * bridge parses: `cgpt-*-v<N>` anywhere in it, or exactly `tool_calls`. */
+ * bridge parses: `cgpt-*-v<N>` anywhere in it, or `tool_calls` (maybe with
+ * `key="value"` attributes after it). */
 export function protocolLanguageOf(header: string): string | null {
   const text = header.trim();
   const m = text.match(PROTOCOL_LANG_RE);
@@ -968,8 +1219,11 @@ function findCodeBlockLanguage(block: HTMLElement): string {
 // The fence info string for a header label: the label if it is one token
 // (HEADER_TOKEN_RE; a protocol label normalized), else none.
 function infoStringOf(label: string): string {
+  // A protocol label first: `tool_calls id="…"` is no single token.
+  const protocol = protocolLanguageOf(label);
+  if (protocol !== null) return protocol;
   if (!HEADER_TOKEN_RE.test(label)) return "";
-  return protocolLanguageOf(label) ?? label.toLowerCase();
+  return label.toLowerCase();
 }
 
 const CODE_BLOCK_SELECTOR = "pre, .cm-editor, #code-block-viewer";
@@ -1144,6 +1398,14 @@ export interface WaitForAnswerOptions {
   // text is taken (live: after a mid-answer Stop the turn reads `complete`,
   // not `cancelled`, so a cut wait would hold the ask to its deadline).
   stopped?: () => boolean;
+  // Filled in when the wait ends: the stream's answer text as it last was
+  // (null: none, or the stream was cut) and whether the stream completed.
+  seen?: AnswerSeen;
+}
+
+export interface AnswerSeen {
+  streamText: string | null;
+  streamDone: boolean;
 }
 
 export interface DeadlineSnapshot {
@@ -1236,6 +1498,10 @@ export async function waitForNewAnswer(
     const finish = (err: Error | null, value: string | null): void => {
       if (done) return;
       done = true;
+      if (options.seen !== undefined) {
+        options.seen.streamText = streamCut ? null : shimText;
+        options.seen.streamDone = shimDone && !streamCut;
+      }
       if (observer !== null) observer.disconnect();
       if (scheduled !== null) clearTimeout(scheduled);
       window.removeEventListener("message", onShimMessage);
@@ -1412,6 +1678,53 @@ export async function waitForNewAnswer(
 }
 
 // ---------------------------------------------------------------------------
+// Stream ↔ page check: the answer the stream gave next to the one the page
+// shows. Only a report; the ask's answer stays what it was.
+// ---------------------------------------------------------------------------
+
+/** The answer's text without what the page's rendering drops or adds:
+ * whitespace, fence lines (with their info string: the page shows the label
+ * its own way), list markers, rules and table separators, link targets,
+ * backslash escapes and markdown emphasis, code and quote marks. */
+export function answerSkeleton(text: string): string {
+  return text
+    .replace(/^[ \t]*(?:`{3,}|~{3,}).*$/gm, "")
+    .replace(/^[ \t]*[-*_:| ]{3,}$/gm, "")
+    .replace(/^[ \t]*(?:[-*+]|\d+[.)])[ \t]+/gm, "")
+    .replace(/\[([^\]\n]*)\]\((?:[^()\s]|\([^()\s]*\))*\)/g, "$1")
+    .replace(/\\([\\`*_{}[\]()#+\-.!>~|])/g, "$1")
+    .replace(/[\s`*_#>~|]/g, "");
+}
+
+export interface StreamPageCheck {
+  streamChars: number;
+  pageChars: number;
+  mismatch: boolean;
+}
+
+/** The stream's answer next to the page's, by their skeletons. */
+export function compareStreamAndPage(streamText: string, pageText: string): StreamPageCheck {
+  const a = answerSkeleton(streamText);
+  const b = answerSkeleton(pageText);
+  return { streamChars: a.length, pageChars: b.length, mismatch: a !== b };
+}
+
+/**
+ * Compare the stream's answer with the new answer the page shows (after
+ * `baseline`), read once and at once: no wait is added to the ask. Null
+ * (no check, not a mismatch) when the page shows no new answer yet, still
+ * generates, or its turn has not ended: in a hidden window the page often
+ * lags behind the stream.
+ */
+export function pageCheckNow(baseline: AnswerBaseline, streamText: string): StreamPageCheck | null {
+  const node = lastAssistantNode();
+  if (node === null || !isNewAnswer(node, baseline)) return null;
+  if (isGenerating() || lastTurnEnded() === false) return null;
+  const text = readAssistantText(node);
+  return text === null ? null : compareStreamAndPage(streamText, text);
+}
+
+// ---------------------------------------------------------------------------
 // Chat addressing, Stop and rate limit — for gateway requests, which run in
 // the extension's own ChatGPT tab and name the chat they belong to.
 // ---------------------------------------------------------------------------
@@ -1480,6 +1793,18 @@ export function conversationPathOfUrl(url: string | undefined): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Whether the page at `pathname` shows the chat of `url`, compared by chat
+ * id only (as `chat_key` does): a chat that gets its project prefix later
+ * (`/c/<id>`, then `/g/<project>-<slug>/c/<id>`) is the same chat.
+ */
+export function showsSameChatId(url: string, pathname: string): boolean {
+  const path = conversationPathOfUrl(url);
+  const want = path === null ? null : chatOfPath(path);
+  const got = chatOfPath(pathname);
+  return want !== null && got !== null && want.chatId === got.chatId;
 }
 
 /**
@@ -1575,7 +1900,11 @@ export function assertAnsweredInTarget(
   const turns = userTurnCount();
   if (turns !== 1) {
     throw new TargetMismatchError(
-      `The new chat holds ${turns} user turns ${when}, want 1: at ${location.pathname}.`,
+      `The new chat holds ${turns} user turns ${when}, want 1: at ${location.pathname}.` +
+        (turns > 1
+          ? " The bridge window shows another chat (switched by a click?) or a second message was " +
+            "typed into it; the prompt was sent, and ChatGPT goes on answering it in its own chat."
+          : ""),
     );
   }
   const bubbles = document.querySelectorAll<HTMLElement>(USER_BUBBLE_SELECTOR);
@@ -1833,7 +2162,7 @@ const SIDEBAR_WAIT_MS = 5_000;
 // show, and the list must then hold still for ROW_SETTLE_MS.
 const ROW_WAIT_MS = 5_000;
 const ROW_SETTLE_MS = 1_000;
-// How long the collapsed "Projects" section and the create dialog get to open.
+// How long the create dialog gets to open.
 const PROJECT_UI_WAIT_MS = 3_000;
 // chrome.storage.local: { [name, NFC]: "g-p-<hex>" } of the projects found or
 // created, so a project the sidebar does not show (collapsed, hidden, behind
@@ -1999,11 +2328,13 @@ async function projectPageHolds(projectId: string, timeoutMs: number, settleMs: 
  * at most PROJECT_OPEN_TIMEOUT_MS). Resolves with the project's id once its
  * page shows, blank, with the composer, and remembers it. `cachedId`: the id
  * remembered for the name, looked for first by its row (dropped when its row
- * shows another name). A project is created only when the list is known to
- * be whole: a collapsed "Projects" section that does not open is a failure,
- * not a missing project, and the named row is first given ROW_WAIT_MS to
- * render. When it is still not in view, a long list's "show more" control
- * (showMoreProjectsButton) is pressed once and the row looked for again;
+ * shows another name). Before a project is created the named row is given
+ * ROW_WAIT_MS to render. Nothing is clicked to open a collapsed "Projects"
+ * section (no reliable sign of one was recorded): a project it hides that
+ * is not yet remembered gets a duplicate. When the row is still not in
+ * view, a long list's "show more" control
+ * (showMoreProjectsButton) is pressed once and the row looked for again
+ * until the list stops growing (at most ROW_WAIT_MS);
  * a project hidden in some other way gets a duplicate, unless its id is
  * remembered.
  */
@@ -2060,8 +2391,22 @@ export async function openProject(
     if (more !== null) {
       const shown = projectRows().length;
       more.click();
-      await waitForPage(() => lookup() !== null || projectRows().length > shown, budget(ROW_WAIT_MS));
+      // The rest may render in steps: after the first new rows, wait until
+      // the list holds still for ROW_SETTLE_MS, ROW_WAIT_MS in all.
+      const until = Date.now() + ROW_WAIT_MS;
+      const left = (): number => budget(until - Date.now());
+      await waitForPage(() => lookup() !== null || projectRows().length > shown, left());
       row = lookup();
+      let count = projectRows().length;
+      while (row === null && count > shown && left() > 0) {
+        await waitForPage(
+          () => lookup() !== null || projectRows().length !== count,
+          Math.min(ROW_SETTLE_MS, left()),
+        );
+        row = lookup();
+        if (projectRows().length === count) break;
+        count = projectRows().length;
+      }
     }
   }
   if (stale && cachedId !== null) await forgetProject(name, cachedId);

@@ -14,7 +14,8 @@
     bin\cgpt-gateway.exe, bin\cgpt-bridge-host.exe
     extension\
     install.ps1, uninstall.ps1, start-gateway.ps1, opencode-provider.json,
-    opencode-agent-cgpt.md (shared with the macOS bundle)
+    opencode-agent-cgpt.md, opencode-agent-cgpt-sub.md (shared with the macOS
+    bundle)
     INSTALL.md, README.md, VERSION
   and writes SHA256SUMS (checksum of the zip) next to it.
 
@@ -96,7 +97,9 @@ Copy-Item -LiteralPath 'extension\dist' -Destination (Join-Path $stage 'extensio
 foreach ($f in 'install.ps1', 'uninstall.ps1', 'start-gateway.ps1', 'opencode-provider.json') {
   Copy-Item -LiteralPath (Join-Path 'install\windows' $f) -Destination $stage
 }
-Copy-Item -LiteralPath 'install\opencode-agent-cgpt.md' -Destination $stage
+foreach ($f in 'opencode-agent-cgpt.md', 'opencode-agent-cgpt-sub.md') {
+  Copy-Item -LiteralPath (Join-Path 'install' $f) -Destination $stage
+}
 Copy-Item -LiteralPath 'README.md' -Destination $stage
 Set-Content -LiteralPath (Join-Path $stage 'VERSION') -Value $version
 Set-Content -LiteralPath (Join-Path $stage 'INSTALL.md') -Value @'
@@ -109,8 +112,9 @@ Set-Content -LiteralPath (Join-Path $stage 'INSTALL.md') -Value @'
    It copies everything to %LOCALAPPDATA%\cgpt-bridge\, registers the native
    host with Chrome (HKCU), creates the gateway config with its token, adds
    provider "cgpt" to %USERPROFILE%\.config\opencode\opencode.json (the
-   previous file is kept as opencode.json.bak), adds the OpenCode agent cgpt
-   (%USERPROFILE%\.config\opencode\agents\cgpt.md; -NoAgent skips it), and
+   previous file is kept as opencode.json.bak), adds the OpenCode agents cgpt
+   and cgpt-sub (%USERPROFILE%\.config\opencode\agents\; -NoAgent skips
+   them), and
    starts the gateway now and at every login (HKCU Run value cgpt-gateway),
    then checks that it answers. Chrome may stay open during an update.
 2. Chrome -> chrome://extensions -> Developer mode -> Load unpacked ->
@@ -121,7 +125,8 @@ Set-Content -LiteralPath (Join-Path $stage 'INSTALL.md') -Value @'
    a temporary chat. Do not run Chrome as administrator.
 4. In OpenCode press Tab to switch to the agent cgpt (or run
    opencode --agent cgpt). It uses the model cgpt/chatgpt-web and asks
-   before every command, file edit and web fetch. It is not the default
+   before every command, file edit, web access, MCP tool and skill. It is
+   not the default
    agent: pick it with Tab each time. The model cgpt/chatgpt-web chosen in
    another agent works too, but nothing asks there.
 5. On the first request the extension opens its own ChatGPT window without

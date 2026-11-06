@@ -132,6 +132,8 @@ fn cli_ask_round_trips_through_extension_mock() {
         timeout_ms: 3_000,
         target: None,
         project: None,
+        capture_stream: false,
+        attachments: Vec::new(),
     };
     let envelope = serde_json::json!({
         "type": "ask",
@@ -291,6 +293,8 @@ fn host_forwards_stop_and_status() {
                     "tab_open": true, "logged_in": true,
                     "conversation_url": "https://chatgpt.com/c/abc",
                     "build": "ext-build-1",
+                    "own_tabs": 8,
+                    "attachments": true,
                 }),
                 other => return Err(format!("unexpected frame type {:?}", other)),
             };
@@ -340,6 +344,8 @@ fn host_forwards_stop_and_status() {
             logged_in,
             conversation_url,
             build,
+            own_tabs,
+            attachments,
         } => {
             assert_eq!(id, "status-1");
             assert!(extension && tab_open && logged_in);
@@ -349,6 +355,10 @@ fn host_forwards_stop_and_status() {
             );
             // The extension's build reaches the caller as the extension sent it.
             assert_eq!(build.as_deref(), Some("ext-build-1"));
+            // So does the number of its own tabs (several gateway sessions).
+            assert_eq!(own_tabs, Some(8));
+            // And whether it takes an ask's files.
+            assert!(attachments);
         }
         other => panic!("expected StatusResult, got {:?}", other),
     }
@@ -427,6 +437,104 @@ fn host_forwards_ask_target_to_extension() {
             "target": {"kind": "new_chat"},
         })
     );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn host_forwards_capture_stream_and_the_answers_diagnostics_unchanged() {
+    let (mut child, endpoint, test_dir, _stderr) = spawn_host("capture");
+    let child_stdin = child.stdin.take().unwrap();
+    let child_stdout = child.stdout.take().unwrap();
+    let diagnostics = serde_json::json!({
+        "stream_check": {"stream_chars": 4, "page_chars": 8, "mismatch": true},
+        "stream_capture_dropped": true,
+    });
+    let sent = diagnostics.clone();
+
+    let extension = thread::spawn(move || -> Result<serde_json::Value, String> {
+        let mut reader = BufReader::new(child_stdout);
+        let mut writer = BufWriter::new(child_stdin);
+        let body = read_frame(&mut reader).map_err(fmt_frame_err)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| format!("parse: {}", e))?;
+        let resp = serde_json::json!({
+            "type": "ask_result",
+            "id": value["id"],
+            "text": "ok",
+            "conversation_url": "https://chatgpt.com/c/new1",
+            "diagnostics": sent,
+        });
+        write_frame(&mut writer, &serde_json::to_vec(&resp).unwrap())
+            .map_err(|e| format!("write: {}", e))?;
+        writer.flush().map_err(|e| format!("flush: {}", e))?;
+        Ok(value)
+    });
+
+    assert!(wait_for_endpoint(&endpoint, HOST_START_TIMEOUT));
+    let ask = serde_json::json!({
+        "type": "ask", "id": "cap-1", "text": "hi", "timeout_ms": 3000,
+        "target": {"kind": "new_chat"}, "capture_stream": true,
+    });
+    let resp = local_round_trip(&endpoint, &ask);
+    match &resp {
+        BridgeResponse::AskResult { id, .. } => assert_eq!(id, "cap-1"),
+        other => panic!("expected AskResult, got {:?}", other),
+    }
+    assert_eq!(
+        serde_json::to_value(&resp).unwrap()["diagnostics"],
+        diagnostics
+    );
+    let forwarded = join_within(extension, "fake extension finishes").expect("ext err");
+    assert_eq!(forwarded, ask);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+#[test]
+fn host_forwards_the_asks_attachments_unchanged() {
+    let (mut child, endpoint, test_dir, _stderr) = spawn_host("attach");
+    let child_stdin = child.stdin.take().unwrap();
+    let child_stdout = child.stdout.take().unwrap();
+
+    let extension = thread::spawn(move || -> Result<serde_json::Value, String> {
+        let mut reader = BufReader::new(child_stdout);
+        let mut writer = BufWriter::new(child_stdin);
+        let body = read_frame(&mut reader).map_err(fmt_frame_err)?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| format!("parse: {}", e))?;
+        let resp = serde_json::json!({
+            "type": "ask_result",
+            "id": value["id"],
+            "text": "ok",
+            "conversation_url": "https://chatgpt.com/c/new1",
+        });
+        write_frame(&mut writer, &serde_json::to_vec(&resp).unwrap())
+            .map_err(|e| format!("write: {}", e))?;
+        writer.flush().map_err(|e| format!("flush: {}", e))?;
+        Ok(value)
+    });
+
+    assert!(wait_for_endpoint(&endpoint, HOST_START_TIMEOUT));
+
+    // A frame near the size the gateway allows for an ask with images.
+    let data = "A".repeat(900 * 1024);
+    let ask = serde_json::json!({
+        "type": "ask", "id": "img-1", "text": "what is this?", "timeout_ms": 3000,
+        "target": {"kind": "new_chat"},
+        "attachments": [{"name": "image-1.png", "mime": "image/png", "data_base64": data}],
+    });
+    match local_round_trip(&endpoint, &ask) {
+        BridgeResponse::AskResult { id, .. } => assert_eq!(id, "img-1"),
+        other => panic!("expected AskResult, got {:?}", other),
+    }
+
+    let forwarded = join_within(extension, "fake extension finishes").expect("ext err");
+    assert_eq!(forwarded, ask);
 
     let _ = child.kill();
     let _ = child.wait();
@@ -534,12 +642,16 @@ fn status_without_extension_reports_extension_false_and_stop_errors() {
             logged_in,
             conversation_url,
             build,
+            own_tabs,
+            attachments,
         } => {
             assert_eq!(id, "status-2");
             assert!(!extension && !tab_open && !logged_in);
             assert_eq!(conversation_url, None);
-            // No extension, no extension build.
+            // No extension, no extension build, no own tabs, no files.
             assert_eq!(build, None);
+            assert_eq!(own_tabs, None);
+            assert!(!attachments);
         }
         other => panic!("expected StatusResult, got {:?}", other),
     }
@@ -1113,5 +1225,171 @@ fn a_length_prefix_over_64_mib_ends_the_host_as_a_desync() {
         "{}",
         stderr.contents()
     );
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// A client that goes away while its ask is at the extension (a restarted
+/// gateway, a killed `cgpt`) gets that ask stopped: the host sends the
+/// extension a `stop_ask` for it. A client that closes after its answer
+/// does not: the first ask below is answered, its client closes, and the
+/// next frame the extension sees is the second ask, not a stop.
+#[test]
+fn a_client_that_hangs_up_mid_ask_gets_its_ask_stopped() {
+    let (mut child, endpoint, test_dir, stderr) = spawn_host("hangup");
+    let child_stdin = child.stdin.take().unwrap();
+    let child_stdout = child.stdout.take().unwrap();
+    let (asked_tx, asked_rx) = std::sync::mpsc::channel::<String>();
+
+    let extension = thread::spawn(move || -> Result<serde_json::Value, String> {
+        let mut reader = BufReader::new(child_stdout);
+        let mut writer = BufWriter::new(child_stdin);
+        let mut next = || -> Result<serde_json::Value, String> {
+            let body = read_frame(&mut reader).map_err(fmt_frame_err)?;
+            serde_json::from_slice(&body).map_err(|e| format!("parse: {}", e))
+        };
+        let mut answer = |frame: serde_json::Value| -> Result<(), String> {
+            write_frame(&mut writer, &serde_json::to_vec(&frame).unwrap())
+                .and_then(|_| writer.flush())
+                .map_err(|e| format!("write: {}", e))
+        };
+        // 1: answered at once.
+        let first = next()?;
+        answer(serde_json::json!({"type": "ask_result", "id": first["id"], "text": "ok"}))?;
+        // 2: left unanswered; its client hangs up.
+        let second = next()?;
+        if second["type"] != "ask" {
+            return Err(format!("expected the second ask, got {}", second));
+        }
+        let _ = asked_tx.send(second["id"].as_str().unwrap_or_default().to_string());
+        // 3: the stop for it.
+        let stop = next()?;
+        answer(serde_json::json!({"type": "stopped", "id": stop["id"], "was_generating": true}))?;
+        while next().is_ok() {}
+        Ok(stop)
+    });
+
+    assert!(wait_for_endpoint(&endpoint, HOST_START_TIMEOUT));
+    match local_round_trip(&endpoint, &ask_json("ask-answered")) {
+        BridgeResponse::AskResult { id, .. } => assert_eq!(id, "ask-answered"),
+        other => panic!("expected AskResult, got {:?}", other),
+    }
+
+    let stream = connect(&endpoint, 5_000).expect("local socket connect");
+    {
+        let mut writer = BufWriter::new(&stream);
+        write_frame(
+            &mut writer,
+            &serde_json::to_vec(&ask_json("ask-gone")).unwrap(),
+        )
+        .unwrap();
+        writer.flush().unwrap();
+    }
+    let asked = asked_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the extension got the second ask");
+    assert_eq!(asked, "ask-gone");
+    drop(stream);
+
+    let wanted = "the client of ask ask-gone hung up before the answer; stop_ask: \
+                  was_generating true";
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !stderr.contents().contains(wanted) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let log = stderr.contents();
+    assert!(log.contains(wanted), "{log}");
+    assert!(!log.contains("ask-answered hung up"), "{log}");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let stop = join_within(extension, "fake extension finishes").expect("ext err");
+    assert_eq!(stop["type"], "stop_ask", "{stop}");
+    assert_eq!(stop["ask_id"], "ask-gone", "{stop}");
+    let _ = std::fs::remove_dir_all(&test_dir);
+}
+
+/// The answer arrives just as its client closes (a race, run several
+/// times): at most a harmless `stop_ask` for that very ask goes out, never
+/// one for another client's ask, which is still answered normally.
+#[test]
+fn an_answer_racing_its_clients_hang_up_never_stops_another_ask() {
+    let (mut child, endpoint, test_dir, stderr) = spawn_host("hangup-race");
+    let child_stdin = child.stdin.take().unwrap();
+    let child_stdout = child.stdout.take().unwrap();
+    const ROUNDS: usize = 5;
+    let (asked_tx, asked_rx) = std::sync::mpsc::channel::<String>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+
+    // Per round: the racing ask, answered on "go"; then the other client's
+    // ask, answered at once. Every frame seen is returned.
+    let extension = thread::spawn(move || -> Result<Vec<serde_json::Value>, String> {
+        let mut reader = BufReader::new(child_stdout);
+        let mut writer = BufWriter::new(child_stdin);
+        let mut seen = Vec::new();
+        let mut answer = |frame: serde_json::Value| -> Result<(), String> {
+            write_frame(&mut writer, &serde_json::to_vec(&frame).unwrap())
+                .and_then(|_| writer.flush())
+                .map_err(|e| format!("write: {}", e))
+        };
+        while let Ok(body) = read_frame(&mut reader) {
+            let frame: serde_json::Value =
+                serde_json::from_slice(&body).map_err(|e| format!("parse: {}", e))?;
+            seen.push(frame.clone());
+            let id = frame["id"].as_str().unwrap_or_default().to_string();
+            match frame["type"].as_str() {
+                Some("ask") if id.starts_with("race-") => {
+                    let _ = asked_tx.send(id.clone());
+                    go_rx.recv().map_err(|e| format!("go: {}", e))?;
+                    answer(serde_json::json!({"type": "ask_result", "id": id, "text": "ok"}))?;
+                }
+                Some("ask") => {
+                    answer(serde_json::json!({"type": "ask_result", "id": id, "text": "other"}))?
+                }
+                Some("stop_ask") => answer(
+                    serde_json::json!({"type": "stopped", "id": id, "was_generating": false}),
+                )?,
+                _ => {}
+            }
+        }
+        Ok(seen)
+    });
+
+    assert!(wait_for_endpoint(&endpoint, HOST_START_TIMEOUT));
+    for round in 0..ROUNDS {
+        let stream = connect(&endpoint, 5_000).expect("local socket connect");
+        {
+            let mut writer = BufWriter::new(&stream);
+            let ask = ask_json(&format!("race-{round}"));
+            write_frame(&mut writer, &serde_json::to_vec(&ask).unwrap()).unwrap();
+            writer.flush().unwrap();
+        }
+        asked_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the extension got the racing ask");
+        // The answer and the hang-up at the same moment.
+        go_tx.send(()).unwrap();
+        drop(stream);
+        let other = format!("other-{round}");
+        match local_round_trip(&endpoint, &ask_json(&other)) {
+            BridgeResponse::AskResult { id, text, .. } => {
+                assert_eq!((id.as_str(), text.as_str()), (other.as_str(), "other"))
+            }
+            other => panic!("expected AskResult, got {:?}", other),
+        }
+    }
+    // Let a late watcher of the last round act before the host goes.
+    thread::sleep(Duration::from_millis(300));
+    let _ = child.kill();
+    let _ = child.wait();
+    let seen = join_within(extension, "fake extension finishes").expect("ext err");
+    for frame in seen.iter().filter(|f| f["type"] == "stop_ask") {
+        let ask_id = frame["ask_id"].as_str().unwrap_or_default();
+        assert!(
+            ask_id.starts_with("race-"),
+            "a stop for another ask: {frame}"
+        );
+    }
+    let log = stderr.contents();
+    assert!(!log.contains("ask other-"), "{log}");
     let _ = std::fs::remove_dir_all(&test_dir);
 }

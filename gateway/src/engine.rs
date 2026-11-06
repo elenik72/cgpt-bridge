@@ -4,14 +4,19 @@
 //! automatic repair round per turn.
 
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use cgpt_bridge_protocol::chat_url::{chat_id, chat_key};
-use cgpt_bridge_protocol::{ChatTarget, BUILD};
+use cgpt_bridge_protocol::{Attachment, ChatTarget, BUILD};
 
-use crate::backend::{new_ask_id, BackendError, ChatBackend, PeerBuilds};
+use crate::backend::{new_ask_id, Answer, BackendError, ChatBackend, PeerBuilds};
 use crate::config::MAX_TURN_TIMEOUT_MS;
 use crate::cooldown::Cooldown;
+use crate::images;
+use crate::journal::{Journal, Reason, Record};
+use crate::lanes::{lock, Lanes};
 use crate::log::log;
 use crate::openai::{ChatRequest, FunctionCall, Reply, Tool, ToolCall};
 use crate::prompt;
@@ -26,23 +31,67 @@ pub const NO_EXTENSION: &str =
 /// Expired sessions are looked for at most this often.
 const EXPIRE_EVERY: Duration = Duration::from_secs(60 * 60);
 
+/// Runs turns. Turns of different sessions may run at once (the HTTP side
+/// keeps one turn per session, see [`Lanes`]): what they share (the pause
+/// after a rate limit, the outdated latch, the builds in the log, the scan
+/// for expired sessions) is behind short locks, never held across a call to
+/// the bridge, and a turn touches only its own session's file.
 pub struct Engine {
     sessions: Sessions,
     /// `allow_tools` of the config: tools shown to ChatGPT beyond the safe set.
     allow_tools: Vec<String>,
     cooldown: Cooldown,
-    /// The last answered turn's session as it was before the turn, to undo
-    /// it with [`Engine::interrupt_last_turn`].
-    last_turn: Option<Session>,
-    last_expire: Option<Instant>,
+    /// Read while a turn loads its session and marks it in flight, and while
+    /// a session is saved; written while expired sessions are deleted, so
+    /// that the scan never deletes a session a turn has just taken up.
+    files: RwLock<()>,
+    last_expire: Mutex<Option<Instant>>,
     /// The bridge was found outdated (by a turn or by the `status` probe);
     /// cleared when the probe proves a current extension again.
-    outdated: bool,
+    outdated: AtomicBool,
     /// No part of a turn is sent with less budget left than this. Zero: only
     /// a spent budget stops a part.
     min_ask_budget: Duration,
     /// The bridge's builds last written to the log.
-    builds_seen: Option<PeerBuilds>,
+    builds_seen: Mutex<Option<PeerBuilds>>,
+    /// Told the extension's own tabs after every status probe (the limit of
+    /// turns at once); without it (tests of the engine alone) one turn at a
+    /// time is assumed.
+    lanes: Option<Arc<Lanes>>,
+    /// Where answers the gateway could not read as meant are recorded (and
+    /// raw answer streams captured); none in tests of the engine alone.
+    journal: Option<Arc<Journal>>,
+}
+
+/// What a turn learns from its HTTP side, and tells it.
+pub trait TurnWatch {
+    /// The client went away: nothing more is sent and an answer that still
+    /// arrives is dropped.
+    fn stopped(&self) -> bool;
+
+    /// The turn is about to send a part under bridge id `ask_id` (so a stop
+    /// can name it). `false`: the client went away, and it is not sent.
+    fn sending(&self, _ask_id: &str) -> bool {
+        !self.stopped()
+    }
+}
+
+impl<F: Fn() -> bool> TurnWatch for F {
+    fn stopped(&self) -> bool {
+        self()
+    }
+}
+
+/// An answered turn's session as it was before the turn, marked
+/// interrupted: for [`Engine::undo`] when the answer did not reach the client
+/// after all.
+#[derive(Debug)]
+pub struct Undo(Session);
+
+/// A turn's result, and how to undo it (only for an answered turn).
+pub struct Handled {
+    pub result: Result<Reply, BackendError>,
+    pub undo: Option<Undo>,
 }
 
 impl Engine {
@@ -51,12 +100,20 @@ impl Engine {
             sessions,
             allow_tools,
             cooldown,
-            last_turn: None,
-            last_expire: None,
-            outdated: false,
+            files: RwLock::new(()),
+            last_expire: Mutex::new(None),
+            outdated: AtomicBool::new(false),
             min_ask_budget: Duration::ZERO,
-            builds_seen: None,
+            builds_seen: Mutex::new(None),
+            lanes: None,
+            journal: None,
         }
+    }
+
+    /// Record unusual answers (and capture raw streams) in `journal`.
+    pub fn with_journal(mut self, journal: Arc<Journal>) -> Engine {
+        self.journal = Some(journal);
+        self
     }
 
     /// Refuse to send any part of a turn (a later part, a repair, a refusal)
@@ -66,51 +123,86 @@ impl Engine {
         self
     }
 
-    /// Run one turn. Turns never overlap (the caller holds the turn gate), so
-    /// the engine may keep state in `&mut self`. `stopped` says the client
-    /// went away: nothing more is sent and an answer that still arrives is
-    /// dropped. During a pause after a rate limit nothing is sent at all; a
-    /// rate limit in this turn starts the next pause. Every turn first asks
-    /// the bridge for `status`: nothing is sent unless an extension that
-    /// knows `status` answers (an old one ignores targets and may write into
-    /// the user's active tab), and the session stays as it was.
+    /// Tell `lanes` the extension's own tabs after every status probe.
+    pub fn with_lanes(mut self, lanes: Arc<Lanes>) -> Engine {
+        self.lanes = Some(lanes);
+        self
+    }
+
+    /// [`run`](Self::run) without the undo.
+    #[cfg(test)]
     pub fn handle(
-        &mut self,
+        &self,
         headers: &[(String, String)],
         req: &ChatRequest,
         backend: &dyn ChatBackend,
         timeout_ms: u64,
-        stopped: &dyn Fn() -> bool,
+        watch: &dyn TurnWatch,
     ) -> Result<Reply, BackendError> {
-        self.last_turn = None;
+        self.run(headers, req, backend, timeout_ms, watch).result
+    }
+
+    /// Run one turn. Turns of one session never overlap (the caller holds
+    /// its lane); turns of other sessions may run meanwhile. `watch` says
+    /// the client went away: nothing more is sent and an answer that still
+    /// arrives is dropped. During a pause after a rate limit nothing is sent
+    /// at all; a rate limit in this turn starts the next pause, for every
+    /// session. Every turn first asks the bridge for `status`: nothing is
+    /// sent unless an extension that knows `status` answers (an old one
+    /// ignores targets and may write into the user's active tab), and the
+    /// session stays as it was. An answered turn comes with its undo.
+    pub fn run(
+        &self,
+        headers: &[(String, String)],
+        req: &ChatRequest,
+        backend: &dyn ChatBackend,
+        timeout_ms: u64,
+        watch: &dyn TurnWatch,
+    ) -> Handled {
+        let mut undo = None;
+        let result = self.checked_turn(headers, req, backend, timeout_ms, watch, &mut undo);
+        Handled { result, undo }
+    }
+
+    fn checked_turn(
+        &self,
+        headers: &[(String, String)],
+        req: &ChatRequest,
+        backend: &dyn ChatBackend,
+        timeout_ms: u64,
+        watch: &dyn TurnWatch,
+        undo: &mut Option<Undo>,
+    ) -> Result<Reply, BackendError> {
         // Checked again here: the pause may have started while this request
         // waited for its turn.
         self.cooldown.check(now_ms())?;
         match backend.status() {
             Ok(true) => {
-                if self.outdated {
+                if self.outdated.swap(false, Ordering::SeqCst) {
                     log("cgpt-gateway: a current extension answered status");
-                    self.outdated = false;
                 }
                 if let Some(line) = backend.peer_builds().and_then(|b| self.note_builds(b)) {
                     log(line);
+                }
+                if let Some(lanes) = &self.lanes {
+                    lanes.set_own_tabs(backend.own_tabs());
                 }
             }
             Ok(false) => return Err(BackendError::Unavailable(NO_EXTENSION.to_string())),
             // An old extension never answers `status` (the host times out),
             // an old host does not know it.
             Err(BackendError::Timeout | BackendError::Outdated) => {
-                self.outdated = true;
+                self.outdated.store(true, Ordering::SeqCst);
                 return Err(BackendError::Outdated);
             }
             Err(e) => return Err(e),
         }
-        match self.turn(headers, req, backend, timeout_ms, stopped) {
+        match self.turn(headers, req, backend, timeout_ms, watch, undo) {
             Err(BackendError::RateLimited) => Err(BackendError::CoolingDown {
                 until_ms: self.cooldown.record_hit(now_ms()),
             }),
             Err(BackendError::Outdated) => {
-                self.outdated = true;
+                self.outdated.store(true, Ordering::SeqCst);
                 Err(BackendError::Outdated)
             }
             result => result,
@@ -120,33 +212,37 @@ impl Engine {
     /// The log line for the bridge's builds, when they are not the ones last
     /// logged: so the first turn names them, and a reloaded extension or a
     /// new host is named again.
-    fn note_builds(&mut self, seen: PeerBuilds) -> Option<String> {
+    fn note_builds(&self, seen: PeerBuilds) -> Option<String> {
         // Whatever a part sends is logged only as a build id, else as none.
         let valid = |b: Option<String>| b.filter(|b| is_build_id(b));
         let seen = PeerBuilds {
             host: valid(seen.host),
             extension: valid(seen.extension),
         };
-        if self.builds_seen.as_ref() == Some(&seen) {
+        let mut builds_seen = lock(&self.builds_seen);
+        if builds_seen.as_ref() == Some(&seen) {
             return None;
         }
         let line = builds_line(BUILD, &seen);
-        self.builds_seen = Some(seen);
+        *builds_seen = Some(seen);
         Some(line)
     }
 
     fn turn(
-        &mut self,
+        &self,
         headers: &[(String, String)],
         req: &ChatRequest,
         backend: &dyn ChatBackend,
         timeout_ms: u64,
-        stopped: &dyn Fn() -> bool,
+        watch: &dyn TurnWatch,
+        undo: &mut Option<Undo>,
     ) -> Result<Reply, BackendError> {
         let deadline = turn_now() + Duration::from_millis(timeout_ms.min(MAX_TURN_TIMEOUT_MS));
         let now = now_ms();
         self.expire_now(now);
         let key = Sessions::key_for(headers, req);
+        // Up to the save in flight below: the expiry scan waits.
+        let files = self.files.read().unwrap_or_else(|e| e.into_inner());
         let mut saved = self.sessions.load(&key);
         // An address that names no chat (kept by an older gateway) is none:
         // the turn starts a new chat.
@@ -166,6 +262,13 @@ impl Engine {
             .as_ref()
             .filter(|s| s.state == SessionState::Interrupted)
             .and_then(|s| s.cut.clone());
+        // The images of the messages sent (see `images`): markers in the
+        // text, files with the last part; one over a limit becomes a note.
+        let takes_files = backend.attachments();
+        let mut delta_images = match &plan {
+            Plan::Delta { from, .. } => Some(images::prepare(req, *from, takes_files)),
+            Plan::Bootstrap => None,
+        };
         let delta = match plan {
             Plan::Bootstrap => None,
             Plan::Delta {
@@ -173,7 +276,7 @@ impl Engine {
                 note_interrupted,
                 updated_rules,
             } => {
-                let history = session::history(req);
+                let history = session::history(delta_images.as_ref().map_or(req, |p| &p.req));
                 let rules = updated_rules.then(|| {
                     let tools = req.tools.as_deref().unwrap_or(&[]);
                     (
@@ -205,38 +308,53 @@ impl Engine {
         // Without a delta to send after a cut, the delta changed since (or
         // ends where it was cut): sent again in the same chat, its answered
         // start would be there twice, so a new chat gets the history.
-        let (parts, ends, from): (Vec<String>, Vec<usize>, usize) = match &delta {
-            Some(d) => {
-                let (parts, ends) = prompt::split_after(&d.message(), d.answered)
-                    .into_iter()
-                    .unzip();
-                (parts, ends, d.from)
-            }
-            None => {
-                // Nothing of the old chat counts until this pack is answered.
-                s.chat_url = None;
-                s.delivered.clear();
-                s.cut = None;
-                (prompt::bootstrap(req, &self.allow_tools), Vec::new(), 0)
-            }
-        };
+        let (parts, ends, from, attachments): (Vec<String>, Vec<usize>, usize, Vec<Attachment>) =
+            match &delta {
+                Some(d) => {
+                    let attachments = delta_images
+                        .take()
+                        .map(|p| p.take_files().1)
+                        .unwrap_or_default();
+                    let room = images::text_room(&attachments);
+                    let (parts, ends) = prompt::split_after_room(&d.message(), d.answered, room)
+                        .into_iter()
+                        .unzip();
+                    (parts, ends, d.from, attachments)
+                }
+                None => {
+                    // Nothing of the old chat counts until this pack is answered.
+                    s.chat_url = None;
+                    s.delivered.clear();
+                    s.cut = None;
+                    let (shown, attachments) = images::prepare(req, 0, takes_files).take_files();
+                    let room = images::text_room(&attachments);
+                    let parts = prompt::bootstrap_room(&shown, &self.allow_tools, room);
+                    (parts, Vec::new(), 0, attachments)
+                }
+            };
         s.state = SessionState::InFlight;
         s.last_used_ms = now;
         self.sessions
             .save(&s)
             .map_err(|e| BackendError::Other(format!("сессия не сохранена: {}", e)))?;
+        drop(files);
         let before = s.clone();
 
         let tools = safety::visible_tools(req.tools.as_deref().unwrap_or(&[]), &self.allow_tools);
         let turn = Turn {
             backend,
             deadline,
-            stopped,
+            watch,
+            lanes: self.lanes.as_deref(),
+            cooldown: &self.cooldown,
             project: project_of(req, home_dir().as_deref()),
             min_ask_budget: self.min_ask_budget,
             reached: Cell::new(false),
             answered: Cell::new(0),
             ask_id: RefCell::new(String::new()),
+            journal: self.journal.as_deref(),
+            capture: Cell::new(None),
+            attachments: RefCell::new(attachments),
         };
         match turn.run(&mut s, &parts, &tools) {
             Ok(reply) => {
@@ -252,14 +370,14 @@ impl Engine {
                 // A failed save leaves the session in flight: the next turn
                 // resends this delta with the note, which is safe.
                 self.save(&s);
-                self.last_turn = Some(Session {
+                *undo = Some(Undo(Session {
                     state: SessionState::Interrupted,
                     chat_url: s.chat_url.clone(),
                     call_seq: s.call_seq,
                     // The chat has the whole delta.
                     cut: None,
                     ..before
-                });
+                }));
                 Ok(reply)
             }
             Err(e) if !turn.reached.get() => {
@@ -296,16 +414,16 @@ impl Engine {
         self.cooldown.clone()
     }
 
-    /// The answer of the last turn did not reach OpenCode after all (it was
-    /// stopped after the answer arrived): the session goes back to what the
-    /// chat had seen before that turn, marked interrupted.
-    pub fn interrupt_last_turn(&mut self) {
-        if let Some(s) = self.last_turn.take() {
-            self.save(&s);
-        }
+    /// The answer of a turn did not reach OpenCode after all (it was stopped
+    /// after the answer arrived): its session goes back to what the chat had
+    /// seen before that turn, marked interrupted. No other session is
+    /// touched.
+    pub fn undo(&self, undo: Undo) {
+        self.save(&undo.0);
     }
 
     fn save(&self, s: &Session) {
+        let _files = self.files.read().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = self.sessions.save(s) {
             log(format_args!(
                 "cgpt-gateway: session {} not saved: {}",
@@ -314,11 +432,15 @@ impl Engine {
         }
     }
 
-    fn expire_now(&mut self, now: u128) {
-        if self.last_expire.is_some_and(|t| t.elapsed() < EXPIRE_EVERY) {
-            return;
+    fn expire_now(&self, now: u128) {
+        {
+            let mut last = lock(&self.last_expire);
+            if last.is_some_and(|t| t.elapsed() < EXPIRE_EVERY) {
+                return;
+            }
+            *last = Some(Instant::now());
         }
-        self.last_expire = Some(Instant::now());
+        let _files = self.files.write().unwrap_or_else(|e| e.into_inner());
         match self.sessions.expire(now) {
             Ok(0) => {}
             Ok(n) => log(format_args!("cgpt-gateway: {} expired sessions deleted", n)),
@@ -401,7 +523,11 @@ impl Delta {
 struct Turn<'a> {
     backend: &'a dyn ChatBackend,
     deadline: Instant,
-    stopped: &'a dyn Fn() -> bool,
+    watch: &'a dyn TurnWatch,
+    /// See [`Engine::lanes`]: how many other turns run beside this one.
+    lanes: Option<&'a Lanes>,
+    /// The pause after a rate limit, checked before every part.
+    cooldown: &'a Cooldown,
     /// The ChatGPT project a new chat of this turn goes into, or why the
     /// folder name cannot be one (see [`project_of`]).
     project: Result<Option<String>, String>,
@@ -415,6 +541,15 @@ struct Turn<'a> {
     /// The bridge id of the last ask sent: the one whose answer the turn's
     /// log line is about (empty before the first).
     ask_id: RefCell<String>,
+    /// See [`Engine::with_journal`].
+    journal: Option<&'a Journal>,
+    /// Whether the raw stream of every answer of this turn is captured
+    /// (`debug_capture_turns`); decided, and a capture turn used up, only
+    /// when the turn's first ask is about to go out (`None` before).
+    capture: Cell<Option<bool>>,
+    /// The turn's images (see `images`): they go with the last part of the
+    /// turn's message, once; a repair or refusal sends none.
+    attachments: RefCell<Vec<Attachment>>,
 }
 
 /// The clock a turn's budget is measured by.
@@ -539,11 +674,19 @@ impl Turn<'_> {
         let mut answer = self.send(s, parts)?;
         let mut repaired = false;
         let mut refused = false;
+        // The answer a repair request followed.
+        let mut before_repair: Option<String> = None;
         loop {
             let id = self.ask_id.borrow().clone();
+            let record = |reason: Reason, detail: &str| {
+                self.record(s, &id, reason, detail, &answer, before_repair.as_deref())
+            };
             match reply::parse_reply(&answer, tools) {
                 ParseOutcome::Text(text) => {
                     log_turn(s, &id, "text", repaired, refused, "");
+                    if reply::mentions_calls(&text, tools) {
+                        record(Reason::CallLikeText, "");
+                    }
                     return Ok(Reply::Text(text));
                 }
                 ParseOutcome::Calls { prefix, calls } => {
@@ -555,6 +698,9 @@ impl Turn<'_> {
                         })
                         .collect();
                     if reasons.is_empty() {
+                        if reply::is_doubled(&answer) {
+                            record(Reason::DoubledAnswer, "");
+                        }
                         log_turn(
                             s,
                             &id,
@@ -583,19 +729,37 @@ impl Turn<'_> {
                 ParseOutcome::Invalid(problem) if !repaired => {
                     log_turn(s, &id, "invalid", repaired, refused, &problem);
                     repaired = true;
+                    before_repair = Some(answer);
                     answer = self.send(s, &prompt::split(&reply::repair_request(&problem)))?;
                 }
                 ParseOutcome::Widget { problem, .. } if !repaired => {
                     log_turn(s, &id, "widget", repaired, refused, "");
                     repaired = true;
+                    before_repair = Some(answer);
+                    answer = self.send(s, &prompt::split(&reply::repair_request(&problem)))?;
+                }
+                // Never run: it only earns the repair request.
+                ParseOutcome::CallShaped { problem, .. } if !repaired => {
+                    log_turn(s, &id, "call-shaped", repaired, refused, &problem);
+                    repaired = true;
+                    before_repair = Some(answer);
                     answer = self.send(s, &prompt::split(&reply::repair_request(&problem)))?;
                 }
                 ParseOutcome::Widget { text, .. } => {
                     log_turn(s, &id, "widget", repaired, refused, "");
+                    record(Reason::RepairFailed, "widget");
+                    return Ok(Reply::Text(text));
+                }
+                // Still no block after the repair: the answer as it is (it
+                // may be no call at all, say code that only looks like one).
+                ParseOutcome::CallShaped { problem, text } => {
+                    log_turn(s, &id, "call-shaped", repaired, refused, &problem);
+                    record(Reason::RepairFailed, &problem);
                     return Ok(Reply::Text(text));
                 }
                 ParseOutcome::Invalid(problem) => {
                     log_turn(s, &id, "invalid", repaired, refused, &problem);
+                    record(Reason::RepairFailed, &problem);
                     return Ok(Reply::Text(format!(
                         "Шлюз не смог разобрать вызовы инструментов в ответе ChatGPT \
                          и после просьбы исправить: {}\n\nОтвет ChatGPT:\n\n{}",
@@ -614,10 +778,13 @@ impl Turn<'_> {
     /// after the client left is dropped.
     fn send(&self, s: &mut Session, parts: &[String]) -> Result<String, BackendError> {
         let mut answer = String::new();
-        for part in parts {
-            if (self.stopped)() {
+        for (n, part) in parts.iter().enumerate() {
+            if self.watch.stopped() {
                 return Err(stopped());
             }
+            // A pause another session's turn started meanwhile holds for
+            // every part: nothing more goes out during it.
+            self.cooldown.check(now_ms())?;
             let left = self.deadline.saturating_duration_since(turn_now());
             // The extension sends only with at least half of the budget it is
             // given, and would then be cut off mid-answer: a part that cannot
@@ -658,19 +825,48 @@ impl Turn<'_> {
                 }
                 (ChatTarget::Conversation { .. }, _) => None,
             };
-            let asked = match self.backend.ask_in_project(
-                &id,
-                part,
-                &target,
-                project,
-                left.as_millis() as u64,
-            ) {
+            // From here a stop for this request names this part.
+            if !self.watch.sending(&id) {
+                return Err(stopped());
+            }
+            let attachments = if n + 1 == parts.len() {
+                self.attachments.take()
+            } else {
+                Vec::new()
+            };
+            images::log_sent(&id, &attachments);
+            let budget = left.as_millis() as u64;
+            let first_capture = self.capture.get().is_none();
+            let capture = self.capture_this_turn();
+            let asked = if capture {
+                self.backend
+                    .ask_capturing(&id, part, &target, project, &attachments, budget)
+            } else {
+                self.backend
+                    .ask_with_files(&id, part, &target, project, &attachments, budget)
+            };
+            let asked = match asked {
                 Ok(asked) => asked,
-                Err(e) => return Err(self.failed_ask(&id, e)),
+                Err(e) => {
+                    let e = self.failed_ask(&id, e);
+                    // Nothing reached the bridge (no host to connect to, no
+                    // access, a busy tab refused it): the capture turn is
+                    // not used up, the next ask decides again.
+                    if first_capture && !self.reached.get() {
+                        if capture {
+                            if let Some(journal) = self.journal {
+                                journal.give_back_capture_turn();
+                            }
+                        }
+                        self.capture.set(None);
+                    }
+                    return Err(e);
+                }
             };
             if let Some(w) = &asked.warning {
                 log(warning_line(&id, w));
             }
+            self.note_diagnostics(s, &id, &asked);
             let (text, url) = (asked.text, asked.conversation_url);
             self.reached.set(true);
             // A bridge that knows targets always names the chat it answered
@@ -702,10 +898,92 @@ impl Turn<'_> {
             self.answered.set(self.answered.get() + 1);
             answer = text;
         }
-        if (self.stopped)() {
+        if self.watch.stopped() {
             return Err(stopped());
         }
         Ok(answer)
+    }
+
+    /// Whether this turn's asks carry `capture_stream`: the first call
+    /// takes a capture turn from the journal, if it has one left.
+    fn capture_this_turn(&self) -> bool {
+        match self.capture.get() {
+            Some(capture) => capture,
+            None => {
+                let capture = self.journal.is_some_and(Journal::take_capture_turn);
+                self.capture.set(Some(capture));
+                capture
+            }
+        }
+    }
+
+    /// Record an answer in the journal (see [`crate::journal`]), if there
+    /// is one.
+    fn record(
+        &self,
+        s: &Session,
+        ask_id: &str,
+        reason: Reason,
+        detail: &str,
+        text: &str,
+        first_text: Option<&str>,
+    ) {
+        if let Some(journal) = self.journal {
+            journal.unparsed(Record {
+                session: &s.key,
+                ask_id,
+                reason,
+                detail,
+                text,
+                first_text,
+                stream_check: None,
+            });
+        }
+    }
+
+    /// What the bridge noticed about an answer: a stream that differs from
+    /// the page's answer is logged and recorded (the answer used stays the
+    /// one the bridge gave), a raw stream is written to the captures.
+    fn note_diagnostics(&self, s: &Session, ask_id: &str, asked: &Answer) {
+        if let Some(check) = asked
+            .diagnostics
+            .stream_check
+            .as_ref()
+            .filter(|c| c.mismatch)
+        {
+            log(format_args!(
+                "cgpt-gateway: answer [{}] differs between stream and page: {} vs {} characters",
+                ask_id, check.stream_chars, check.page_chars
+            ));
+            if let Some(journal) = self.journal {
+                journal.unparsed(Record {
+                    session: &s.key,
+                    ask_id,
+                    reason: Reason::StreamPageMismatch,
+                    detail: "",
+                    text: &asked.text,
+                    first_text: None,
+                    stream_check: Some(check),
+                });
+            }
+        }
+        if asked.diagnostics.stream_capture_dropped {
+            log(format_args!(
+                "cgpt-gateway: debug: answer stream of [{}] not captured: capture dropped, frame too big",
+                ask_id
+            ));
+        }
+        if let (Some(journal), Some(raw)) = (self.journal, &asked.diagnostics.stream_capture) {
+            if self.capture.get() == Some(true) {
+                journal.capture(ask_id, raw);
+            }
+        }
+    }
+
+    /// Turns of other sessions running beside this one now (this turn holds
+    /// a seat while it runs).
+    fn others_running(&self) -> usize {
+        self.lanes.map_or(0, |l| l.running().saturating_sub(1))
     }
 
     /// An ask failed. Unless the host could not be reached at all, the
@@ -714,7 +992,8 @@ impl Turn<'_> {
     /// this turn was sent is no longer "nothing sent": it is `Unavailable`,
     /// which clients do not resend; a busy tab then is `Dom`. A timeout, rate
     /// limit or page failure may also leave ChatGPT writing, so the bridge is
-    /// asked to stop (the HTTP side already did when the client left).
+    /// asked to stop (the HTTP side already did when the client left), as
+    /// [`stop_request`] chooses.
     fn failed_ask(&self, id: &str, e: BackendError) -> BackendError {
         log(failed_ask_line(id, &e));
         let e = match e {
@@ -737,13 +1016,19 @@ impl Turn<'_> {
                 | BackendError::Dom(_)
                 | BackendError::TabBusy(_)
         );
-        if may_generate && !(self.stopped)() {
-            match self.backend.stop() {
+        if may_generate && !self.watch.stopped() {
+            match stop_request(self.backend, Some(id), self.others_running()) {
+                // The bridge answering the stop does not mean anything ran:
+                // the extension presses Stop only while this ask's answer
+                // still generates in its own chat (never after a switch to
+                // another chat).
                 Ok(()) => log(format_args!(
-                    "cgpt-gateway: generation stopped after {:?} [{}]",
-                    e, id
+                    "cgpt-gateway: stop sent for the failed ask [{}]; pressed only if its answer \
+                     was still generating in its chat",
+                    id
                 )),
-                // The bridge does not know `stop`: that is the real problem.
+                // The bridge does not know `stop` (or `stop_ask`): that is
+                // the real problem.
                 Err(BackendError::Outdated) => return BackendError::Outdated,
                 // The stop cannot reach the tab; the next ask's settlePreviousAnswer
                 // stops any leftover generation there.
@@ -760,6 +1045,44 @@ impl Turn<'_> {
             }
         }
         e
+    }
+}
+
+/// Stop the generation of one request (its client left, or its ask failed),
+/// `ask_id` being its part sent last (`None`: nothing sent yet). The plain
+/// `stop` (the whole own tab) goes only when the last status named no own
+/// tabs (an extension that may not know `stop_ask`: builds of 26-27.10
+/// answer `status` but ignore it, and the host then answers
+/// `extension_unavailable` after 10 s) and no other turn runs: exactly as
+/// before several sessions at once. Otherwise `stop_ask` names the part; a
+/// bridge that does not know it (`Outdated`) gets the plain `stop` only when
+/// no other turn runs, else nothing (the stop cannot be scoped). Any other
+/// failure of `stop_ask` is never answered by a plain `stop`. `others_running`
+/// counts the turns actually running beside this one, not the limit (which
+/// may drop while turns run).
+pub fn stop_request(
+    backend: &dyn ChatBackend,
+    ask_id: Option<&str>,
+    others_running: usize,
+) -> Result<(), BackendError> {
+    let alone = others_running == 0;
+    if alone && backend.own_tabs().is_none() {
+        return backend.stop();
+    }
+    let Some(id) = ask_id else {
+        return Ok(());
+    };
+    match backend.stop_ask(id) {
+        Err(BackendError::Outdated) if alone => backend.stop(),
+        Err(BackendError::Outdated) => {
+            log(format_args!(
+                "cgpt-gateway: the bridge does not know stop_ask and {} other turn(s) run: \
+                 the stop of [{}] cannot be scoped, none sent",
+                others_running, id
+            ));
+            Err(BackendError::Outdated)
+        }
+        other => other,
     }
 }
 
@@ -1278,9 +1601,10 @@ mod tests {
         history.push(result(&reply, 0, "содержимое a"));
         let req = with_tools(history);
         fake.push_reply(Ok(("ответ, который не дошёл".into(), Some(URL_A.into()))));
-        run(&mut e, &sid("ses_a"), &req, &fake).unwrap();
+        let handled = e.run(&sid("ses_a"), &req, &*fake, 60_000, &|| false);
+        handled.result.unwrap();
         // The HTTP side stopped the turn after all.
-        e.interrupt_last_turn();
+        e.undo(handled.undo.expect("an answered turn can be undone"));
         fake.push_reply(Ok(("ок".into(), Some(URL_A.into()))));
         run(&mut e, &sid("ses_a"), &req, &fake).unwrap();
         let (text, target) = last_sent(&fake);
@@ -1372,7 +1696,7 @@ mod tests {
 
     #[test]
     fn stopped_turn_sends_no_further_parts() {
-        let (mut e, dir) = engine("stopped");
+        let (e, dir) = engine("stopped");
         let fake = FakeBackend::new();
         let long = two_part_text();
         let req = request(vec![msg("user", &long)]);
@@ -1407,7 +1731,7 @@ mod tests {
         // with under 29 s left: above zero, under the minimum. Preparing the
         // message runs on the wall clock and has up to 30 s before the first
         // part, so a loaded machine does not change the outcome.
-        let mut e = e.with_min_ask_budget_ms(30_000);
+        let e = e.with_min_ask_budget_ms(30_000);
         let fake = FakeBackend::new();
         let long = two_part_text();
         let req = request(vec![msg("user", &long)]);
@@ -1431,7 +1755,7 @@ mod tests {
         let (e, dir) = engine("min-budget-repair");
         // As for a part: 60 s, 30 s a part, the first ask takes 31 s of the
         // turn's clock, so the repair would start with under 29 s left.
-        let mut e = e.with_min_ask_budget_ms(30_000);
+        let e = e.with_min_ask_budget_ms(30_000);
         let fake = FakeBackend::new();
         let broken = "```tool_calls\n{не json\n```";
         fake.push_reply(Ok((broken.into(), Some(URL_A.into()))));
@@ -1451,7 +1775,7 @@ mod tests {
     #[test]
     fn nothing_is_sent_when_the_budget_is_under_the_minimum_from_the_start() {
         let (e, dir) = engine("min-budget-first");
-        let mut e = e.with_min_ask_budget_ms(1_500);
+        let e = e.with_min_ask_budget_ms(1_500);
         let fake = FakeBackend::new();
         let req = request(vec![msg("user", "привет")]);
         let got = e.handle(&sid("ses_f"), &req, &*fake, 1_000, &|| false);
@@ -1469,7 +1793,7 @@ mod tests {
     #[test]
     fn multi_part_turn_with_enough_budget_is_sent_whole() {
         let (e, _dir) = engine("min-budget-ok");
-        let mut e = e.with_min_ask_budget_ms(1_500);
+        let e = e.with_min_ask_budget_ms(1_500);
         let fake = FakeBackend::new();
         let long = two_part_text();
         let req = request(vec![msg("user", &long)]);
@@ -1568,6 +1892,232 @@ mod tests {
             "{:?}",
             got
         );
+    }
+
+    /// An engine recording into `<dir>/gw` (see [`crate::journal`]), the raw
+    /// streams of the first `capture` turns captured.
+    fn journaled(tag: &str, capture: u32) -> (Engine, std::path::PathBuf) {
+        let (e, dir) = engine(tag);
+        let gw = dir.join("gw");
+        (
+            e.with_journal(Arc::new(Journal::new(gw.clone(), capture))),
+            gw,
+        )
+    }
+
+    fn records(gw: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(gw.join(crate::journal::UNPARSED_FILE))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn call_shaped_text_gets_one_repair_and_then_goes_as_it_is_and_is_recorded() {
+        let (mut e, gw) = journaled("call-shaped", 0);
+        let fake = FakeBackend::new();
+        let shaped = "Читаю:\n```json\n{\"tool\": \"read\", \"args\": {\"path\": \"a.txt\"}}\n```";
+        fake.push_reply(Ok((shaped.into(), Some(URL_A.into()))));
+        fake.push_reply(Ok((shaped.into(), Some(URL_A.into()))));
+        let req = with_tools(vec![msg("user", "прочитай a.txt")]);
+        let got = run(&mut e, &sid("ses_cs"), &req, &fake).unwrap();
+        let sent = fake.sent_texts();
+        assert_eq!(sent.len(), 2, "one repair request");
+        assert!(sent[1].contains("похоже на вызов"), "{}", sent[1]);
+        assert!(sent[1].contains("```tool_calls"), "{}", sent[1]);
+        // Nothing ran; the answer goes as it came, with no wrapper.
+        assert_eq!(got, Reply::Text(shaped.into()));
+        let recs = records(&gw);
+        assert_eq!(recs.len(), 1, "{:?}", recs);
+        assert_eq!(recs[0]["reason"], "repair_failed");
+        assert_eq!(recs[0]["session"], "ses_cs");
+        assert_eq!(recs[0]["text"], shaped);
+        assert_eq!(recs[0]["first_text"], shaped);
+        assert!(recs[0]["detail"].as_str().unwrap().contains("блок «json»"));
+
+        // A repair that gives a block gives the calls; nothing is recorded.
+        let (mut e, gw) = journaled("call-shaped-ok", 0);
+        let fake = FakeBackend::new();
+        fake.push_reply(Ok((shaped.into(), Some(URL_A.into()))));
+        fake.push_reply(Ok((calls_answer(&["a.txt"]), Some(URL_A.into()))));
+        let got = run(&mut e, &sid("ses_cs"), &req, &fake).unwrap();
+        assert!(
+            matches!(got, Reply::ToolCalls { ref calls, .. } if calls.len() == 1),
+            "{:?}",
+            got
+        );
+        assert!(records(&gw).is_empty());
+    }
+
+    #[test]
+    fn a_failed_repair_and_text_that_mentions_calls_are_recorded_redacted() {
+        let (mut e, gw) = journaled("journal-invalid", 0);
+        let fake = FakeBackend::new();
+        let bad = "```tool_calls\n[{\"name\": \"nope\", \"arguments\": {\"k\": \"AKIAIOSFODNN7EXAMPLE\"}}]\n```";
+        fake.push_reply(Ok((bad.into(), Some(URL_A.into()))));
+        fake.push_reply(Ok((bad.into(), Some(URL_A.into()))));
+        let req = with_tools(vec![msg("user", "сделай")]);
+        run(&mut e, &sid("ses_j"), &req, &fake).unwrap();
+        let recs = records(&gw);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["reason"], "repair_failed");
+        assert!(recs[0]["detail"].as_str().unwrap().contains("nope"));
+        let text = recs[0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("AKIA") && text.contains("«redacted:"),
+            "{}",
+            text
+        );
+        assert!(recs[0]["ask_id"].as_str().unwrap().starts_with("gw_ask_"));
+
+        // Final text that still talks in calls (an example in a longer
+        // fence) is recorded, and goes as it is.
+        let example =
+            "Формат такой:\n````markdown\n```tool_calls\n[{\"name\": \"read\", \"arguments\": {\"path\": \"a\"}}]\n```\n````";
+        fake.push_reply(Ok((example.into(), Some(URL_A.into()))));
+        let req2 = with_tools(vec![msg("user", "покажи формат")]);
+        let got = run(&mut e, &sid("ses_j2"), &req2, &fake).unwrap();
+        assert_eq!(got, Reply::Text(example.into()));
+        let recs = records(&gw);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[1]["reason"], "call_like_text");
+        // Plain text is not recorded.
+        fake.push_reply(Ok(("Готово.".into(), Some(URL_A.into()))));
+        run(
+            &mut e,
+            &sid("ses_j3"),
+            &with_tools(vec![msg("user", "ок")]),
+            &fake,
+        )
+        .unwrap();
+        assert_eq!(records(&gw).len(), 2);
+    }
+
+    #[test]
+    fn a_doubled_answer_runs_its_calls_once_and_is_recorded() {
+        let (mut e, gw) = journaled("journal-doubled", 0);
+        let fake = FakeBackend::new();
+        let one = "Читаю.\n```tool_calls id=\"call-1\"\n[{\"name\": \"read\", \"arguments\": {\"path\": \"a\"}}]\n```";
+        fake.push_reply(Ok((format!("{}\n{}", one, one), Some(URL_A.into()))));
+        let req = with_tools(vec![msg("user", "прочитай")]);
+        let got = run(&mut e, &sid("ses_d"), &req, &fake).unwrap();
+        assert!(
+            matches!(got, Reply::ToolCalls { ref calls, .. } if calls.len() == 1),
+            "{:?}",
+            got
+        );
+        assert_eq!(fake.sent_texts().len(), 1, "no repair");
+        assert_eq!(records(&gw)[0]["reason"], "doubled_answer");
+    }
+
+    #[test]
+    fn a_stream_page_mismatch_is_logged_and_recorded_and_the_text_is_kept() {
+        let (mut e, gw) = journaled("journal-mismatch", 0);
+        let fake = FakeBackend::new();
+        *fake.stream_check.lock().unwrap() = Some(cgpt_bridge_protocol::StreamCheck {
+            stream_chars: 6,
+            page_chars: 12,
+            mismatch: true,
+        });
+        fake.push_reply(Ok(("Готово".into(), Some(URL_A.into()))));
+        let req = with_tools(vec![msg("user", "сделай")]);
+        let got = run(&mut e, &sid("ses_m"), &req, &fake).unwrap();
+        assert_eq!(
+            got,
+            Reply::Text("Готово".into()),
+            "the bridge's text is used"
+        );
+        let recs = records(&gw);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["reason"], "stream_page_mismatch");
+        assert_eq!(recs[0]["text"], "Готово");
+        assert_eq!(recs[0]["stream_check"]["page_chars"], 12);
+        // A check without a mismatch is not recorded.
+        *fake.stream_check.lock().unwrap() = Some(cgpt_bridge_protocol::StreamCheck {
+            stream_chars: 6,
+            page_chars: 6,
+            mismatch: false,
+        });
+        fake.push_reply(Ok(("Готово".into(), Some(URL_A.into()))));
+        run(&mut e, &sid("ses_m2"), &req, &fake).unwrap();
+        assert_eq!(records(&gw).len(), 1);
+    }
+
+    #[test]
+    fn an_ask_that_never_reached_the_bridge_uses_up_no_capture() {
+        let (mut e, gw) = journaled("journal-capture-unreached", 1);
+        let fake = FakeBackend::new();
+        *fake.capture.lock().unwrap() = Some("data: [DONE]\n\n".into());
+        let req = with_tools(vec![msg("user", "сделай")]);
+        // No host to connect to: nothing sent.
+        fake.push_reply(Err(BackendError::NotConnected("no host".into())));
+        assert!(run(&mut e, &sid("ses_u"), &req, &fake).is_err());
+        // The next turn still has its capture.
+        fake.push_reply(Ok(("Готово".into(), Some(URL_A.into()))));
+        run(&mut e, &sid("ses_u"), &req, &fake).unwrap();
+        let ids = fake.ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(fake.capturing_ids.lock().unwrap().last(), ids.last());
+        let files = std::fs::read_dir(gw.join(crate::journal::CAPTURES_DIR))
+            .unwrap()
+            .count();
+        assert_eq!(files, 1);
+    }
+
+    #[test]
+    fn only_the_configured_number_of_turns_is_captured() {
+        let (mut e, gw) = journaled("journal-capture", 1);
+        let fake = FakeBackend::new();
+        *fake.capture.lock().unwrap() =
+            Some("data: {\"v\": \"AKIAIOSFODNN7EXAMPLE\"}\n\ndata: [DONE]\n\n".into());
+        let req = with_tools(vec![msg("user", "сделай")]);
+        let bad = "```tool_calls\n[{\"name\": \"nope\", \"arguments\": {}}]\n```";
+        // A turn that sends nothing (its client left) uses up no capture.
+        assert!(e
+            .handle(&sid("ses_gone"), &req, &*fake, 60_000, &|| true)
+            .is_err());
+        assert!(fake.ids.lock().unwrap().is_empty());
+        // The first turn, its repair included, is captured.
+        fake.push_reply(Ok((bad.into(), Some(URL_A.into()))));
+        fake.push_reply(Ok(("Готово".into(), Some(URL_A.into()))));
+        run(&mut e, &sid("ses_c"), &req, &fake).unwrap();
+        // The second is not.
+        fake.push_reply(Ok(("Готово".into(), Some(URL_A.into()))));
+        run(&mut e, &sid("ses_c2"), &req, &fake).unwrap();
+        let ids = fake.ids.lock().unwrap().clone();
+        assert_eq!(*fake.capturing_ids.lock().unwrap(), ids[..2].to_vec());
+        let mut files: Vec<String> = std::fs::read_dir(gw.join(crate::journal::CAPTURES_DIR))
+            .unwrap()
+            .flatten()
+            .map(|f| f.file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), 2, "{:?}", files);
+        assert!(files.iter().all(|f| f.ends_with(".sse")));
+        for id in &ids[..2] {
+            assert!(
+                files.iter().any(|f| f.contains(id.as_str())),
+                "{} in {:?}",
+                id,
+                files
+            );
+        }
+        let text =
+            std::fs::read_to_string(gw.join(crate::journal::CAPTURES_DIR).join(&files[0])).unwrap();
+        assert!(
+            !text.contains("AKIA") && text.contains("[DONE]"),
+            "{}",
+            text
+        );
+
+        // Without the setting nothing is asked for and nothing written.
+        let (mut e, gw) = journaled("journal-no-capture", 0);
+        let fake = FakeBackend::new();
+        fake.push_reply(Ok(("Готово".into(), Some(URL_A.into()))));
+        run(&mut e, &sid("ses_n"), &req, &fake).unwrap();
+        assert!(fake.capturing_ids.lock().unwrap().is_empty());
+        assert!(!gw.join(crate::journal::CAPTURES_DIR).exists());
     }
 
     #[test]
@@ -1708,7 +2258,7 @@ mod tests {
 
     #[test]
     fn a_failing_stop_after_a_timeout_is_ignored() {
-        let (mut e, dir) = engine("stop-fails");
+        let (e, dir) = engine("stop-fails");
         let fake = FakeBackend::new();
         fake.push_reply(Err(BackendError::Timeout));
         let backend = NoTabStop(fake.clone());
@@ -1729,16 +2279,24 @@ mod tests {
         let broken = "```tool_calls\n{не json\n```";
         fake.push_reply(Ok((broken.into(), Some(URL_A.into()))));
         fake.push_reply(Ok(("готово".into(), Some(URL_A.into()))));
-        let stopped = || false;
+        // Each part is announced to the HTTP side under its id before it goes.
+        let announced = RefCell::new(Vec::new());
+        let watch = Announced(&announced);
+        let cooldown = Cooldown::new(temp_dir("bridge-ids").join("cooldown.json"));
         let turn = Turn {
             backend: &*fake,
             deadline: turn_now() + Duration::from_secs(60),
-            stopped: &stopped,
+            watch: &watch,
+            lanes: None,
+            cooldown: &cooldown,
             project: Ok(None),
             min_ask_budget: Duration::ZERO,
             reached: Cell::new(false),
             answered: Cell::new(0),
             ask_id: RefCell::new(String::new()),
+            journal: None,
+            capture: Cell::new(None),
+            attachments: RefCell::new(Vec::new()),
         };
         let mut s = Session::new("ses_id");
         let tools = vec![read_tool()];
@@ -1751,6 +2309,180 @@ mod tests {
         assert_ne!(ids[0], ids[1]);
         // The line of a turn is about the ask that gave its answer.
         assert_eq!(*turn.ask_id.borrow(), ids[1]);
+        assert_eq!(*announced.borrow(), ids);
+    }
+
+    /// A watch that records the parts announced and never stops.
+    struct Announced<'a>(&'a RefCell<Vec<String>>);
+
+    impl TurnWatch for Announced<'_> {
+        fn stopped(&self) -> bool {
+            false
+        }
+        fn sending(&self, ask_id: &str) -> bool {
+            self.0.borrow_mut().push(ask_id.to_string());
+            true
+        }
+    }
+
+    #[test]
+    fn a_turn_stopped_as_its_part_is_announced_sends_nothing_and_keeps_the_session() {
+        struct StopAtSend;
+        impl TurnWatch for StopAtSend {
+            fn stopped(&self) -> bool {
+                false
+            }
+            fn sending(&self, _: &str) -> bool {
+                false
+            }
+        }
+        let (e, dir) = engine("stop-at-send");
+        let fake = FakeBackend::new();
+        let req = request(vec![msg("user", "привет")]);
+        let got = e.handle(&sid("ses_x"), &req, &*fake, 60_000, &StopAtSend);
+        assert!(got.is_err());
+        assert!(fake.sent_texts().is_empty(), "nothing was sent");
+        // Nothing reached ChatGPT: no note on the next delivery.
+        let s = Sessions::new(dir).load("ses_x").unwrap();
+        assert_eq!(s.state, SessionState::Idle);
+    }
+
+    #[test]
+    fn a_failed_ask_stops_the_tab_for_an_old_extension_and_itself_for_a_new_one() {
+        // No own tabs reported, nothing else running: the own tab is
+        // stopped, as always.
+        let (e, _dir) = engine("failed-stop-one");
+        let fake = FakeBackend::new();
+        fake.push_reply(Err(BackendError::Timeout));
+        let req = request(vec![msg("user", "привет")]);
+        e.handle(&sid("ses_1"), &req, &*fake, 60_000, &|| false)
+            .unwrap_err();
+        assert_eq!(fake.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(fake.stop_ask_ids().is_empty(), "a plain stop");
+
+        // An extension with own tabs: only the failed ask is stopped.
+        let dir = temp_dir("failed-stop-many");
+        let lanes = Arc::new(Lanes::new(3));
+        let e = engine_in(&dir, &[]).with_lanes(lanes.clone());
+        let fake = FakeBackend::new();
+        fake.set_own_tabs(Some(8));
+        fake.push_reply(Err(BackendError::Timeout));
+        e.handle(&sid("ses_2"), &req, &*fake, 60_000, &|| false)
+            .unwrap_err();
+        assert_eq!(lanes.limit(), 3, "the probe told the lanes");
+        let ids = fake.ids.lock().unwrap().clone();
+        assert_eq!(fake.stop_ask_ids(), ids);
+        assert_eq!(fake.stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_plain_stop_goes_only_for_an_old_extension_with_nothing_else_running() {
+        let plain = |fake: &FakeBackend| fake.plain_stops();
+        // (own tabs reported, other turns running, what stop_ask answers) →
+        // (plain stops, stop_asks, result).
+        let outdated = Some(BackendError::Outdated);
+        let unavailable = Some(BackendError::Unavailable("x".into()));
+        let cases = [
+            // An old or unknown extension alone: the tab, as at 8fe9055.
+            (None, 0, None, (1, 0, Ok(()))),
+            // An old one beside other turns: only this ask.
+            (None, 2, None, (0, 1, Ok(()))),
+            // A new one, alone or not: only this ask.
+            (Some(8), 0, None, (0, 1, Ok(()))),
+            (Some(8), 2, None, (0, 1, Ok(()))),
+            // A bridge without stop_ask: the tab only when alone.
+            (Some(8), 0, outdated.clone(), (1, 1, Ok(()))),
+            (
+                Some(8),
+                2,
+                outdated.clone(),
+                (0, 1, Err(BackendError::Outdated)),
+            ),
+            (None, 1, outdated, (0, 1, Err(BackendError::Outdated))),
+            // Any other failure is never answered by the plain stop.
+            (
+                Some(8),
+                0,
+                unavailable.clone(),
+                (0, 1, Err(BackendError::Unavailable("x".into()))),
+            ),
+            (
+                None,
+                2,
+                unavailable,
+                (0, 1, Err(BackendError::Unavailable("x".into()))),
+            ),
+            (
+                Some(1),
+                3,
+                Some(BackendError::Timeout),
+                (0, 1, Err(BackendError::Timeout)),
+            ),
+        ];
+        for (own_tabs, others, stop_ask, (plains, asks, result)) in cases {
+            let what = format!("{:?} {} {:?}", own_tabs, others, stop_ask);
+            let fake = FakeBackend::new();
+            fake.set_own_tabs(own_tabs);
+            fake.set_stop_ask_error(stop_ask);
+            assert_eq!(
+                stop_request(&*fake, Some("gw_ask_1"), others),
+                result,
+                "{what}"
+            );
+            assert_eq!(plain(&fake), plains, "{what}");
+            assert_eq!(fake.stop_ask_ids().len(), asks, "{what}");
+        }
+        // Nothing sent yet and not the plain case: nothing to stop.
+        let fake = FakeBackend::new();
+        fake.set_own_tabs(Some(8));
+        assert_eq!(stop_request(&*fake, None, 0), Ok(()));
+        assert_eq!(fake.stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_later_part_is_not_sent_during_a_pause_another_session_started() {
+        let (e, dir) = engine("pause-between-parts");
+        let fake = FakeBackend::new();
+        // While part 1 of B's turn is answered, A's turn hits the limit.
+        let cooldown = e.cooldown();
+        fake.set_responder(move |_, _| {
+            cooldown.record_hit(now_ms());
+            Ok(("ok".into(), Some(URL_A.into())))
+        });
+        let req = request(vec![msg("user", &two_part_text())]);
+        let got = e.handle(&sid("ses_b"), &req, &*fake, 60_000, &|| false);
+        assert!(
+            matches!(got, Err(BackendError::CoolingDown { .. })),
+            "{:?}",
+            got
+        );
+        assert_eq!(fake.sent_texts().len(), 1, "part 2 was not sent");
+        // Part 1 reached the chat: the session is interrupted, as after a 429.
+        assert_eq!(
+            Sessions::new(dir).load("ses_b").unwrap().state,
+            SessionState::Interrupted
+        );
+    }
+
+    #[test]
+    fn every_status_probe_sets_the_limit_from_the_own_tabs() {
+        let dir = temp_dir("probe-limit");
+        let lanes = Arc::new(Lanes::new(3));
+        let e = engine_in(&dir, &[]).with_lanes(lanes.clone());
+        let fake = FakeBackend::new();
+        let req = request(vec![msg("user", "привет")]);
+        let turn = |own_tabs: Option<u32>| {
+            fake.set_own_tabs(own_tabs);
+            fake.push_reply(Ok(("ok".into(), Some(URL_A.into()))));
+            e.handle(&sid("ses_l"), &req, &*fake, 60_000, &|| false)
+                .unwrap();
+            lanes.limit()
+        };
+        assert_eq!(lanes.limit(), 1, "before any probe");
+        assert_eq!(turn(None), 1, "an extension without own tabs");
+        assert_eq!(turn(Some(2)), 2);
+        assert_eq!(turn(Some(8)), 3, "max_parallel");
+        assert_eq!(turn(None), 1, "a later status without them");
     }
 
     #[test]
@@ -2311,10 +3043,11 @@ mod tests {
         fake.push_reply(Err(BackendError::Timeout));
         run(&mut e, &sid("ses_a"), &req, &fake).unwrap_err();
         fake.push_reply(Ok(("ок".into(), Some(URL_A.into()))));
-        run(&mut e, &sid("ses_a"), &req, &fake).unwrap();
+        let handled = e.run(&sid("ses_a"), &req, &*fake, 60_000, &|| false);
+        handled.result.unwrap();
         // The HTTP side stopped the turn after its answer arrived: the chat
         // has the whole delta, so nothing is resumed from the old cut.
-        e.interrupt_last_turn();
+        e.undo(handled.undo.expect("an answered turn can be undone"));
         let s = Sessions::new(dir).load("ses_a").unwrap();
         assert_eq!(s.state, SessionState::Interrupted);
         assert_eq!(s.cut, None);
@@ -2497,10 +3230,10 @@ mod tests {
 
     #[test]
     fn a_build_outside_the_build_id_alphabet_counts_as_none() {
-        let (mut e, _dir) = engine("builds-bad");
+        let (e, _dir) = engine("builds-bad");
         let long = "a".repeat(65);
         for bad in ["", "a b", "x\u{1b}[2J", "line\nbreak", long.as_str()] {
-            e.builds_seen = None;
+            *e.builds_seen.lock().unwrap() = None;
             let line = e
                 .note_builds(builds(Some(bad), Some(bad)))
                 .expect("first builds are logged");
@@ -2511,7 +3244,7 @@ mod tests {
             );
         }
         let ok = "a".repeat(64);
-        e.builds_seen = None;
+        *e.builds_seen.lock().unwrap() = None;
         assert_eq!(
             e.note_builds(builds(Some("v1.2_x-3"), Some(&ok))),
             Some(builds_line(BUILD, &builds(Some("v1.2_x-3"), Some(&ok))))
@@ -2526,14 +3259,14 @@ mod tests {
         // A backend that cannot tell: nothing to log.
         fake.push_reply(Ok(("ок".into(), Some(URL_A.into()))));
         run(&mut e, &sid("ses_b"), &req, &fake).unwrap();
-        assert_eq!(e.builds_seen, None);
+        assert_eq!(*e.builds_seen.lock().unwrap(), None);
 
         let first = builds(Some("h1"), Some("x1"));
         *fake.builds.lock().unwrap() = Some(first.clone());
         fake.push_reply(Ok(("ок".into(), Some(URL_A.into()))));
         run(&mut e, &sid("ses_b"), &req, &fake).unwrap();
         assert_eq!(
-            e.builds_seen,
+            *e.builds_seen.lock().unwrap(),
             Some(first.clone()),
             "the turn noted the builds"
         );
@@ -2647,7 +3380,7 @@ mod tests {
 
     #[test]
     fn stop_unknown_to_the_bridge_fails_the_turn_as_outdated() {
-        let (mut e, _dir) = engine("outdated-stop");
+        let (e, _dir) = engine("outdated-stop");
         let fake = FakeBackend::new();
         fake.push_reply(Err(BackendError::Timeout));
         let backend = OldHostStop(fake.clone());
@@ -2676,7 +3409,7 @@ mod tests {
 
     #[test]
     fn a_huge_timeout_does_not_panic() {
-        let (mut e, _dir) = engine("huge-timeout");
+        let (e, _dir) = engine("huge-timeout");
         let fake = FakeBackend::new();
         fake.push_reply(Ok(("ок".into(), Some(URL_A.into()))));
         let req = request(vec![msg("user", "привет")]);
@@ -2870,7 +3603,7 @@ mod tests {
 
     #[test]
     fn path_with_sk_inside_a_word_survives_the_system_prompt() {
-        let (mut e, _dir) = engine("desk");
+        let (e, _dir) = engine("desk");
         let fake = FakeBackend::new();
         let path = "/Users/me/dev/desk-booking-service-frontend/src/app.ts";
         let req = with_tools(vec![
@@ -3097,7 +3830,7 @@ mod tests {
 
     #[test]
     fn edit_of_a_code_line_with_secret_looking_words_is_not_refused() {
-        let (mut e, _dir) = engine("codeline");
+        let (e, _dir) = engine("codeline");
         let fake = FakeBackend::new();
         let code = "const token = req.headers.authorization;\nPASSWORD_MIN_LENGTH = 8\nlet cookie = parse(header);";
         let req = tools_request(
@@ -3361,5 +4094,253 @@ mod tests {
         assert_eq!(target, conversation(URL_A));
         assert!(text.contains("Правила и инструменты обновлены"), "{}", text);
         assert!(text.contains("### execute"), "{}", text);
+    }
+
+    /// Images from OpenCode (see `images`).
+    mod images_in_turns {
+        use super::*;
+        use crate::images::tests::{data_url, png_of, user_with_images, PNG};
+        use crate::images::{MAX_ASK_IMAGE_BYTES, OLD_EXTENSION_NOTE};
+        use cgpt_bridge_protocol::{AskRequest, BridgeRequest, MAX_FRAME_BYTES};
+
+        /// A bootstrapped session "ses_a" whose `read` result came back with
+        /// the image OpenCode puts in a user message of its own after it.
+        fn with_image_result(e: &mut Engine, fake: &Arc<FakeBackend>, image: &[u8]) -> ChatRequest {
+            let (mut history, reply) = bootstrapped(e, fake);
+            history.push(result(&reply, 0, "Image read successfully"));
+            history.push(user_with_images("", &[data_url("image/png", image)]));
+            with_tools(history)
+        }
+
+        #[test]
+        fn the_images_of_a_delta_go_as_files_with_its_message() {
+            let (mut e, dir) = engine("img-delta");
+            let fake = FakeBackend::new();
+            fake.set_attachments(true);
+            let req = with_image_result(&mut e, &fake, PNG);
+            fake.push_reply(Ok(("На снимке кнопка.".into(), Some(URL_A.into()))));
+            let reply = run(&mut e, &sid("ses_a"), &req, &fake).unwrap();
+            assert_eq!(reply, Reply::Text("На снимке кнопка.".into()));
+            let (text, target) = last_sent(&fake);
+            assert_eq!(target, conversation(URL_A));
+            assert!(text.contains("[изображение 1 во вложении]"), "{}", text);
+            let files = fake.sent_files();
+            assert_eq!(files.len(), 2);
+            assert!(files[0].is_empty(), "the bootstrap had no image");
+            assert_eq!(files[1].len(), 1);
+            assert_eq!(files[1][0].mime, "image/png");
+            assert_eq!(files[1][0].name, "image-1.png");
+            // The next turn does not send the image again.
+            let mut history = req.messages.clone();
+            history.push(assistant(&reply));
+            history.push(msg("user", "спасибо"));
+            fake.push_reply(Ok(("Пожалуйста.".into(), Some(URL_A.into()))));
+            run(&mut e, &sid("ses_a"), &with_tools(history), &fake).unwrap();
+            assert!(fake.sent_files()[2].is_empty());
+            assert!(!last_sent(&fake).0.contains("изображение"));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn a_repair_after_an_image_turn_carries_no_files() {
+            let (mut e, dir) = engine("img-repair");
+            let fake = FakeBackend::new();
+            fake.set_attachments(true);
+            let req = with_image_result(&mut e, &fake, PNG);
+            let shaped = "```json\n{\"tool\": \"read\", \"args\": {\"path\": \"a\"}}\n```";
+            fake.push_reply(Ok((shaped.into(), Some(URL_A.into()))));
+            fake.push_reply(Ok(("Готово.".into(), Some(URL_A.into()))));
+            run(&mut e, &sid("ses_a"), &req, &fake).unwrap();
+            let files = fake.sent_files();
+            // Bootstrap, the delta with its image, the repair without.
+            assert_eq!(files.len(), 3);
+            assert_eq!(files[1].len(), 1);
+            assert!(files[2].is_empty(), "the repair sends no files");
+            assert!(last_sent(&fake).0.contains("Не получилось разобрать"));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn a_capture_turn_sends_its_last_part_with_the_files_through_ask_capturing() {
+            // Two capture turns: the bootstrap and the turn with the image.
+            let (mut e, _gw) = journaled("img-capture", 2);
+            let fake = FakeBackend::new();
+            fake.set_attachments(true);
+            let req = with_image_result(&mut e, &fake, PNG);
+            fake.push_reply(Ok(("На снимке кнопка.".into(), Some(URL_A.into()))));
+            run(&mut e, &sid("ses_a"), &req, &fake).unwrap();
+            let ids = fake.ids.lock().unwrap().clone();
+            assert_eq!(*fake.capturing_ids.lock().unwrap(), ids);
+            let files = fake.sent_files();
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[1].len(), 1, "the image went with the captured ask");
+        }
+
+        #[test]
+        fn an_extension_that_takes_no_files_gets_a_note_instead() {
+            let (mut e, dir) = engine("img-old");
+            let fake = FakeBackend::new();
+            let req = with_image_result(&mut e, &fake, PNG);
+            fake.push_reply(Ok(("Не вижу изображения.".into(), Some(URL_A.into()))));
+            run(&mut e, &sid("ses_a"), &req, &fake).unwrap();
+            assert!(last_sent(&fake).0.contains(OLD_EXTENSION_NOTE));
+            assert!(fake.sent_files().iter().all(Vec::is_empty));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn a_single_image_over_the_limit_is_a_note_and_the_turn_goes() {
+            let (mut e, dir) = engine("img-big");
+            let fake = FakeBackend::new();
+            fake.set_attachments(true);
+            let req = with_image_result(&mut e, &fake, &png_of(2_200_000));
+            fake.push_reply(Ok(("Изображение не дошло.".into(), Some(URL_A.into()))));
+            run(&mut e, &sid("ses_a"), &req, &fake).unwrap();
+            let (text, target) = last_sent(&fake);
+            assert_eq!(target, conversation(URL_A));
+            assert!(
+                text.contains("[изображение не отправлено: 2,1 МБ, предел 700 КБ на сообщение]"),
+                "{}",
+                text
+            );
+            assert!(fake.sent_files()[1].is_empty());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn two_tool_images_over_the_total_send_one_and_the_session_goes_on() {
+            let (mut e, dir) = engine("img-two");
+            let fake = FakeBackend::new();
+            fake.set_attachments(true);
+            let (mut history, reply) = bootstrapped(&mut e, &fake);
+            history.push(result(&reply, 0, "Image read successfully"));
+            let half = png_of(MAX_ASK_IMAGE_BYTES / 2 + 1);
+            history.push(user_with_images(
+                "",
+                &[data_url("image/png", &half), data_url("image/png", &half)],
+            ));
+            fake.push_reply(Ok(("Вижу один снимок.".into(), Some(URL_A.into()))));
+            let second = run(&mut e, &sid("ses_a"), &with_tools(history.clone()), &fake).unwrap();
+            let (text, _) = last_sent(&fake);
+            assert!(text.contains("вместе с более новыми больше предела 700 КБ"), "{}", text);
+            assert!(text.contains("[изображение 1 во вложении]"), "{}", text);
+            assert_eq!(fake.sent_files()[1].len(), 1);
+            // The next turn goes on in the same chat and sends no image again.
+            history.push(assistant(&second));
+            history.push(msg("user", "дальше"));
+            fake.push_reply(Ok(("Хорошо.".into(), Some(URL_A.into()))));
+            run(&mut e, &sid("ses_a"), &with_tools(history), &fake).unwrap();
+            let (text, target) = last_sent(&fake);
+            assert_eq!(target, conversation(URL_A));
+            assert!(!text.contains("изображение"), "{}", text);
+            assert!(fake.sent_files()[2].is_empty());
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        /// The upload failed in the page (`attachment_upload_failed`, a
+        /// `dom_failure` on the wire): the next request of the session sends
+        /// the delta again, image included.
+        #[test]
+        fn after_an_upload_failure_the_next_turn_sends_the_image_again() {
+            let (mut e, dir) = engine("img-fail-1");
+            let fake = FakeBackend::new();
+            fake.set_attachments(true);
+            let req = with_image_result(&mut e, &fake, PNG);
+            fake.push_reply(Err(BackendError::Dom(
+                "attachment_upload_failed: the prompt was not sent.".into(),
+            )));
+            assert!(matches!(
+                run(&mut e, &sid("ses_a"), &req, &fake),
+                Err(BackendError::Dom(_))
+            ));
+            fake.push_reply(Ok(("Вижу снимок.".into(), Some(URL_A.into()))));
+            run(&mut e, &sid("ses_a"), &req, &fake).unwrap();
+            let (text, target) = last_sent(&fake);
+            assert_eq!(target, conversation(URL_A));
+            assert!(text.starts_with(prompt::INTERRUPTED_NOTE), "{}", text);
+            assert!(text.contains("[изображение 1 во вложении]"), "{}", text);
+            let files = fake.sent_files();
+            assert_eq!(files.len(), 3);
+            assert_eq!(files[1].len(), 1);
+            assert_eq!(files[2].len(), 1);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        /// The same in a delta of two parts: the first was answered, the
+        /// second (with the files) failed; the next turn sends the rest, the
+        /// files again with its last part.
+        #[test]
+        fn after_an_upload_failure_on_the_last_part_the_rest_goes_with_the_image() {
+            let (mut e, dir) = engine("img-fail-2");
+            let fake = FakeBackend::new();
+            fake.set_attachments(true);
+            let (mut history, reply) = bootstrapped(&mut e, &fake);
+            history.push(result(&reply, 0, &"строка файла\n".repeat(200_000 / 13)));
+            history.push(user_with_images("", &[data_url("image/png", PNG)]));
+            let req = with_tools(history);
+            fake.push_reply(Ok(("ok".into(), Some(URL_A.into()))));
+            fake.push_reply(Err(BackendError::Dom(
+                "attachment_upload_failed: the prompt was not sent.".into(),
+            )));
+            assert!(matches!(
+                run(&mut e, &sid("ses_a"), &req, &fake),
+                Err(BackendError::Dom(_))
+            ));
+            let files = fake.sent_files();
+            assert_eq!(files.len(), 3, "the bootstrap and two parts");
+            assert!(files[1].is_empty());
+            assert_eq!(files[2].len(), 1, "the files go with the last part");
+            fake.set_responder(|_, _| Ok(("Вижу снимок.".into(), Some(URL_A.into()))));
+            run(&mut e, &sid("ses_a"), &req, &fake).unwrap();
+            let sent = fake.sent_texts();
+            let rest = &sent[3..];
+            assert!(
+                rest[0].contains("Продолжение сообщения выше"),
+                "{}",
+                rest[0].chars().take(200).collect::<String>()
+            );
+            assert!(rest.last().unwrap().contains("[изображение 1 во вложении]"));
+            let files = fake.sent_files();
+            assert_eq!(files.last().unwrap().len(), 1);
+            assert!(files[3..files.len() - 1].iter().all(Vec::is_empty));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn every_ask_of_a_long_message_with_images_fits_one_bridge_frame() {
+            let (mut e, dir) = engine("img-frame");
+            let fake = FakeBackend::new();
+            fake.set_attachments(true);
+            fake.set_responder(|_, _| Ok(("готово".into(), Some(URL_A.into()))));
+            let long = "строка с \"кавычками\"\n".repeat(140_000 / 21);
+            let first = vec![
+                msg("system", "sys"),
+                user_with_images(
+                    &long,
+                    &[data_url("image/png", &png_of(MAX_ASK_IMAGE_BYTES))],
+                ),
+            ];
+            run(&mut e, &sid("ses_f"), &with_tools(first), &fake).unwrap();
+            let sent = fake.sent.lock().unwrap().clone();
+            let files = fake.sent_files();
+            assert!(sent.len() >= 2, "{}", sent.len());
+            assert_eq!(files.last().unwrap().len(), 1, "the files go with the last part");
+            assert!(files[..files.len() - 1].iter().all(Vec::is_empty));
+            for ((text, target), attachments) in sent.into_iter().zip(files) {
+                let frame = serde_json::to_vec(&BridgeRequest::Ask(AskRequest {
+                    id: new_ask_id(),
+                    text,
+                    timeout_ms: 600_000,
+                    target: Some(target),
+                    project: Some("п".repeat(100)),
+                    // A capture turn adds the flag: the frame holds it too.
+                    capture_stream: true,
+                    attachments,
+                }))
+                .unwrap();
+                assert!(frame.len() <= MAX_FRAME_BYTES as usize, "{}", frame.len());
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

@@ -40,6 +40,7 @@ OC_DIR="$HOME/.config/opencode"
 OC="$OC_DIR/opencode.json"
 OC_AGENTS="$OC_DIR/agents"
 OC_AGENT="$OC_AGENTS/cgpt.md"
+OC_SUB="$OC_AGENTS/cgpt-sub.md"
 
 FAILS=0
 ok()   { echo "ok   - $*"; }
@@ -142,12 +143,53 @@ eq "opencode.json (holds the token) is owner-only" "$(stat -f '%Lp' "$OC")" "600
 eq "opencode.json.bak is owner-only" "$(stat -f '%Lp' "$OC.bak")" "600"
 check "installer says opencode.json was made owner-only" grep -q "holds the gateway token: mode set to 600" <<<"$OUT"
 
+# Rules match last to first, so where it matters the order is checked:
+# opencode_* is denied before the two MCP resource readers ask again, and
+# in read: the .env rules (both cases) come after "*": allow, with
+# .env.example allowed last. grep asks: it is checked against the search
+# pattern, not the path, so an allowed grep could print a .env file.
+agent_rule_order() { # agent_rule_order <name> <file>
+  eq "$1: opencode_* denied, then the MCP resource readers ask" \
+    "$(grep -xF -e '  "opencode_*": deny' -e '  opencode_list_mcp_resources: ask' \
+         -e '  opencode_read_mcp_resource: ask' "$2" | tr '\n' '|')" \
+    '  "opencode_*": deny|  opencode_list_mcp_resources: ask|  opencode_read_mcp_resource: ask|'
+  eq "$1: read allowed, .env and .ENV ask, .env.example allowed last" \
+    "$(grep -A6 -x '  read:' "$2" | tr '\n' '|')" \
+    '  read:|    "*": allow|    "*.env": ask|    "*.env.*": ask|    "*.ENV": ask|    "*.ENV.*": ask|    "*.env.example": allow|'
+  check "$1: grep asks" grep -qxF "  grep: ask" "$2"
+}
+
 check "agent cgpt created" test -f "$OC_AGENT"
 check "agent file is the bundled template" cmp -s "$OC_AGENT" "$BUNDLE/opencode-agent-cgpt.md"
 for line in "model: cgpt/chatgpt-web" "mode: primary" "  bash: ask" "  edit: ask" "  webfetch: ask" \
-            "  task: deny" "  question: allow"; do
+            "  skill: ask" "  execute: deny" '  "opencode_*": deny' "  task:" "  subagent:" "  question: allow"; do
   check "agent file has '$line'" grep -qxF "$line" "$OC_AGENT"
 done
+# Everything not named below asks (MCP tools have no common name): the
+# catch-all must be the first rule, since rules match last to first.
+eq "agent cgpt asks for everything by default (first rule)" \
+  "$(grep -A1 -x 'permission:' "$OC_AGENT" | tr '\n' '|')" 'permission:|  "*": ask|'
+# task (OpenCode before 2.1) and subagent (2.1 and later): deny all, then
+# allow cgpt-sub. Rules match last to first, so the order matters.
+eq "agent cgpt may start only cgpt-sub, under both permission names" \
+  "$(grep -A2 -E '^  (task|subagent):$' "$OC_AGENT" | grep -v '^--$' | tr '\n' '|')" \
+  '  task:|    "*": deny|    cgpt-sub: allow|  subagent:|    "*": deny|    cgpt-sub: allow|'
+agent_rule_order "agent cgpt" "$OC_AGENT"
+check "subagent cgpt-sub created" test -f "$OC_SUB"
+check "subagent file is the bundled template" cmp -s "$OC_SUB" "$BUNDLE/opencode-agent-cgpt-sub.md"
+for line in "model: cgpt/chatgpt-web" "mode: subagent" "  bash: ask" "  shell: ask" "  edit: ask" \
+            "  webfetch: ask" "  skill: ask" "  execute: deny" '  "opencode_*": deny' "  task: deny" "  subagent: deny"; do
+  check "subagent file has '$line'" grep -qxF "$line" "$OC_SUB"
+done
+eq "subagent cgpt-sub asks for everything by default (first rule)" \
+  "$(grep -A1 -x 'permission:' "$OC_SUB" | tr '\n' '|')" 'permission:|  "*": ask|'
+agent_rule_order "subagent cgpt-sub" "$OC_SUB"
+check "the subagent description is plain YAML and carries our mark" \
+  grep -Eq '^description: ChatGPT Web \(bridge\)[^:]+$' "$OC_SUB"
+check "subagent file has LF line ends only" test -z "$(tr -cd '\r' < "$OC_SUB")"
+eq "subagent file has ordinary permissions" "$(stat -f '%Lp' "$OC_SUB")" "644"
+check "installer says the subagent was added" grep -q "agent cgpt-sub: added" <<<"$OUT"
+check "installer tells that cgpt may start only cgpt-sub" grep -q "it may start only cgpt-sub" <<<"$OUT"
 check "the agent description is plain YAML (no ': ' in the value)" \
   grep -Eq '^description: [^:]+$' "$OC_AGENT"
 check "agent file has LF line ends only" test -z "$(tr -cd '\r' < "$OC_AGENT")"
@@ -175,7 +217,7 @@ check "a re-run says so" grep -q "mode set to 600" <<<"$OUT"
 
 echo "a note of the user" > "$APP/notes.txt"
 OUT="$(uninstall 2>&1)" || { echo "$OUT" >&2; fail "uninstall.sh exits 0"; }
-for f in bin extension uninstall.sh gateway.log opencode-agent-cgpt.md; do
+for f in bin extension uninstall.sh gateway.log opencode-agent-cgpt.md opencode-agent-cgpt-sub.md; do
   check "uninstall removes $f" test ! -e "$APP/$f"
 done
 check "uninstall keeps a foreign file in the install dir" test -f "$APP/notes.txt"
@@ -191,6 +233,7 @@ eq "uninstall keeps the other provider" "$(get_json "$OC" provider.anthropic)" \
   "$(get_json "$WORK/opencode.original.json" provider.anthropic)"
 eq "uninstall keeps UTF-8" "$(get "$OC" instructions.0)" "Отвечай по-русски 🙂"
 check "uninstall removes agent cgpt" test ! -e "$OC_AGENT"
+check "uninstall removes subagent cgpt-sub" test ! -e "$OC_SUB"
 check "uninstall removes the agents folder it left empty" test ! -e "$OC_AGENTS"
 rm -f "$APP/notes.txt"; rmdir "$APP"
 
@@ -260,7 +303,8 @@ rm -f "$OC" "$OC_DIR/cycle-b.json"
 # ---------------------------------------------------------------------------
 echo "# G: OpenCode agent cgpt next to the user's own agents"
 # ---------------------------------------------------------------------------
-agent_line() { grep -A1 '==> OpenCode agent cgpt' <<<"$1" | tail -n 1; }
+agent_line() { grep -A1 '==> OpenCode agent cgpt:' <<<"$1" | tail -n 1; }
+sub_line() { grep -A1 '==> OpenCode agent cgpt-sub:' <<<"$1" | tail -n 1; }
 rm -rf "$OC_DIR"
 mkdir -p "$OC_AGENTS"
 printf -- '---\ndescription: my own agent\nmode: primary\n---\nBe brief.\n' > "$OC_AGENTS/mine.md"
@@ -290,7 +334,7 @@ check "install says the agent was updated and where the copy is" \
 # stays in cgpt.md.bak. The unedited older template is replaced without a
 # .bak, so it never overwrites the saved edit.
 cp -R "$BUNDLE" "$WORK/bundle-v2"
-sed -i '' 's/edits and web fetches$/edits and web fetches (v2)/' "$WORK/bundle-v2/opencode-agent-cgpt.md"
+sed -i '' 's/MCP tools and skills$/MCP tools and skills (v2)/' "$WORK/bundle-v2/opencode-agent-cgpt.md"
 if cmp -s "$WORK/bundle-v2/opencode-agent-cgpt.md" "$BUNDLE/opencode-agent-cgpt.md"; then
   fail "the v2 template differs from v1"; else ok "the v2 template differs from v1"; fi
 RC=0; OUT="$("$WORK/bundle-v2/install.sh" --no-launchctl 2>&1)" || RC=$?
@@ -338,8 +382,10 @@ chmod 755 "$OC_AGENTS"
 check "uninstall reports the failed .bak with a non-zero status" test "$RC" -ne 0
 check "uninstall warns that the agent was left" grep -q "agent cgpt left in place" <<<"$OUT"
 check "uninstall keeps the edited agent it could not back up" cmp -s "$OC_AGENT" "$WORK/agent.ro.md"
+check "uninstall warns that the subagent it could not remove was left" \
+  grep -q "could not remove $OC_SUB: agent cgpt-sub left in place" <<<"$OUT"
 check "uninstall goes on after the failed .bak" test ! -e "$APP/bin"
-rm -f "$OC_AGENT"
+rm -f "$OC_AGENT" "$OC_SUB"
 # Without the installed template copy (an install from before it existed)
 # the file is kept as .bak to be safe, and the message says so.
 install >/dev/null 2>&1 || fail "install.sh exits 0"
@@ -368,6 +414,35 @@ for foreign in 'description: my own cgpt\nmodel: openai/gpt-5' \
   eq "uninstall keeps default_agent cgpt while a foreign agent cgpt stays" "$(get "$OC" default_agent)" "cgpt"
 done
 rm -f "$OC_AGENT"
+
+# A cgpt-sub the user wrote is not ours: left alone by install and uninstall,
+# and install warns, since agent cgpt may start it.
+mkdir -p "$OC_AGENTS"
+printf -- '---\ndescription: my own helper\nmode: subagent\n---\nBe brief.\n' > "$OC_SUB"
+cp "$OC_SUB" "$WORK/foreign-sub.md"
+RC=0; OUT="$(install 2>&1)" || RC=$?
+eq "install.sh next to a foreign cgpt-sub exits 0" "$RC" "0"
+check "install does not overwrite a foreign cgpt-sub" cmp -s "$OC_SUB" "$WORK/foreign-sub.md"
+check "install says the subagent was not added" grep -q "not added" <<<"$(sub_line "$OUT")"
+check "install warns that cgpt may start the foreign cgpt-sub" \
+  grep -q "agent cgpt may start cgpt-sub, which is not ours" <<<"$OUT"
+check "agent cgpt is still added" cmp -s "$OC_AGENT" "$BUNDLE/opencode-agent-cgpt.md"
+uninstall >/dev/null 2>&1 || fail "uninstall.sh exits 0"
+check "uninstall keeps a foreign cgpt-sub" cmp -s "$OC_SUB" "$WORK/foreign-sub.md"
+check "uninstall removes agent cgpt next to a foreign cgpt-sub" test ! -e "$OC_AGENT"
+rm -f "$OC_SUB"
+# An edited cgpt-sub of ours is replaced and kept as cgpt-sub.md.bak.
+install >/dev/null 2>&1 || fail "install.sh exits 0"
+sed -i '' 's/  shell: ask/  shell: allow/' "$OC_SUB"
+cp "$OC_SUB" "$WORK/sub.edited.md"
+OUT="$(install 2>&1)" || fail "install.sh over an edited cgpt-sub exits 0"
+check "an edited cgpt-sub of ours is replaced" cmp -s "$OC_SUB" "$BUNDLE/opencode-agent-cgpt-sub.md"
+check "the edited cgpt-sub is kept as cgpt-sub.md.bak" cmp -s "$OC_SUB.bak" "$WORK/sub.edited.md"
+check "install says where the edited cgpt-sub went" \
+  grep -q "agent cgpt-sub: updated (previous saved as cgpt-sub.md.bak)" <<<"$(sub_line "$OUT")"
+uninstall >/dev/null 2>&1 || fail "uninstall.sh exits 0"
+check "uninstall removes an unedited cgpt-sub" test ! -e "$OC_SUB"
+rm -f "$OC_SUB.bak"
 
 # default_agent cgpt (the user made our agent the default) would point at
 # nothing once the agent is gone: uninstall drops it, like a cgpt/ model.
@@ -417,6 +492,7 @@ check "agent cgpt is written into the linked agents folder" \
   cmp -s "$WORK/dot-agents/cgpt.md" "$BUNDLE/opencode-agent-cgpt.md"
 uninstall >/dev/null 2>&1 || fail "uninstall.sh exits 0"
 check "uninstall removes agent cgpt from the linked folder" test ! -e "$WORK/dot-agents/cgpt.md"
+check "uninstall removes subagent cgpt-sub from the linked folder" test ! -e "$WORK/dot-agents/cgpt-sub.md"
 check "uninstall keeps the agents link" test -L "$OC_AGENTS"
 rm -rf "$OC_DIR"
 

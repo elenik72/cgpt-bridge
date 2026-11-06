@@ -21,11 +21,29 @@ before(async () => {
 
 test("startup.a_browser_start_is_noted_in_the_gateway_windows_record", async () => {
   resetWorld();
-  world.local.ownWindowMark = { token: "t-1", windowId: 5, tabId: 7 };
+  world.local.ownWindowMark = { token: "t-1", windowId: 5, tabIds: [7, 8] };
   assert.equal(world.onStartup.length, 1, "background.ts listens to onStartup");
   world.onStartup[0]!();
   for (let i = 0; i < 10; i++) await settle();
-  assert.deepEqual(world.local.ownWindowMark, { token: "t-1", windowId: 5, tabId: 7, browserStarted: true });
+  assert.deepEqual(world.local.ownWindowMark, {
+    token: "t-1",
+    windowId: 5,
+    tabIds: [7, 8],
+    browserStarted: true,
+  });
+});
+
+test("startup.a_single_tab_record_of_an_earlier_version_is_noted_as_a_pool_of_one", async () => {
+  resetWorld();
+  world.local.ownWindowMark = { token: "t-1", windowId: 5, tabId: 7 };
+  world.onStartup[0]!();
+  for (let i = 0; i < 10; i++) await settle();
+  assert.deepEqual(world.local.ownWindowMark, {
+    token: "t-1",
+    windowId: 5,
+    tabIds: [7],
+    browserStarted: true,
+  });
 });
 
 test("startup.without_a_gateway_window_nothing_is_written", async () => {

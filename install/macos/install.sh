@@ -13,10 +13,13 @@
 #      (~/.config/opencode/opencode.json; the previous file is kept as .bak)
 #      and makes it owner-only (600): it holds the gateway token
 #   5. adds the OpenCode agent "cgpt" (~/.config/opencode/agents/cgpt.md): it
-#      uses cgpt/chatgpt-web and asks before every command, file edit and web
-#      fetch. It is not made the default agent; an agents/cgpt.md the user
-#      wrote is left alone, an edited copy of ours is kept as cgpt.md.bak. A
-#      failure here only skips the agent
+#      uses cgpt/chatgpt-web and asks before every command, file edit, web
+#      access, MCP tool and skill, and of all subagents may start only
+#      "cgpt-sub"
+#      (agents/cgpt-sub.md, added too), which asks the same way. cgpt is not
+#      made the default agent; an agent file the user wrote is left alone, an
+#      edited copy of ours is kept as <name>.md.bak. A failure here only skips
+#      that agent
 #   6. installs the LaunchAgent ~/Library/LaunchAgents/com.cgpt-bridge.gateway.plist,
 #      (re)starts the gateway and checks that it answers
 #
@@ -29,8 +32,8 @@
 #
 #   --no-launchctl  write the LaunchAgent file but do not stop or start it
 #                   (CI and tests, where there is no login session)
-#   --no-agent      do not add the OpenCode agent cgpt (one added by an
-#                   earlier run stays as it is)
+#   --no-agent      do not add the OpenCode agents cgpt and cgpt-sub (ones
+#                   added by an earlier run stay as they are)
 #
 # Exit status 1 when the gateway does not answer after the start.
 
@@ -57,10 +60,10 @@ APP="$HOME/Library/Application Support/cgpt-bridge"
 NM_DIR="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 OC="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
-AGENT="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/agents/cgpt.md"
+AGENTS="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/agents"
 
 for f in bin/cgpt bin/cgpt-bridge-host bin/cgpt-gateway extension/manifest.json \
-         uninstall.sh "$LABEL.plist" opencode-agent-cgpt.md; do
+         uninstall.sh "$LABEL.plist" opencode-agent-cgpt.md opencode-agent-cgpt-sub.md; do
   if [[ ! -e "$SRC/$f" ]]; then
     echo "error: $SRC/$f not found — run install.sh from the unpacked release bundle" >&2
     exit 1
@@ -106,17 +109,18 @@ is_our_agent() {
     grep -q '^description: ChatGPT Web (bridge)' "$1"
 }
 
-# Put the bundled agent at $AGENT_FILE through a temp file and a rename;
-# with <backup> = true the file there is kept as cgpt.md.bak first. Returns 1
-# on any failure (errexit is off inside an `if`), with the temp file removed.
+# Put <template> at <file> (the agent path <agent> with symlinks followed)
+# through a temp file and a rename; with <backup> = true the file there is
+# kept as <agent>.bak first. Returns 1 on any failure (errexit is off inside
+# an `if`), with the temp file removed.
 write_agent() {
-  local backup="$1"
-  AGENT_TMP="$AGENT_FILE.tmp.$$"
-  if mkdir -p "$(dirname "$AGENT_FILE")" &&
-     cp "$SRC/opencode-agent-cgpt.md" "$AGENT_TMP" &&
+  local template="$1" file="$2" agent="$3" backup="$4"
+  AGENT_TMP="$file.tmp.$$"
+  if mkdir -p "$(dirname "$file")" &&
+     cp "$template" "$AGENT_TMP" &&
      chmod 644 "$AGENT_TMP" &&
-     { [[ "$backup" != true ]] || { rm -f "$AGENT.bak" && cp "$AGENT_FILE" "$AGENT.bak"; }; } &&
-     mv -f "$AGENT_TMP" "$AGENT_FILE"; then
+     { [[ "$backup" != true ]] || { rm -f "$agent.bak" && cp "$file" "$agent.bak"; }; } &&
+     mv -f "$AGENT_TMP" "$file"; then
     AGENT_TMP=""
     return 0
   fi
@@ -292,55 +296,75 @@ fi
 [[ -f "$OC.bak" ]] && chmod 600 "$OC.bak"
 
 # ---------------------------------------------------------------------------
-# 5. OpenCode agent cgpt: the bundled file, as is. An agents/cgpt.md is ours
+# 5. OpenCode agents cgpt and cgpt-sub: the bundled files, as they are. cgpt
+#    may start no subagent but cgpt-sub (OpenCode's own subagents, such as
+#    general, run every command without asking). An agents/<name>.md is ours
 #    when it names the model cgpt/chatgpt-web and its description starts with
 #    "ChatGPT Web (bridge)" (uninstall.sh uses the same marks); one the user
-#    wrote is not replaced. The install folder keeps a copy of the template the
-#    agent was written from: a file equal to it is unedited and is replaced
-#    as is; any other file of ours is an edit and is kept as cgpt.md.bak
-#    first (also when there is no such copy). So an unedited older template
-#    never overwrites a saved edit. Nothing else in OpenCode is switched:
-#    default_agent stays as it is, the user picks the agent with Tab. The
-#    agent is optional: when it cannot be written the install goes on.
+#    wrote is not replaced. The install folder keeps a copy of the template
+#    each agent was written from: a file equal to it is unedited and is
+#    replaced as is; any other file of ours is an edit and is kept as
+#    <name>.md.bak first (also when there is no such copy). So an unedited
+#    older template never overwrites a saved edit. Nothing else in OpenCode
+#    is switched: default_agent stays as it is, the user picks the agent with
+#    Tab. The agents are optional: when one cannot be written the install
+#    goes on.
 # ---------------------------------------------------------------------------
-AGENT_INSTALLED="$APP/opencode-agent-cgpt.md"
-echo "==> OpenCode agent cgpt: $AGENT"
-AGENT_READY=false
-if [[ "$NO_AGENT" == true ]]; then
-  echo "    not added (--no-agent)"
-  # An agent of an earlier run stays, and stays usable.
-  if [[ -f "$AGENT" ]] && is_our_agent "$AGENT"; then AGENT_READY=true; fi
-elif ! AGENT_FILE="$(resolve_link "$AGENT" 2>/dev/null)"; then
-  echo "    not added: $AGENT is a symlink loop"
-elif [[ -d "$AGENT_FILE" ]]; then
-  echo "    not added: $AGENT is a folder; left as it is"
-elif [[ -f "$AGENT_FILE" ]] && ! is_our_agent "$AGENT_FILE"; then
-  echo "    not added: $AGENT is not ours (another agent named cgpt); left as it is"
-elif cmp -s "$SRC/opencode-agent-cgpt.md" "$AGENT_FILE"; then
-  echo "    agent cgpt: unchanged"
-  AGENT_READY=true
-else
-  BACKUP=false
-  if [[ ! -f "$AGENT_FILE" ]]; then
-    RESULT="added"
-  elif cmp -s "$AGENT_INSTALLED" "$AGENT_FILE"; then
-    RESULT="updated"
-  else
-    RESULT="updated (previous saved as cgpt.md.bak)"
-    BACKUP=true
+# install_agent <name>: sets AGENT_OK=true when agents/<name>.md is ours after
+# the step (written now, unchanged, or left from an earlier run).
+install_agent() {
+  local name="$1"
+  local agent="$AGENTS/$name.md"
+  local template="$SRC/opencode-agent-$name.md"
+  local installed="$APP/opencode-agent-$name.md"
+  local file result backup
+  AGENT_OK=false
+  echo "==> OpenCode agent $name: $agent"
+  if [[ "$NO_AGENT" == true ]]; then
+    echo "    not added (--no-agent)"
+    # An agent of an earlier run stays, and stays usable.
+    if [[ -f "$agent" ]] && is_our_agent "$agent"; then AGENT_OK=true; fi
+    return 0
   fi
-  if write_agent "$BACKUP"; then
-    echo "    agent cgpt: $RESULT"
-    AGENT_READY=true
+  if ! file="$(resolve_link "$agent" 2>/dev/null)"; then
+    echo "    not added: $agent is a symlink loop"
+  elif [[ -d "$file" ]]; then
+    echo "    not added: $agent is a folder; left as it is"
+  elif [[ -f "$file" ]] && ! is_our_agent "$file"; then
+    echo "    not added: $agent is not ours (another agent named $name); left as it is"
+  elif cmp -s "$template" "$file"; then
+    echo "    agent $name: unchanged"
+    AGENT_OK=true
   else
-    echo "warning: could not write $AGENT (see above): agent cgpt not added; the rest of the install goes on" >&2
+    backup=false
+    if [[ ! -f "$file" ]]; then
+      result="added"
+    elif cmp -s "$installed" "$file"; then
+      result="updated"
+    else
+      result="updated (previous saved as $name.md.bak)"
+      backup=true
+    fi
+    if write_agent "$template" "$file" "$agent" "$backup"; then
+      echo "    agent $name: $result"
+      AGENT_OK=true
+    else
+      echo "warning: could not write $agent (see above): agent $name not added; the rest of the install goes on" >&2
+    fi
   fi
+  # The template the agent file now comes from, for the next run and for
+  # uninstall.sh. Left as it is when the agent was not (re)written.
+  if [[ "$AGENT_OK" == true ]]; then
+    cp "$template" "$installed" 2>/dev/null || true
+  fi
+}
+install_agent cgpt-sub
+# A cgpt-sub the user wrote has its own permissions, and cgpt may start it.
+if [[ "$AGENT_OK" != true && "$NO_AGENT" == false && -e "$AGENTS/cgpt-sub.md" ]]; then
+  echo "warning: agent cgpt may start cgpt-sub, which is not ours: it runs with its own permissions ($AGENTS/cgpt-sub.md)" >&2
 fi
-# The template the agent file now comes from, for the next run and for
-# uninstall.sh. Left as it is when the agent was not (re)written.
-if [[ "$AGENT_READY" == true && "$NO_AGENT" == false ]]; then
-  cp "$SRC/opencode-agent-cgpt.md" "$AGENT_INSTALLED" 2>/dev/null || true
-fi
+install_agent cgpt
+AGENT_READY="$AGENT_OK"
 
 # ---------------------------------------------------------------------------
 # 6. LaunchAgent file, prepared next to its target.
@@ -412,8 +436,10 @@ if [[ "$AGENT_READY" == true ]]; then
   cat <<EOM
   3. In OpenCode press Tab to switch to the agent cgpt, or start it with
        opencode --agent cgpt
-     It uses cgpt/chatgpt-web and asks before every command, file edit and
-     web fetch. It is not made the default agent: OpenCode starts with your
+     It uses cgpt/chatgpt-web and asks before every command, file edit, web
+     access, MCP tool and skill; of the subagents it may start only cgpt-sub,
+     which asks the
+     same way. It is not made the default agent: OpenCode starts with your
      usual agent and model, and you pick cgpt with Tab. If you choose the
      model cgpt/chatgpt-web in another agent (/models), nothing asks.
 EOM
@@ -426,6 +452,9 @@ fi
 cat <<EOM
   4. Optional, the cgpt CLI on PATH:
        ln -sf "$APP/bin/cgpt" /usr/local/bin/cgpt
+Warning: when OpenCode starts, it sends the unfinished turns of old sessions
+(for example of a killed opencode run) to ChatGPT again. Delete the sessions
+you do not want to go on (/sessions in the TUI); see the README.
 Uninstall: "$APP/uninstall.sh"
 EOM
 exit "$STATUS"

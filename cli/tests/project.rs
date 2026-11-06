@@ -49,6 +49,7 @@ fn spawn_host(
                 text,
                 conversation_url: Some(CHAT.to_string()),
                 warning: warning.map(str::to_string),
+                diagnostics: None,
             };
             write_frame(&mut writer, &serde_json::to_vec(&reply).unwrap()).unwrap();
             writer.flush().unwrap();

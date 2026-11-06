@@ -6,16 +6,17 @@
 # Removes what install.sh created and nothing else:
 #   - the gateway LaunchAgent (stopped first)
 #   - the Chrome native host manifest, if it still points at the installed host
-#   - bin/, extension/, uninstall.sh, gateway.log and the agent template in the
-#     install folder
+#   - bin/, extension/, uninstall.sh, gateway.log and the agent templates in
+#     the install folder
 #     (the folder itself only when nothing else is left in it)
-#   - the gateway config, sessions and rate-limit state
+#   - the gateway config, sessions, rate-limit state and records of unread answers
 #   - provider "cgpt" from the OpenCode config, small_model if it is
 #     cgpt/local-title, model if it names a cgpt/ model and default_agent if
 #     it is cgpt and no agent cgpt is left (the previous file is kept as .bak)
-#   - the OpenCode agent cgpt (~/.config/opencode/agents/cgpt.md) if it is the
-#     one install.sh wrote (a copy the user edited is kept as cgpt.md.bak),
-#     and the agents folder if that leaves it empty
+#   - the OpenCode agents cgpt and cgpt-sub (~/.config/opencode/agents/cgpt.md
+#     and cgpt-sub.md), each if it is the one install.sh wrote (a copy the
+#     user edited is kept as <name>.md.bak), and the agents folder if that
+#     leaves it empty
 #
 # Usage:
 #   uninstall.sh [--no-launchctl]
@@ -39,7 +40,7 @@ GW="$HOME/Library/Application Support/cgpt-gateway"
 NM="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts/$HOST_NAME.json"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 OC="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
-AGENT="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/agents/cgpt.md"
+AGENTS="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/agents"
 STATUS=0
 
 # Follow symlinks (dotfiles setups link opencode.json): the edit goes to the
@@ -72,37 +73,54 @@ if [[ -f "$NM" ]]; then
   fi
 fi
 
-echo "==> OpenCode agent cgpt: $AGENT"
-# Ours by the marks install.sh checks too; an agent the user wrote stays. A
-# copy of ours the user edited is kept as cgpt.md.bak.
-if AGENT_FILE="$(resolve_link "$AGENT" 2>/dev/null)" && [[ -f "$AGENT_FILE" ]]; then
-  if grep -q '^model: cgpt/chatgpt-web[[:space:]]*$' "$AGENT_FILE" &&
-     grep -q '^description: ChatGPT Web (bridge)' "$AGENT_FILE"; then
-    KEEP=""
-    if [[ ! -f "$APP/opencode-agent-cgpt.md" ]]; then
-      KEEP="no installed template to compare with: kept as $AGENT.bak to be safe"
-    elif ! cmp -s "$APP/opencode-agent-cgpt.md" "$AGENT_FILE"; then
-      KEEP="the file differs from the installed one: kept as $AGENT.bak"
-    fi
-    if [[ -n "$KEEP" ]] && ! { rm -f "$AGENT.bak" && cp "$AGENT_FILE" "$AGENT.bak"; }; then
-      echo "warning: could not save $AGENT as $AGENT.bak: agent cgpt left in place; remove it by hand" >&2
-      STATUS=1
-    else
-      [[ -n "$KEEP" ]] && echo "    $KEEP"
-      rm -f "$AGENT_FILE"
-      if [[ -L "$AGENT" ]]; then
-        echo "    removed $AGENT_FILE; the link $AGENT to it is left in place"
-      fi
-      rmdir "$(dirname "$AGENT")" 2>/dev/null || true
-    fi
-  else
-    echo "    $AGENT is not ours; left in place"
+# remove_agent <name>: agents/<name>.md, if ours by the marks install.sh
+# checks too; an agent the user wrote stays. A copy of ours the user edited is
+# kept as <name>.md.bak.
+remove_agent() {
+  local name="$1"
+  local agent="$AGENTS/$name.md"
+  local installed="$APP/opencode-agent-$name.md"
+  local file keep
+  echo "==> OpenCode agent $name: $agent"
+  if ! file="$(resolve_link "$agent" 2>/dev/null)" || [[ ! -f "$file" ]]; then
+    return 0
   fi
-fi
+  if ! { grep -q '^model: cgpt/chatgpt-web[[:space:]]*$' "$file" &&
+         grep -q '^description: ChatGPT Web (bridge)' "$file"; }; then
+    echo "    $agent is not ours; left in place"
+    return 0
+  fi
+  keep=""
+  if [[ ! -f "$installed" ]]; then
+    keep="no installed template to compare with: kept as $agent.bak to be safe"
+  elif ! cmp -s "$installed" "$file"; then
+    keep="the file differs from the installed one: kept as $agent.bak"
+  fi
+  if [[ -n "$keep" ]] && ! { rm -f "$agent.bak" && cp "$file" "$agent.bak"; }; then
+    echo "warning: could not save $agent as $agent.bak: agent $name left in place; remove it by hand" >&2
+    STATUS=1
+    return 0
+  fi
+  [[ -n "$keep" ]] && echo "    $keep"
+  if ! rm -f "$file"; then
+    echo "warning: could not remove $agent: agent $name left in place; remove it by hand" >&2
+    STATUS=1
+    return 0
+  fi
+  AGENT_REMOVED=true
+  if [[ -L "$agent" ]]; then
+    echo "    removed $file; the link $agent to it is left in place"
+  fi
+}
+AGENT_REMOVED=false
+remove_agent cgpt
+remove_agent cgpt-sub
+# The agents folder, when removing ours left it empty.
+if [[ "$AGENT_REMOVED" == true ]]; then rmdir "$AGENTS" 2>/dev/null || true; fi
 # default_agent "cgpt" is dropped from opencode.json below once no agent file
 # cgpt is left (it would name a missing agent), like a model of provider cgpt.
 AGENT_GONE=0
-[[ -e "$AGENT" ]] || AGENT_GONE=1
+[[ -e "$AGENTS/cgpt.md" ]] || AGENT_GONE=1
 
 echo "==> OpenCode provider cgpt: $OC"
 if ! OC_FILE="$(resolve_link "$OC")"; then
@@ -159,12 +177,13 @@ fi
 
 echo "==> Files: $APP"
 rm -rf "$APP/bin" "$APP/extension"
-rm -f "$APP/uninstall.sh" "$APP/gateway.log" "$APP/opencode-agent-cgpt.md"
+rm -f "$APP/uninstall.sh" "$APP/gateway.log" "$APP/opencode-agent-cgpt.md" \
+      "$APP/opencode-agent-cgpt-sub.md"
 rmdir "$APP" 2>/dev/null || true
 
 echo "==> Gateway config: $GW"
-rm -rf "$GW/sessions"
-rm -f "$GW/config.json" "$GW/cooldown.json"
+rm -rf "$GW/sessions" "$GW/captures"
+rm -f "$GW/config.json" "$GW/cooldown.json" "$GW/unparsed.jsonl" "$GW/unparsed.jsonl.1"
 rmdir "$GW" 2>/dev/null || true
 
 for dir in "$APP" "$GW"; do

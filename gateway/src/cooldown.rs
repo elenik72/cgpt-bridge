@@ -46,8 +46,11 @@ impl Cooldown {
     }
 
     /// ChatGPT limited the rate at `now_ms`: start the next pause; returns
-    /// when it ends. The pause holds in memory when the file cannot be
-    /// written; a file that cannot be read counts as no earlier hit.
+    /// when it ends. A hit while a pause is running (asks of several
+    /// sessions that were out when the first hit came) is the same limit:
+    /// it neither raises the level nor moves the end, and returns the
+    /// running pause's end. The pause holds in memory when the file cannot
+    /// be written; a file that cannot be read counts as no earlier hit.
     pub fn record_hit(&self, now_ms: u128) -> u128 {
         let mut memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
         let file = self.load(now_ms).ok().flatten();
@@ -55,6 +58,9 @@ impl Cooldown {
             .into_iter()
             .flatten()
             .max_by_key(|s| s.last_hit_ms);
+        if let Some(running) = last.as_ref().filter(|s| s.until_ms > now_ms) {
+            return running.until_ms;
+        }
         let level = match last {
             Some(last) if now_ms.saturating_sub(last.last_hit_ms) <= REPEAT_WINDOW_MS => {
                 last.level.saturating_add(1).clamp(1, PAUSES_MIN.len())
@@ -291,6 +297,18 @@ mod tests {
         let later = T0 + 95 * MIN + 61 * MIN;
         assert_eq!(c.record_hit(later), later + 5 * MIN);
         assert_eq!(c.record_hit(later + 6 * MIN), later + 21 * MIN);
+    }
+
+    #[test]
+    fn a_hit_during_a_running_pause_neither_raises_nor_extends_it() {
+        let c = cooldown("cd-during");
+        assert_eq!(c.record_hit(T0), T0 + 5 * MIN);
+        // Two more sessions' asks were out and hit the limit too.
+        assert_eq!(c.record_hit(T0 + 1), T0 + 5 * MIN);
+        assert_eq!(c.record_hit(T0 + 2 * MIN), T0 + 5 * MIN);
+        assert_eq!(c.active_until(T0 + 3 * MIN).unwrap(), Some(T0 + 5 * MIN));
+        // The next hit after the pause is the first repeat: 15, not 30.
+        assert_eq!(c.record_hit(T0 + 10 * MIN), T0 + 25 * MIN);
     }
 
     #[test]

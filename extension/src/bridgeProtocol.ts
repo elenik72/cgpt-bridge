@@ -22,6 +22,59 @@ export interface TestAskRequest {
   // The own window's mark (targetTab.ts), on gateway asks into the own tab
   // only: the page keeps it in its sessionStorage.
   ownMark?: string;
+  // Debug aid (the gateway's `debug_capture_turns`): return the answer
+  // stream (sseParser.ts captureEvent) in `diagnostics.streamCapture`.
+  captureStream?: boolean;
+  // Files the page puts into the composer before it types the text (images
+  // from OpenCode, sent by the gateway); checked by parseAttachments.
+  attachments?: AskAttachment[];
+}
+
+// One file of an ask: the host's `{name, mime, data_base64}`.
+export interface AskAttachment {
+  name: string;
+  mime: string;
+  dataBase64: string;
+}
+
+// The types the gateway sends (it reads them from the bytes).
+export const ATTACHMENT_MIME_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
+// Most files in one ask (the gateway's MAX_IMAGES).
+export const MAX_ATTACHMENTS = 10;
+const ATTACHMENT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+export type ParsedAttachments =
+  | { ok: true; attachments: AskAttachment[] }
+  | { ok: false; message: string };
+
+// An ask's `attachments` as the host sends them (`data_base64`) or as the
+// background hands them to the page (`dataBase64`): absent is none; anything
+// but a list of at most MAX_ATTACHMENTS files with a plain name, one of
+// ATTACHMENT_MIME_TYPES and standard base64 is refused (the frame's size is
+// bounded by the host already).
+export function parseAttachments(value: unknown): ParsedAttachments {
+  if (value === undefined || value === null) return { ok: true, attachments: [] };
+  if (!Array.isArray(value)) return { ok: false, message: "attachments must be a list" };
+  if (value.length > MAX_ATTACHMENTS) {
+    return { ok: false, message: `more than ${MAX_ATTACHMENTS} attachments` };
+  }
+  const out: AskAttachment[] = [];
+  for (const [i, item] of value.entries()) {
+    const a = (typeof item === "object" && item !== null ? item : {}) as Record<string, unknown>;
+    const data = a.data_base64 ?? a.dataBase64;
+    if (typeof a.name !== "string" || !ATTACHMENT_NAME.test(a.name)) {
+      return { ok: false, message: `attachment ${i + 1}: bad name` };
+    }
+    if (typeof a.mime !== "string" || !(ATTACHMENT_MIME_TYPES as readonly string[]).includes(a.mime)) {
+      return { ok: false, message: `attachment ${i + 1}: type ${String(a.mime)} is not an image the bridge sends` };
+    }
+    if (typeof data !== "string" || data === "" || !BASE64.test(data)) {
+      return { ok: false, message: `attachment ${i + 1}: data is not base64` };
+    }
+    out.push({ name: a.name, mime: a.mime, dataBase64: data });
+  }
+  return { ok: true, attachments: out };
 }
 
 export interface DiagnoseRequest {
@@ -68,6 +121,25 @@ export interface TestAskOkResponse {
   // The new chat could not be put into the project asked for and went to a
   // plain new chat (shown to the user by the CLI, logged by the gateway).
   warning?: string;
+  // What the page noticed about the answer; absent when there is nothing.
+  diagnostics?: AskDiagnostics;
+}
+
+// The answer from the stream next to the answer the page shows, both
+// normalized alike (chatgptAdapter.ts `compareStreamAndPage`): lengths in
+// characters and whether they differ.
+export interface StreamCheck {
+  streamChars: number;
+  pageChars: number;
+  mismatch: boolean;
+}
+
+export interface AskDiagnostics {
+  // Only when the stream and the page differ: a report, the answer `text`
+  // stays the one the ask took.
+  streamCheck?: StreamCheck;
+  // The raw answer stream (capped), only when the ask set `captureStream`.
+  streamCapture?: string;
 }
 
 // The target chat cannot be reached in-page: the background loads `url` in
@@ -172,6 +244,15 @@ export interface AskResultFrame {
   text: string;
   conversation_url?: string;
   warning?: string;
+  // Rust `AskDiagnostics` (protocol/src/message.rs).
+  diagnostics?: WireDiagnostics;
+}
+
+export interface WireDiagnostics {
+  stream_check?: { stream_chars: number; page_chars: number; mismatch: boolean };
+  stream_capture?: string;
+  // The capture was asked for but left out: the frame would be too big.
+  stream_capture_dropped?: true;
 }
 
 export interface ErrorFrame {
@@ -200,24 +281,44 @@ export interface StatusResultFrame {
   logged_in: boolean;
   conversation_url: string | null;
   build: string;
+  // How many own tabs (gateway turns at once) the extension keeps at most.
+  // Older extensions leave it out; the gateway then runs one turn at a time.
+  own_tabs?: number;
+  // This extension puts an ask's `attachments` into the composer. Older ones
+  // leave it out, and the gateway then sends no files.
+  attachments?: true;
 }
 
 export type HostResponseFrame = AskResultFrame | ErrorFrame | StoppedFrame | StatusResultFrame;
 
 // `conversation_url` is left out when the page never left the temporary URL,
-// `warning` when there is none.
+// `warning` when there is none, `diagnostics` when there is nothing in it.
 export function askResultFrame(
   id: string,
   text: string,
   conversationUrl: string | null,
   warning: string | null = null,
+  diagnostics: AskDiagnostics | null = null,
 ): AskResultFrame {
+  const wire: WireDiagnostics = {
+    ...(diagnostics?.streamCheck === undefined
+      ? {}
+      : {
+          stream_check: {
+            stream_chars: diagnostics.streamCheck.streamChars,
+            page_chars: diagnostics.streamCheck.pageChars,
+            mismatch: diagnostics.streamCheck.mismatch,
+          },
+        }),
+    ...(diagnostics?.streamCapture === undefined ? {} : { stream_capture: diagnostics.streamCapture }),
+  };
   return {
     type: "ask_result",
     id,
     text,
     ...(conversationUrl === null ? {} : { conversation_url: conversationUrl }),
     ...(warning === null ? {} : { warning }),
+    ...(Object.keys(wire).length === 0 ? {} : { diagnostics: wire }),
   };
 }
 
@@ -259,7 +360,13 @@ export function stoppedFrame(
 // `build` is this extension's.
 export function statusResultFrame(
   id: string,
-  status: { tabOpen: boolean; loggedIn: boolean; conversationUrl: string | null },
+  status: {
+    tabOpen: boolean;
+    loggedIn: boolean;
+    conversationUrl: string | null;
+    ownTabs?: number;
+    attachments?: boolean;
+  },
   build: string = EXTENSION_BUILD,
 ): StatusResultFrame {
   return {
@@ -270,6 +377,8 @@ export function statusResultFrame(
     logged_in: status.loggedIn,
     conversation_url: status.conversationUrl,
     build,
+    ...(status.ownTabs === undefined ? {} : { own_tabs: status.ownTabs }),
+    ...(status.attachments === true ? { attachments: true as const } : {}),
   };
 }
 
@@ -314,9 +423,20 @@ export function hostFrameSize(frame: HostResponseFrame): number {
 // so only that ask fails and the caller is told why. The `oversize_frame` code
 // is the one the CLI and the gateway already report as a failed ask; the
 // message does not carry any of the answer.
+//
+// A debug capture never fails an ask and is never cut (its joined text
+// pieces sit at its end, and a cut there could split a secret before the
+// gateway redacts it): a frame too big with it goes without it, marked
+// `stream_capture_dropped`.
 export function capHostFrame(frame: HostResponseFrame): HostResponseFrame {
+  const budget = MAX_HOST_FRAME_BYTES - HOST_FRAME_RESERVE_BYTES;
   const size = hostFrameSize(frame);
-  if (size <= MAX_HOST_FRAME_BYTES - HOST_FRAME_RESERVE_BYTES) return frame;
+  if (size <= budget) return frame;
+  if (frame.type === "ask_result" && frame.diagnostics?.stream_capture !== undefined) {
+    const { stream_capture: _dropped, ...rest } = frame.diagnostics;
+    const without: AskResultFrame = { ...frame, diagnostics: { ...rest, stream_capture_dropped: true } };
+    if (hostFrameSize(without) <= budget) return without;
+  }
   return errorFrame(frame.id, "oversize_frame", `ответ ${size} байт больше лимита моста`);
 }
 

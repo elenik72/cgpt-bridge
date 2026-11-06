@@ -25,8 +25,23 @@ pub const DEFAULT_FIRST_BYTE_WAIT_MS: u64 = 500;
 pub const DEFAULT_MIN_ASK_BUDGET_MS: u64 = 5_000;
 /// Shortest bearer token accepted from the config file.
 const MIN_TOKEN_CHARS: usize = 32;
+/// Turns of different sessions that may run at once, at most (the extension's
+/// `own_tabs` may set a lower limit).
+pub const DEFAULT_MAX_PARALLEL: u32 = 3;
+/// The range `max_parallel` is clamped to.
+pub const MIN_MAX_PARALLEL: u32 = 1;
+pub const MAX_MAX_PARALLEL: u32 = 8;
+/// The most turns `debug_capture_turns` may capture.
+pub const MAX_DEBUG_CAPTURE_TURNS: u32 = 100;
 /// The keys of the file: the fields of [`Config`] that are not `serde(skip)`.
-const KNOWN_KEYS: [&str; 4] = ["port", "token", "turn_timeout_ms", "allow_tools"];
+const KNOWN_KEYS: [&str; 6] = [
+    "port",
+    "token",
+    "turn_timeout_ms",
+    "allow_tools",
+    "max_parallel",
+    "debug_capture_turns",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -38,6 +53,17 @@ pub struct Config {
     /// Tools the user allowed ChatGPT to use beyond the safe set (`execute`).
     #[serde(default)]
     pub allow_tools: Vec<String>,
+    /// Turns of different sessions that may run at once (see
+    /// [`DEFAULT_MAX_PARALLEL`]); clamped to 1..=8 when read.
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: u32,
+    /// Debug aid, off (0) by default and left out of a new file: the raw
+    /// answer streams of the next this many turns after the start are
+    /// written, redacted, to `captures/` (see `journal`). Only this file
+    /// turns it on, never a request or ChatGPT; at most
+    /// [`MAX_DEBUG_CAPTURE_TURNS`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub debug_capture_turns: u32,
     /// Interval of the `: keepalive` SSE comment. Not part of the file; tests
     /// shorten it.
     #[serde(skip, default = "default_keepalive_ms")]
@@ -56,6 +82,12 @@ fn default_port() -> u16 {
 fn default_turn_timeout_ms() -> u64 {
     DEFAULT_TURN_TIMEOUT_MS
 }
+fn default_max_parallel() -> u32 {
+    DEFAULT_MAX_PARALLEL
+}
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
 fn default_keepalive_ms() -> u64 {
     DEFAULT_KEEPALIVE_MS
 }
@@ -73,6 +105,8 @@ impl Config {
             token,
             turn_timeout_ms: DEFAULT_TURN_TIMEOUT_MS,
             allow_tools: Vec::new(),
+            max_parallel: DEFAULT_MAX_PARALLEL,
+            debug_capture_turns: 0,
             keepalive_ms: DEFAULT_KEEPALIVE_MS,
             first_byte_wait_ms: DEFAULT_FIRST_BYTE_WAIT_MS,
             min_ask_budget_ms: DEFAULT_MIN_ASK_BUDGET_MS,
@@ -94,9 +128,9 @@ pub fn generate_token() -> io::Result<String> {
 }
 
 /// Load `<dir>/config.json`, or create it with defaults and a fresh token.
-/// The second value is the warning about unknown keys, for the caller to log
-/// once the gateway's start line is out.
-pub fn load_or_create(dir: &Path) -> io::Result<(Config, Option<String>)> {
+/// The second value holds the warnings (unknown keys, a `max_parallel` out of
+/// range), for the caller to log once the gateway's start line is out.
+pub fn load_or_create(dir: &Path) -> io::Result<(Config, Vec<String>)> {
     let path = dir.join("config.json");
     match std::fs::read_to_string(&path) {
         Ok(text) => {
@@ -115,16 +149,53 @@ pub fn load_or_create(dir: &Path) -> io::Result<(Config, Option<String>)> {
                     MIN_TOKEN_CHARS
                 )));
             }
-            Ok((cfg, unknown_keys_warning(&path, &text)))
+            let warnings = unknown_keys_warning(&path, &text)
+                .into_iter()
+                .chain(clamp_max_parallel(&mut cfg, &path))
+                .chain(clamp_debug_capture_turns(&mut cfg, &path))
+                .collect();
+            Ok((cfg, warnings))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let cfg = Config::with_token(generate_token()?);
             std::fs::create_dir_all(dir)?;
             write_private(&path, &serde_json::to_string_pretty(&cfg)?)?;
-            Ok((cfg, None))
+            Ok((cfg, Vec::new()))
         }
         Err(e) => Err(e),
     }
+}
+
+/// Bring `max_parallel` into 1..=8; the log line when it was outside.
+fn clamp_max_parallel(cfg: &mut Config, path: &Path) -> Option<String> {
+    let given = cfg.max_parallel;
+    cfg.max_parallel = given.clamp(MIN_MAX_PARALLEL, MAX_MAX_PARALLEL);
+    (cfg.max_parallel != given).then(|| {
+        format!(
+            "cgpt-gateway: {}: \"max_parallel\" {} is outside {}..={}, {} is used",
+            path.display(),
+            given,
+            MIN_MAX_PARALLEL,
+            MAX_MAX_PARALLEL,
+            cfg.max_parallel
+        )
+    })
+}
+
+/// Bring `debug_capture_turns` to at most [`MAX_DEBUG_CAPTURE_TURNS`]; the
+/// log line when it was more.
+fn clamp_debug_capture_turns(cfg: &mut Config, path: &Path) -> Option<String> {
+    let given = cfg.debug_capture_turns;
+    cfg.debug_capture_turns = given.min(MAX_DEBUG_CAPTURE_TURNS);
+    (cfg.debug_capture_turns != given).then(|| {
+        format!(
+            "cgpt-gateway: {}: \"debug_capture_turns\" {} is more than {}, {} is used",
+            path.display(),
+            given,
+            MAX_DEBUG_CAPTURE_TURNS,
+            cfg.debug_capture_turns
+        )
+    })
 }
 
 /// Most unknown keys named in the warning, and the longest key name shown.
@@ -241,6 +312,7 @@ mod tests {
         assert_eq!(cfg.port, 8765);
         assert_eq!(cfg.turn_timeout_ms, 900_000);
         assert!(cfg.allow_tools.is_empty());
+        assert_eq!(cfg.max_parallel, 3);
         assert_eq!(cfg.keepalive_ms, 2_000);
         assert_eq!(cfg.first_byte_wait_ms, 500);
         assert_eq!(cfg.min_ask_budget_ms, 5_000);
@@ -254,7 +326,16 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["allow_tools", "port", "token", "turn_timeout_ms"]);
+        assert_eq!(
+            keys,
+            [
+                "allow_tools",
+                "max_parallel",
+                "port",
+                "token",
+                "turn_timeout_ms"
+            ]
+        );
 
         // A different dir gets a different token.
         let other = load_or_create(&temp_dir("cfg2")).unwrap().0;
@@ -282,6 +363,79 @@ mod tests {
         assert_eq!(cfg.first_byte_wait_ms, 500);
         assert_eq!(cfg.min_ask_budget_ms, 5_000);
         assert_eq!(cfg.allow_tools, ["execute"]);
+        // A file written before `max_parallel` existed.
+        assert_eq!(cfg.max_parallel, 3);
+        // Debug capture is off unless the file says otherwise.
+        assert_eq!(cfg.debug_capture_turns, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debug_capture_turns_is_read_and_capped_with_a_warning() {
+        let dir = temp_dir("debug-capture");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (given, used, warned) in [
+            (0, 0, false),
+            (3, 3, false),
+            (100, 100, false),
+            (5000, 100, true),
+        ] {
+            std::fs::write(
+                dir.join("config.json"),
+                format!(
+                    r#"{{"token":"{}","debug_capture_turns":{}}}"#,
+                    "a".repeat(64),
+                    given
+                ),
+            )
+            .unwrap();
+            let (cfg, warnings) = load_or_create(&dir).unwrap();
+            assert_eq!(cfg.debug_capture_turns, used, "{given}");
+            assert_eq!(warnings.len(), usize::from(warned), "{:?}", warnings);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_parallel_is_read_and_clamped_to_1_to_8_with_a_warning() {
+        let dir = temp_dir("max-parallel");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (given, used, warned) in [
+            (5, 5, false),
+            (1, 1, false),
+            (8, 8, false),
+            (0, 1, true),
+            (9, 8, true),
+            (1000, 8, true),
+        ] {
+            std::fs::write(
+                dir.join("config.json"),
+                format!(
+                    r#"{{"token":"{}","max_parallel":{}}}"#,
+                    "a".repeat(64),
+                    given
+                ),
+            )
+            .unwrap();
+            let (cfg, warnings) = load_or_create(&dir).unwrap();
+            assert_eq!(cfg.max_parallel, used, "{given}");
+            assert_eq!(
+                warnings.len(),
+                usize::from(warned),
+                "{given}: {:?}",
+                warnings
+            );
+            if warned {
+                assert!(
+                    warnings[0].contains(&format!(
+                        "\"max_parallel\" {} is outside 1..=8, {} is used",
+                        given, used
+                    )),
+                    "{}",
+                    warnings[0]
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -370,19 +524,22 @@ mod tests {
             "a".repeat(64)
         );
         std::fs::write(dir.join("config.json"), &text).unwrap();
-        let (cfg, warning) = load_or_create(&dir).unwrap();
+        let (cfg, warnings) = load_or_create(&dir).unwrap();
         // The typo changed nothing: the real key keeps its default.
         assert!(cfg.allow_tools.is_empty());
-        let warning = warning.unwrap();
+        let [warning] = warnings.as_slice() else {
+            panic!("one warning: {:?}", warnings)
+        };
         assert_eq!(
             Some(warning.clone()),
             unknown_keys_warning(&dir.join("config.json"), &text)
         );
         assert_eq!(
-            warning,
+            *warning,
             format!(
                 "cgpt-gateway: {}: unknown key(s) ignored: \"allowed_tools\" \
-                 (known: \"port\", \"token\", \"turn_timeout_ms\", \"allow_tools\")",
+                 (known: \"port\", \"token\", \"turn_timeout_ms\", \"allow_tools\", \
+                 \"max_parallel\", \"debug_capture_turns\")",
                 dir.join("config.json").display()
             )
         );
@@ -402,10 +559,10 @@ mod tests {
     #[test]
     fn a_correct_config_gives_no_warning() {
         let dir = temp_dir("known");
-        assert_eq!(load_or_create(&dir).unwrap().1, None);
+        assert!(load_or_create(&dir).unwrap().1.is_empty());
         let text = std::fs::read_to_string(dir.join("config.json")).unwrap();
         // Read back (not created): still no warning.
-        assert_eq!(load_or_create(&dir).unwrap().1, None);
+        assert!(load_or_create(&dir).unwrap().1.is_empty());
         assert_eq!(unknown_keys_warning(&dir.join("config.json"), &text), None);
         // The known keys are the ones a config the gateway writes has.
         let written: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -416,7 +573,11 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort();
-        let mut known = KNOWN_KEYS.to_vec();
+        // ...but for the debug aid, which a new file leaves out (off).
+        let mut known: Vec<&str> = KNOWN_KEYS
+            .into_iter()
+            .filter(|k| *k != "debug_capture_turns")
+            .collect();
         known.sort();
         assert_eq!(keys, known);
         let _ = std::fs::remove_dir_all(&dir);

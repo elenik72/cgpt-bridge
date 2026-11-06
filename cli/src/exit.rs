@@ -99,6 +99,20 @@ pub fn too_large_message(len: usize, cap: usize) -> String {
     )
 }
 
+/// The same for a `cgpt agent` turn that sends a command result: the user
+/// wrote none of that text, so "shorten the text" does not apply. Output
+/// capped at 256 KiB can still pass the cap: it is JSON-escaped twice on the
+/// way (in the result block, then in the frame).
+pub fn command_result_too_large_message(len: usize, cap: usize) -> String {
+    format!(
+        "the command result is too large to send: {} bytes, the limit is {} bytes (its \
+         output is escaped twice on the way, control characters grow most); nothing was \
+         sent. Go on with `cgpt agent -c \"<what to do instead>\"`, for example a command \
+         with less output",
+        len, cap
+    )
+}
+
 /// What the CLI says when the host did not answer in time. The CLI waits the
 /// ask's own limit plus the host's grace, so the number is the whole wait.
 pub fn no_answer_message(timeout_ms: u64) -> String {
@@ -161,6 +175,7 @@ mod tests {
             text: "t".into(),
             conversation_url: None,
             warning: None,
+            diagnostics: None,
         };
         let pong = BridgeResponse::Pong {
             id: None,
@@ -259,6 +274,18 @@ mod tests {
         assert!(m.contains("1048600 bytes"), "{}", m);
         assert!(m.contains("limit is 1048576 bytes"), "{}", m);
         assert!(m.contains("nothing was sent"), "{}", m);
+        assert!(!m.contains('\n'), "one line");
+    }
+
+    #[test]
+    fn a_command_result_too_large_is_not_told_to_shorten_the_text() {
+        let m = command_result_too_large_message(1_048_600, 1_048_576);
+        assert!(m.contains("command result is too large"), "{}", m);
+        assert!(m.contains("1048600 bytes"), "{}", m);
+        assert!(m.contains("limit is 1048576 bytes"), "{}", m);
+        assert!(m.contains("nothing was sent"), "{}", m);
+        assert!(m.contains("cgpt agent -c"), "{}", m);
+        assert!(!m.contains("shorten the text"), "{}", m);
         assert!(!m.contains('\n'), "one line");
     }
 

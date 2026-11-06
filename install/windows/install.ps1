@@ -18,10 +18,12 @@
      as opencode.json.bak. small_model is set only if there is none.
   5. Adds the OpenCode agent "cgpt"
      (%USERPROFILE%\.config\opencode\agents\cgpt.md): it uses
-     cgpt/chatgpt-web and asks before every command, file edit and web fetch.
-     It is not made the default agent; an agents\cgpt.md the user wrote is
-     left alone, an edited copy of ours is kept as cgpt.md.bak. A failure here
-     only skips the agent.
+     cgpt/chatgpt-web and asks before every command, file edit, web access,
+     MCP tool and skill, and of all subagents may start only "cgpt-sub"
+     (agents\cgpt-sub.md,
+     added too), which asks the same way. cgpt is not made the default agent;
+     an agent file the user wrote is left alone, an edited copy of ours is
+     kept as <name>.md.bak. A failure here only skips that agent.
   6. Registers the gateway for autostart at login: the value "cgpt-gateway"
      under HKCU\Software\Microsoft\Windows\CurrentVersion\Run, which runs
      start-gateway.ps1 (a registry value holds any Unicode path; a .lnk made
@@ -40,8 +42,8 @@
   Do not start the gateway now (the autostart value is still written).
 
 .PARAMETER NoAgent
-  Do not add the OpenCode agent cgpt (one added by an earlier run stays as it
-  is).
+  Do not add the OpenCode agents cgpt and cgpt-sub (ones added by an earlier
+  run stay as they are).
 #>
 param([switch]$NoStart, [switch]$NoAgent)
 
@@ -75,10 +77,11 @@ $Log = Join-Path $App 'gateway.log'
 $GatewayConfig = Join-Path $env:APPDATA 'cgpt-gateway\config.json'
 $ConfigHome = if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $env:USERPROFILE '.config' }
 $OpenCode = Join-Path $ConfigHome 'opencode\opencode.json'
-$Agent = Join-Path $ConfigHome 'opencode\agents\cgpt.md'
+$Agents = Join-Path $ConfigHome 'opencode\agents'
 
 foreach ($f in 'bin\cgpt-gateway.exe', 'bin\cgpt-bridge-host.exe', 'extension\manifest.json',
-               'start-gateway.ps1', 'uninstall.ps1', 'opencode-provider.json', 'opencode-agent-cgpt.md') {
+               'start-gateway.ps1', 'uninstall.ps1', 'opencode-provider.json', 'opencode-agent-cgpt.md',
+               'opencode-agent-cgpt-sub.md') {
   if (-not (Test-Path -LiteralPath (Join-Path $Src $f))) {
     throw "$Src\$f not found - run install.ps1 from the unpacked release bundle"
   }
@@ -120,6 +123,68 @@ function Resolve-Link([string]$Path) {
 function Test-OurAgent([string]$Path) {
   $text = [System.IO.File]::ReadAllText($Path, $Utf8)
   ($text -cmatch '(?m)^model: cgpt/chatgpt-web[ \t\r]*$') -and ($text -cmatch '(?m)^description: ChatGPT Web \(bridge\)')
+}
+
+# Step 5: OpenCode agent <name>: the bundled opencode-agent-<name>.md, as is
+# (UTF-8 without BOM, LF), at agents\<name>.md. OpenCode's own subagents, such
+# as general, run every command without asking, so agent cgpt may start only
+# cgpt-sub. An agent file is ours when it names the model cgpt/chatgpt-web
+# and its description starts with "ChatGPT Web (bridge)" (uninstall.ps1 uses
+# the same marks); one the user wrote is not replaced. The install folder
+# keeps a copy of the template each agent was written from: a file equal to
+# it is unedited and is replaced as is; any other file of ours is an edit and
+# is kept as <name>.md.bak first (also when there is no such copy). So an
+# unedited older template never overwrites a saved edit. Nothing else in
+# OpenCode is switched: default_agent stays as it is, the user picks the
+# agent with Tab. The agents are optional: when one cannot be written the
+# install goes on. Returns $true when the agent file is ours after the step.
+function Install-Agent([string]$Name) {
+  $agent = Join-Path $Agents "$Name.md"
+  $agentSrc = Join-Path $Src "opencode-agent-$Name.md"
+  $agentInstalled = Join-Path $App "opencode-agent-$Name.md"
+  $ready = $false
+  Write-Host "==> OpenCode agent ${Name}: $agent"
+  if ($NoAgent) {
+    Write-Host '    not added (-NoAgent)'
+    # An agent of an earlier run stays, and stays usable.
+    return ((Test-Path -LiteralPath $agent -PathType Leaf) -and (Test-OurAgent $agent))
+  }
+  try { $agentFile = Resolve-Link $agent } catch { $agentFile = $null }
+  if ($null -eq $agentFile) {
+    Write-Host "    not added: $agent is a symlink loop"
+  } elseif (Test-Path -LiteralPath $agentFile -PathType Container) {
+    Write-Host "    not added: $agent is a folder; left as it is"
+  } elseif ((Test-Path -LiteralPath $agentFile -PathType Leaf) -and -not (Test-OurAgent $agentFile)) {
+    Write-Host "    not added: $agent is not ours (another agent named $Name); left as it is"
+  } elseif ((Test-Path -LiteralPath $agentFile -PathType Leaf) -and
+            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($agentFile)) -ceq
+            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($agentSrc))) {
+    Write-Host "    agent ${Name}: unchanged"
+    $ready = $true
+  } else {
+    $existed = Test-Path -LiteralPath $agentFile -PathType Leaf
+    $unedited = $existed -and (Test-Path -LiteralPath $agentInstalled -PathType Leaf) -and
+                [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($agentFile)) -ceq
+                [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($agentInstalled))
+    try {
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $agentFile) | Out-Null
+      if ($existed -and -not $unedited) { Copy-Item -LiteralPath $agentFile -Destination "$agent.bak" -Force }
+      Write-TextFile $agentFile ([System.IO.File]::ReadAllText($agentSrc, $Utf8))
+      $ready = $true
+      if (-not $existed) { Write-Host "    agent ${Name}: added" }
+      elseif ($unedited) { Write-Host "    agent ${Name}: updated" }
+      else { Write-Host "    agent ${Name}: updated (previous saved as $Name.md.bak)" }
+    } catch {
+      Remove-Item -LiteralPath "$agentFile.tmp" -Force -ErrorAction SilentlyContinue
+      Write-Warning "could not write $agent ($($_.Exception.Message)): agent $Name not added; the rest of the install goes on"
+    }
+  }
+  # The template the agent file now comes from, for the next run and for
+  # uninstall.ps1. Left as it is when the agent was not (re)written.
+  if ($ready) {
+    Copy-Item -LiteralPath $agentSrc -Destination $agentInstalled -Force -ErrorAction SilentlyContinue
+  }
+  return $ready
 }
 
 function Get-Gateway {
@@ -266,62 +331,15 @@ try {
   }
 
   # -------------------------------------------------------------------------
-  # 5. OpenCode agent cgpt: the bundled file, as is (UTF-8 without BOM, LF).
-  #    An agents\cgpt.md is ours when it names the model cgpt/chatgpt-web and
-  #    its description starts with "ChatGPT Web (bridge)" (uninstall.ps1 uses
-  #    the same marks); one the user wrote is not replaced. The install
-  #    folder keeps a copy of the template the agent was written from: a file
-  #    equal to it is unedited and is replaced as is; any other file of ours
-  #    is an edit and is kept as cgpt.md.bak first (also when there is no such
-  #    copy). So an unedited older template never overwrites a saved edit.
-  #    Nothing else in OpenCode is switched: default_agent stays as it is, the
-  #    user picks the agent with Tab. The agent is optional: when it cannot be
-  #    written the install goes on.
+  # 5. OpenCode agents cgpt and cgpt-sub (Install-Agent above): cgpt may start
+  #    no subagent but cgpt-sub.
   # -------------------------------------------------------------------------
-  $agentInstalled = Join-Path $App 'opencode-agent-cgpt.md'
-  Write-Host "==> OpenCode agent cgpt: $Agent"
-  if ($NoAgent) {
-    Write-Host '    not added (-NoAgent)'
-    # An agent of an earlier run stays, and stays usable.
-    if ((Test-Path -LiteralPath $Agent -PathType Leaf) -and (Test-OurAgent $Agent)) { $agentReady = $true }
-  } else {
-    $agentSrc = Join-Path $Src 'opencode-agent-cgpt.md'
-    try { $agentFile = Resolve-Link $Agent } catch { $agentFile = $null }
-    if ($null -eq $agentFile) {
-      Write-Host "    not added: $Agent is a symlink loop"
-    } elseif (Test-Path -LiteralPath $agentFile -PathType Container) {
-      Write-Host "    not added: $Agent is a folder; left as it is"
-    } elseif ((Test-Path -LiteralPath $agentFile -PathType Leaf) -and -not (Test-OurAgent $agentFile)) {
-      Write-Host "    not added: $Agent is not ours (another agent named cgpt); left as it is"
-    } elseif ((Test-Path -LiteralPath $agentFile -PathType Leaf) -and
-              [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($agentFile)) -ceq
-              [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($agentSrc))) {
-      Write-Host '    agent cgpt: unchanged'
-      $agentReady = $true
-    } else {
-      $existed = Test-Path -LiteralPath $agentFile -PathType Leaf
-      $unedited = $existed -and (Test-Path -LiteralPath $agentInstalled -PathType Leaf) -and
-                  [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($agentFile)) -ceq
-                  [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($agentInstalled))
-      try {
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $agentFile) | Out-Null
-        if ($existed -and -not $unedited) { Copy-Item -LiteralPath $agentFile -Destination "$Agent.bak" -Force }
-        Write-TextFile $agentFile ([System.IO.File]::ReadAllText($agentSrc, $Utf8))
-        $agentReady = $true
-        if (-not $existed) { Write-Host '    agent cgpt: added' }
-        elseif ($unedited) { Write-Host '    agent cgpt: updated' }
-        else { Write-Host '    agent cgpt: updated (previous saved as cgpt.md.bak)' }
-      } catch {
-        Remove-Item -LiteralPath "$agentFile.tmp" -Force -ErrorAction SilentlyContinue
-        Write-Warning "could not write $Agent ($($_.Exception.Message)): agent cgpt not added; the rest of the install goes on"
-      }
-    }
-    # The template the agent file now comes from, for the next run and for
-    # uninstall.ps1. Left as it is when the agent was not (re)written.
-    if ($agentReady) {
-      Copy-Item -LiteralPath $agentSrc -Destination $agentInstalled -Force -ErrorAction SilentlyContinue
-    }
+  $subReady = Install-Agent 'cgpt-sub'
+  # A cgpt-sub the user wrote has its own permissions, and cgpt may start it.
+  if (-not $subReady -and -not $NoAgent -and (Test-Path -LiteralPath (Join-Path $Agents 'cgpt-sub.md'))) {
+    Write-Warning "agent cgpt may start cgpt-sub, which is not ours: it runs with its own permissions ($(Join-Path $Agents 'cgpt-sub.md'))"
   }
+  $agentReady = Install-Agent 'cgpt'
 
   # -------------------------------------------------------------------------
   # 6. Autostart: the Run value runs start-gateway.ps1 at login, which starts
@@ -398,8 +416,10 @@ if ($agentReady) {
   Write-Host @"
   3. In OpenCode press Tab to switch to the agent cgpt, or start it with
        opencode --agent cgpt
-     It uses cgpt/chatgpt-web and asks before every command, file edit and
-     web fetch. It is not made the default agent: OpenCode starts with your
+     It uses cgpt/chatgpt-web and asks before every command, file edit, web
+     access, MCP tool and skill; of the subagents it may start only cgpt-sub,
+     which asks the
+     same way. It is not made the default agent: OpenCode starts with your
      usual agent and model, and you pick cgpt with Tab. If you choose the
      model cgpt/chatgpt-web in another agent (/models), nothing asks.
 "@
@@ -410,6 +430,9 @@ if ($agentReady) {
 "@
 }
 Write-Host @"
+Warning: when OpenCode starts, it sends the unfinished turns of old sessions
+(for example of a killed opencode run) to ChatGPT again. Delete the sessions
+you do not want to go on (/sessions in the TUI); see the README.
 Uninstall: powershell -ExecutionPolicy Bypass -File "$App\uninstall.ps1"
 "@
 exit $status

@@ -27,8 +27,21 @@ export type QueueResult<T> = { ran: true; value: T } | { ran: false };
  */
 export class TabQueue {
   private tails = new Map<number, Promise<void>>();
+  // Jobs per tab, the running one and those waiting behind it.
+  private counts = new Map<number, number>();
+
+  /**
+   * How many jobs the tab has, running or waiting. A job counts from the
+   * moment `run` is called (synchronously, before its first await) until it
+   * ends or is dropped, so a caller that reserved a tab elsewhere may let go
+   * of that reservation right after calling `run`.
+   */
+  pending(tabId: number): number {
+    return this.counts.get(tabId) ?? 0;
+  }
 
   async run<T>(tabId: number, deadline: number, job: () => Promise<T>): Promise<QueueResult<T>> {
+    this.counts.set(tabId, this.pending(tabId) + 1);
     const prev = this.tails.get(tabId) ?? Promise.resolve();
     let release!: () => void;
     const mine = new Promise<void>((resolve) => {
@@ -43,6 +56,9 @@ export class TabQueue {
       if (!(await settlesBefore(prev, deadline))) return { ran: false };
       return { ran: true, value: await job() };
     } finally {
+      const left = this.pending(tabId) - 1;
+      if (left > 0) this.counts.set(tabId, left);
+      else this.counts.delete(tabId);
       release();
     }
   }
@@ -74,14 +90,17 @@ export interface ActiveAsk {
   // stop has nothing to press: the ask ends `cancelled` and its prompt never
   // reaches the tab.
   handedToTab: boolean;
+  // Set while the tab had no content script for the request and the page
+  // scripts go in, before the request is sent again: nobody has received it.
+  scriptsGoingIn: boolean;
 }
 
-/** Which tabs have a bridge ask in flight (at most one per tab). */
+/** The bridge asks in flight, in every tab (at most one running per tab). */
 export class InFlight {
   private asks: ActiveAsk[] = [];
 
-  start(ask: Omit<ActiveAsk, "cancelled" | "handedToTab">): ActiveAsk {
-    const active: ActiveAsk = { ...ask, cancelled: false, handedToTab: false };
+  start(ask: Omit<ActiveAsk, "cancelled" | "handedToTab" | "scriptsGoingIn">): ActiveAsk {
+    const active: ActiveAsk = { ...ask, cancelled: false, handedToTab: false, scriptsGoingIn: false };
     this.asks.push(active);
     return active;
   }
@@ -107,9 +126,24 @@ export class InFlight {
     return this.asks.find((a) => a.hostId === hostId) ?? null;
   }
 
-  /** Every ask in the own tab, the one running and those queued behind it. */
+  /** Every ask in the own tabs, those running and those queued behind them. */
   ownAsks(): ActiveAsk[] {
     return this.asks.filter((a) => a.own);
+  }
+
+  /**
+   * Per own tab, the own ask a `stop` is about there: the one handed to the
+   * tab, else the first one that has the tab (it runs next). Asks still
+   * choosing their tab are not in it.
+   */
+  ownByTab(): Map<number, ActiveAsk> {
+    const byTab = new Map<number, ActiveAsk>();
+    for (const a of this.asks) {
+      if (!a.own || a.tabId === null) continue;
+      const seen = byTab.get(a.tabId);
+      if (seen === undefined || (!seen.handedToTab && a.handedToTab)) byTab.set(a.tabId, a);
+    }
+    return byTab;
   }
 }
 
