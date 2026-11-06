@@ -11,7 +11,7 @@ A personal local bridge between your terminal or OpenCode and ChatGPT in your Go
 ## What it does
 
 - Lets you send a prompt from your terminal (`cgpt ask`, `cgpt agent`) to a ChatGPT tab you have open, without copy-paste, keeping the conversation visible in the browser.
-- Lets OpenCode use ChatGPT as its model through the local gateway `cgpt-gateway`. Those requests run in the extension's own ChatGPT window, never in your tabs, one chat per OpenCode session.
+- Lets OpenCode use ChatGPT as its model through the local gateway `cgpt-gateway`. Those requests run in the extension's own ChatGPT window, never in your tabs, one chat per OpenCode session; up to 3 sessions (setting `max_parallel`) get answers at the same time, each in its own tab of that window.
 - Lets ChatGPT propose **one shell command at a time** that the CLI shows to you and runs **only after you confirm** — useful for debugging sessions, repo exploration, and small diagnosis tasks.
 - Keeps a local, human-readable plan (`.cgpt-bridge/plan.md`) and an append-only event log (`.cgpt-bridge/plan.jsonl`) for the task you are working on.
 
@@ -74,7 +74,9 @@ built for Apple silicon (`arm64`) only; on an Intel Mac build it from source
 with `./scripts/build-release.sh` (see "Developer: clone + build"; no
 Intel build is made or tested in CI). Developers
 build the same with `./scripts/build-release.sh` (macOS) or
-`pwsh ./scripts/build-release.ps1` (Windows).
+`pwsh ./scripts/build-release.ps1` (Windows); the Windows setup `.exe` then
+with `pwsh ./scripts/build-setup.ps1 -Bundle dist\cgpt-bridge-<version>-<build>-windows-x64`
+(needs Inno Setup 6).
 
 **Verify the download.** The artifact also holds `SHA256SUMS` with the
 SHA-256 of the archive (the build script writes it too, next to the archive in
@@ -101,7 +103,23 @@ cd cgpt-bridge-<version>-<build>-macos-arm64
 ./install.sh
 ```
 
-**Windows** (unpack the `.zip`, then in PowerShell inside that folder):
+**Windows, one file:** the same artifact holds
+`cgpt-bridge-<version>-<build>-windows-x64-setup.exe` (its checksum is the
+second line of `SHA256SUMS`). Run it: no admin rights, nothing to unpack.
+It is not signed, so Windows SmartScreen may say "Windows protected your PC":
+click **More info** → **Run anyway**. The setup unpacks the bundle into its
+temp folder and runs the bundle's `install.ps1` (everything in the table
+below). Its one option, on by default, is the OpenCode agent `cgpt`
+(unticked = `-NoAgent`). The last page says how to load the extension; the
+extension's folder is already on the clipboard, and a tick opens Chrome at
+`chrome://extensions`. The setup keeps only its uninstaller in
+`%LOCALAPPDATA%\cgpt-bridge\setup` (with `install.log`, the output of
+`install.ps1`) and adds **cgpt-bridge** to Settings → Apps → Installed apps;
+uninstalling there runs `uninstall.ps1`. Run the newer setup to update.
+Silent install: `...-setup.exe /VERYSILENT /SUPPRESSMSGBOXES` (exit code 1
+when `install.ps1` failed; `/MERGETASKS="!agent"` skips the agent).
+
+**Windows, from the `.zip`** (unpack it, then in PowerShell inside that folder):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -115,7 +133,7 @@ The installer:
 | Native host registered with Chrome | manifest in `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/` | manifest + key `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.cgpt_bridge.host` |
 | Gateway config with a random token | `~/Library/Application Support/cgpt-gateway/config.json` | `%APPDATA%\cgpt-gateway\config.json` |
 | OpenCode provider `cgpt` (the file then holds the gateway token) | `~/.config/opencode/opencode.json`, made owner-only (mode 600) | `%USERPROFILE%\.config\opencode\opencode.json`, ACL of your profile kept (private to you by default) |
-| OpenCode agent `cgpt` (asks before commands, file edits and web fetches) | `~/.config/opencode/agents/cgpt.md` | `%USERPROFILE%\.config\opencode\agents\cgpt.md` |
+| OpenCode agent `cgpt` and its subagent `cgpt-sub` (both ask before commands, file edits, web access, MCP tools and skills) | `~/.config/opencode/agents/cgpt.md`, `cgpt-sub.md` | `%USERPROFILE%\.config\opencode\agents\cgpt.md`, `cgpt-sub.md` |
 | Gateway autostart, started right away and checked (`GET /v1/models` with the token) | LaunchAgent `~/Library/LaunchAgents/com.cgpt-bridge.gateway.plist` | registry value `cgpt-gateway` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, which runs `start-gateway.ps1` from the install folder (a `cgpt-gateway.lnk` of an earlier version is removed from the Startup folder) |
 | Gateway log | `…/cgpt-bridge/gateway.log` | `…\cgpt-bridge\gateway.log` |
 
@@ -138,9 +156,47 @@ reachable shows on the first real request.
 **The agent `cgpt`.** The installer also adds an OpenCode agent `cgpt` as a
 file of its own, `agents/cgpt.md` next to `opencode.json` (it holds no
 token). The agent uses the model `cgpt/chatgpt-web` and asks before every
-shell command, file edit and web fetch (`bash`, `edit` and `webfetch` set to
-`ask`). It cannot start subagents (`task` set to `deny`): a subagent has
-your usual permissions and would run commands without asking.
+shell command, file edit, web fetch and web search, every tool of your MCP
+servers, every skill, every content search and every access outside the
+project folder. Its first rule is `"*": ask`: every permission OpenCode
+checks asks unless a later rule names it. `bash`, `edit`, `webfetch`,
+`skill` and `grep` are set to `ask` once more (by name). `grep` asks
+because OpenCode checks it against the search pattern, not the path, so an
+allowed `grep` could print a `.env` file. `read` (except `.env` files, in
+lower or upper case, which ask), `glob` (file names only), `todowrite` and
+`question` are allowed. The rules cover only what asks OpenCode for
+permission: a tool that never does, such as a custom tool or a plugin's
+tool, runs without asking in this agent too. OpenCode names an MCP tool's
+permission
+`<server>_<tool>`, with no common prefix, so only a catch-all reaches all of
+them (the names `mcp.use` and `skill.use` of OpenCode 2.2 are policy entries
+that switch a server or skill off for everyone, not per-agent rules). Of all
+subagents it may start only `cgpt-sub`, which the installer adds next to it
+(`agents/cgpt-sub.md`): OpenCode's own subagents, such as `general`, have
+their own permissions and run commands without asking.
+
+- **Code Mode is off in it** (`execute: deny`). OpenCode 2.1 and 2.2 hand
+  MCP tools (and their own `opencode_*` tools) to the model only inside the
+  `execute` tool, which the gateway does not show ChatGPT (see "Gateway
+  config" below). With `execute` denied, OpenCode 2.2.5 sends those tools as
+  ordinary ones, and ChatGPT can call them (each call asks). OpenCode's own
+  `opencode_*` tools then come too, and some of them ask for no permission
+  (renaming the session, moving it to another folder, creating a worktree,
+  listing models): `"opencode_*": deny` hides them all, and the two that
+  read MCP resources are set back to `ask`; removing a worktree stays and
+  asks as an edit. OpenCode 2.1.4 then leaves these tools out of the request
+  altogether: with 2.1.4 ChatGPT reaches MCP tools only through `execute`,
+  in another agent and with `"execute"` in `allow_tools`.
+- **The subagent `cgpt-sub`** also uses `cgpt/chatgpt-web`, has the same
+  rules (`bash` and `shell`, `edit`, `webfetch`, `skill`, `grep` set to
+  `ask`, Code Mode off, every other permission not named asks) and starts
+  no subagents of its own. In `cgpt.md` the subagent rule is written under
+  both names OpenCode has used for it, `task` and `subagent`: everything
+  denied, then `cgpt-sub` allowed (rules are matched
+  from the last one up, so the order matters). OpenCode 2.1 and later read
+  `task` as `subagent` and `bash` as `shell` themselves; checked with
+  OpenCode 2.1.4 and 2.2.5. `cgpt-sub` is a subagent like any other: other
+  agents, such as `build`, may start it too, and it asks there the same way.
 
 - **You switch to it yourself.** The installer does not make `cgpt` the
   default agent and does not change `default_agent`: OpenCode starts with
@@ -149,25 +205,33 @@ your usual permissions and would run commands without asking.
 - **The questions belong to the agent, not to the model.** If you pick the
   model `cgpt/chatgpt-web` in another agent (for example `build` through
   `/models`), commands run without asking.
-- Its `ask` rules come after your own `permission` in `opencode.json` and
-  win: in this agent even a command you `deny` there is asked about, not
-  refused. Tools of your MCP servers, `websearch` and file reads (except
-  `.env` files) do not ask.
+- Its rules come after your own `permission` in `opencode.json` and win,
+  every one of them, because the first is `"*": ask`: in this agent even a
+  command or tool you `deny` there is asked about, not refused, and a file
+  read you `deny` there (other than `.env` files) is allowed. File reads
+  (except `.env` files), `glob`, the todo list and questions to you do not
+  ask. The `.env` rules match the name in lower or upper case only (`.env`,
+  `.ENV`), because OpenCode compares paths case-sensitively on macOS: a
+  file named `.Env` on a case-insensitive volume is read without asking.
 - In a non-interactive `opencode run --agent cgpt` there is nobody to answer,
   so OpenCode refuses each of these actions.
-- An `agents/cgpt.md` you wrote yourself (one without both of the
-  installer's marks, the line `model: cgpt/chatgpt-web` and a description
-  that starts with `ChatGPT Web (bridge)`) is not replaced. If you edited the
-  installer's file, the next run (or the uninstaller) keeps your copy as
-  `agents/cgpt.md.bak` before it replaces (or removes) the file; OpenCode does
-  not load that copy. An unedited file of an older version is replaced
-  without a `.bak`, so a saved edit is not overwritten by an update. The installer prints `agent cgpt: added`, `updated` or
-  `unchanged`. `--no-agent` (macOS) or `-NoAgent` (Windows) skips the agent;
-  an agent added by an earlier run then stays as it is. If the agent cannot
-  be written, the installer warns and finishes without it.
-- If `agents/cgpt.md` is a symlink (dotfiles), the installer writes the file
-  it points to, and the uninstaller removes that file and leaves the link,
-  now pointing at nothing, for you to delete.
+- An `agents/cgpt.md` or `agents/cgpt-sub.md` you wrote yourself (one
+  without both of the installer's marks, the line `model: cgpt/chatgpt-web`
+  and a description that starts with `ChatGPT Web (bridge)`) is not
+  replaced. For `cgpt-sub.md` the installer then warns: the agent `cgpt` may
+  start it, and it runs with the permissions you gave it. If you edited one
+  of the installer's files, the next run (or the uninstaller) keeps your copy
+  as `agents/cgpt.md.bak` (`cgpt-sub.md.bak`) before it replaces (or removes)
+  the file; OpenCode does not load that copy. An unedited file of an older
+  version is replaced without a `.bak`, so a saved edit is not overwritten by
+  an update. The installer prints `agent cgpt: added`, `updated` or
+  `unchanged` (and the same for `cgpt-sub`). `--no-agent` (macOS) or
+  `-NoAgent` (Windows) skips both; agents added by an earlier run then stay
+  as they are. If an agent cannot be written, the installer warns and
+  finishes without it.
+- If `agents/cgpt.md` (or `cgpt-sub.md`) is a symlink (dotfiles), the
+  installer writes the file it points to, and the uninstaller removes that
+  file and leaves the link, now pointing at nothing, for you to delete.
 
 Then:
 
@@ -178,18 +242,21 @@ Then:
    not use a temporary chat for this (see below).
 3. In OpenCode press **Tab** to switch to the agent **cgpt** (or start
    `opencode --agent cgpt`): it uses ChatGPT and asks before each command,
-   edit and web fetch. Or pick the model **cgpt/chatgpt-web** in any agent:
-   `/models` in the TUI, or `"model": "cgpt/chatgpt-web"` in
+   edit, web access, MCP tool and skill. Or pick the model
+   **cgpt/chatgpt-web** in any agent: `/models` in the TUI, or `"model": "cgpt/chatgpt-web"` in
    `opencode.json`, or `opencode run -m cgpt/chatgpt-web "<task>"`; then
    nothing asks unless you set the permissions below. The installer never
    changes your `model` or `default_agent`.
 
 **The first OpenCode request.** The extension opens its **own ChatGPT
 window**, without focus, and works only there; your own ChatGPT tabs are
-never used for OpenCode.
+never used for OpenCode. When several OpenCode sessions (or subagents) work
+at once, the extension opens more tabs in that window, up to 8; each turn
+goes to the tab that already shows its chat when that tab is free.
 
-- Leave that window open and do not type in it. If you close it, the next
-  request opens a new one.
+- Leave that window and its tabs open and do not type in them. If you close
+  the window, the next request opens a new one; a closed tab is replaced by
+  a new one when needed.
 - Click once inside the page of that window — the gateway's tab, not your
   own ChatGPT tab. Chrome lets the tab keep streaming in the background only
   after a click in it. Click again after that tab was fully reloaded.
@@ -201,16 +268,31 @@ never used for OpenCode.
   root (see "ChatGPT projects" below).
 - After you reload the extension (↻ at `chrome://extensions`, for example
   after an update), the extension knows that window again by a mark its
-  page keeps, and goes on using it. After a Chrome restart that restores
-  the window it does so only on the first request, and only while the
-  window holds just that tab and no other tab alone in its window carries
-  the mark (a duplicated or reopened copy of the tab does). Otherwise the
-  window becomes an ordinary tab and the next request opens a new one;
-  close the old one then. A window opened by a version before this one
+  pages keep, and goes on using it. After a Chrome restart that restores
+  the window it does so only on the first request, and only while that
+  window holds nothing but ChatGPT tabs and no tab of another window carries
+  the mark (a duplicated or reopened copy of a tab does). Only the tabs that
+  carry the mark go back into use; the window's other tabs stay idle.
+  Otherwise the window becomes ordinary and the next request opens a new
+  one; close the old one then. A window opened by a version before this one
   has no mark: close it after the first update.
 - Do not keep a copy of that tab (Duplicate, or a reopened closed tab):
   if the original was closed and Chrome restarts before the next request,
   the copy is taken for the gateway's window.
+
+**Images.** Images in OpenCode's messages (a pasted screenshot, an image a
+tool read) go to ChatGPT as files of the message: the extension uploads them
+into the composer, waits until each has uploaded (at most 60 s), then sends
+the text. PNG, JPEG, GIF and WebP only; at most 700 KB and 10 images per
+message, because Chrome takes at most 1 MB per native message. The newest
+images go while they fit; ChatGPT gets a note such as
+`[изображение не отправлено: 2,1 МБ, предел 700 КБ на сообщение]` in place of
+each other one: make it smaller or crop it, or send fewer at once. Image links
+(http/https) are not downloaded; ChatGPT gets the link as text. Other files
+(PDF and the like) are not sent either; ChatGPT is told so. **Images are not
+redacted:** a secret in a screenshot reaches ChatGPT as it is (see
+`docs/security.md` §15). An extension older than the gateway gets
+`[изображение не отправлено: расширение устарело]` instead: reload it.
 
 **Recommended OpenCode settings.**
 
@@ -234,17 +316,66 @@ never used for OpenCode.
   list to ChatGPT with every new chat. To turn that off set
   `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1` (macOS: `export` it in your shell
   profile; Windows: `setx OPENCODE_DISABLE_CLAUDE_CODE_SKILLS 1`, then open a
-  new terminal).
+  new terminal). In the agent `cgpt` loading a skill asks first, but the
+  list still goes to ChatGPT.
 - *Scripted runs.* `opencode run --standalone "<task>"` was more reliable in
   testing than going through the background service (`opencode serve
   --service` once hung at the start of a turn).
+- *Unfinished sessions are sent again.* **Warning:** when OpenCode starts
+  (the TUI, or anything that starts its background service), the service
+  resumes every session whose last turn did not finish and sends that turn
+  to ChatGPT again, without asking, tool calls included. Seen live: 7 old
+  sessions, about 12 turns, one file edited in an old test folder. A session
+  is left unfinished when `opencode run` is killed mid-turn (Ctrl+C, a
+  closed terminal, a timeout) or OpenCode quits while it answers. What to
+  do: let a turn finish or press Esc in the TUI to interrupt it, instead of
+  killing OpenCode; after a kill, open the session list in the TUI
+  (`/sessions`) and delete the sessions you do not want to go on. To clean
+  up without anything reaching ChatGPT, stop the gateway first (macOS:
+  `launchctl bootout gui/$(id -u)/com.cgpt-bridge.gateway`; Windows: end
+  `cgpt-gateway.exe` in Task Manager), clean up, then run the installer
+  again (or log out and in) to start the gateway.
+- *`question` in `opencode run`.* A non-interactive run has nobody to
+  answer, so OpenCode itself cancels each `question` call and tells the
+  model to go on without an answer. ChatGPT then usually asks in plain text
+  and the run ends with that question. This is OpenCode's behaviour, not the
+  gateway's. Put the choices into the task, or answer in the TUI.
 
 **Gateway config.** `config.json` holds `port` (8765), `token`,
-`turn_timeout_ms` (900000) and `allow_tools`. ChatGPT does not get OpenCode's
-`execute` tool unless you add `"execute"` to `allow_tools`. After editing the
+`turn_timeout_ms` (900000), `allow_tools` and `max_parallel` (3: how many
+OpenCode sessions get answers from ChatGPT at the same time, 1 to 8; turns
+of one session always go one at a time). The gateway uses no more than the
+extension reports it can hold, and one at a time with an older extension.
+More at once reaches ChatGPT's rate limit sooner; the pause after a limit
+applies to all sessions. ChatGPT does not get OpenCode's
+`execute` tool (Code Mode: it runs code that calls other tools, which the
+denylist cannot see) unless you add `"execute"` to `allow_tools`. OpenCode
+2.1 and 2.2 give the model MCP tools and their own `opencode_*` tools only
+inside `execute`, so in an agent with Code Mode on (such as `build` with the
+model `cgpt/chatgpt-web`) ChatGPT gets only the plain tools (`shell`, `read`,
+`glob`, `grep`, `patch`, `webfetch`, `websearch`, `skill`, `subagent`,
+`question`): those come directly either way, checked with 2.1.4 and 2.2.5.
+To reach an MCP server's tools there, switch Code Mode off for that agent
+(`"execute": "deny"` in its `permission`, as the agent `cgpt` does) or, with
+OpenCode 2.2.5, for that server (`"codemode": false` in its entry under
+`mcp`; 2.1.4 ignores that key there). With 2.1.4 a denied `execute` drops
+those tools instead of sending them directly. After editing the
 file restart the gateway (log out and in, or run the installer again). A
 key the gateway does not know (a typo such as `allowed_tools`) is ignored; the
 log names it in a line `unknown key(s) ignored`, and the gateway still starts.
+
+**Answers the gateway could not read.** When ChatGPT writes a tool call in
+another form (a `json` block, bare JSON, a tool name followed by its
+arguments), the gateway never runs it: it asks ChatGPT once to send a proper
+`tool_calls` block, and if that fails too, OpenCode gets the answer as text.
+Such answers (and a failed repair, an answer that came twice over, an answer
+whose stream and page text differ) are recorded in `unparsed.jsonl` next to
+`config.json`, redacted and cut, at most 2 × 2 MiB (`unparsed.jsonl.1` is the
+older half). For a closer look at one problem, `"debug_capture_turns": 3` in
+`config.json` (restart the gateway) writes the answer stream of the next 3
+turns, redacted, to `captures/`; it is off by default and holds the whole
+answer text, so set it back to 0 when done. Both may be deleted at any time.
+Details: `docs/security.md` §15.
 
 **Updating.** Unpack the new bundle and run the installer again; Chrome may
 stay open. Everything is prepared first, and the running gateway is stopped,
@@ -262,6 +393,15 @@ this version close the old window once.
 - *Windows: do not run Chrome as administrator.* The bridge's named pipe is
   then created by the elevated account, and the gateway (not elevated)
   cannot reach it.
+- *A request fails with "Send button not found".* The prompt was typed, but
+  the page did not show its Send button within 20 seconds. Chrome slows down
+  a window that is minimized or completely covered by other windows (on
+  Windows above all), and ChatGPT then takes its time to react to the typed
+  text. Keep the bridge's ChatGPT window at least partly visible. If it
+  keeps happening on Windows, open `chrome://flags`, set **Calculate window
+  occlusion on Windows** to **Disabled** and restart Chrome. Before you ask
+  again, look at the bridge's window: when the text is still in the input
+  field, it was not sent, and asking again sends it once.
 - *macOS 13 and later: the gateway does not start.* macOS shows "Background
   item added" after the install; if the `cgpt-gateway` entry is switched off
   in System Settings → General → Login Items (Allow in the Background),
@@ -319,13 +459,15 @@ this version close the old window once.
 **Uninstall.** `~/Library/Application Support/cgpt-bridge/uninstall.sh`
 (macOS) or
 `powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\cgpt-bridge\uninstall.ps1"`
-(Windows). It removes only what the installer created: the files, the
-gateway config and sessions, the autostart entry, the native host
+(Windows; installed with the setup `.exe`: Settings → Apps → Installed apps →
+**cgpt-bridge** → Uninstall, which runs the same script). It removes only what the installer created: the files, the
+gateway config and sessions (and its `unparsed.jsonl` and `captures/`), the autostart entry, the native host
 registration (if it still points at the installed host), provider `cgpt`
 in `opencode.json` (plus `small_model` if it is `cgpt/local-title` and
 `model` if it is a `cgpt/` model, `default_agent` if it is `cgpt` and no
-agent `cgpt` is left) and the agent file `agents/cgpt.md` if it is the
-installer's (the `agents` folder too when nothing else is left in it).
+agent `cgpt` is left) and the agent files `agents/cgpt.md` and
+`agents/cgpt-sub.md`, each if it is the installer's (the `agents` folder too
+when nothing else is left in it).
 Remove the extension at `chrome://extensions` yourself.
 
 ### OpenCode in WSL
@@ -543,6 +685,11 @@ cgpt last --copy           # ...and copy it to the clipboard
 cgpt replay <session-id>
 ```
 
+The STATE column of `cgpt history` is the session's status from its
+`runs/<id>/session.json`: `active`, `final`, `idle`, `needs_user_input`,
+`blocked`, `user_cancelled`, `chat_changed` or `protocol_violation`
+(`-` for an old session with no status recorded).
+
 Copy the final assistant message to the clipboard as part of any run:
 
 ```sh
@@ -572,9 +719,10 @@ gives a plain new chat, with the warning below.
   of an OpenCode session. For the CLI a new chat is a tab on ChatGPT's start
   page or on a project's page with no message yet.
 - The project is found by its name in the sidebar (compared in Unicode NFC,
-  so a macOS folder name finds it; the "Projects" section is opened when it
-  is collapsed, and the project rows get 5 s to load before a project is
-  created). The extension then remembers the project's id for the name
+  so a macOS folder name finds it; the project rows get 5 s to load before
+  a project is created). Nothing is clicked to open a collapsed "Projects"
+  section: a project it hides that is not yet remembered gets a duplicate.
+  The extension then remembers the project's id for the name
   (`chrome.storage.local`): the gateway opens that project's page directly
   next time, even when the sidebar does not show it, and the CLI looks for
   its row first. The CLI cannot load your tab, so when neither that row nor
@@ -584,8 +732,7 @@ gives a plain new chat, with the warning below.
 - If the project can be neither found nor created (the sidebar is hidden,
   the page markup changed), the chat goes to a plain new chat and the bridge
   warns: a `cgpt: warning: …` line on stderr, a `warning` line in the gateway
-  log. A collapsed "Projects" list that does not open is such a failure: no
-  project is created while the list may be hiding it.
+  log.
 - **Same name, same project.** Two folders with the same name (`~/a/app` and
   `~/b/app`) share one project, with its memory and files.
 - **Renamed project.** After you rename a project in ChatGPT, new chats keep
@@ -624,7 +771,7 @@ implemented**: the command does not exist yet.
 
 `cgpt ask` and `cgpt agent` share one table (details: `docs/requirements.md` §9):
 `0` ok, `1` generic failure, `2` usage error (no prompt or task, unknown option,
-host `bad_request`, a prompt too large for the native host's 1 MiB request
+host `bad_request`, a prompt or `cgpt agent` command result too large for the native host's 1 MiB request
 limit, refused before anything is sent), `3` setup, `4` transport, `5` tab unavailable (also a
 signed-out ChatGPT window, a timeout, a changed chat), `6` DOM failure, `7`
 protocol violation, `8` busy tab (see below), `10` user cancelled (also an ask
@@ -742,6 +889,16 @@ cgpt-bridge/
 - `cgpt` CLI: macOS and Linux (the Linux bundle holds the CLI, the native host and the extension, built, tested and host-installer-checked in CI on `ubuntu-latest`; only the gateway is limited to Windows and macOS, with no Linux installer: the Linux bundle also holds a built `bin/cgpt-gateway` that is unsupported there). Prebuilt macOS bundles are Apple silicon (`arm64`); on an Intel Mac build from source, no Intel build is checked in CI.
 - Google Chrome (stable channel) on those platforms.
 - Single host URL: `https://chatgpt.com/*`.
+
+OpenCode versions the gateway and the agents `cgpt` / `cgpt-sub` were
+checked with (macOS, an isolated OpenCode home with a fake provider in place
+of the gateway):
+
+| OpenCode | Checked (6 Nov 2026) | Result |
+|---|---|---|
+| 2.2.5 | both agent files load without warnings; resolved rules (`opencode debug agents`); tools in the requests of agent `cgpt` and of `build` with `cgpt/chatgpt-web` | every checked permission not allowed by name asks (shell, edits, grep, web fetch and search, MCP tools, skills, `.env`/`.ENV` reads, paths outside the project); only `cgpt-sub` may be started; Code Mode off: MCP tools sent directly, OpenCode's own tools that ask nothing (`opencode_session_move`, `opencode_worktree_create`, ...) hidden |
+| 2.1.4 | the same (rules through `GET /api/agent` of `opencode serve`) | the same rules; with Code Mode off MCP tools are not sent at all, so ChatGPT cannot use them |
+| older | not checked | unknown. Before 2.1 the subagent rule was named `task` only; the agent files carry it under both names |
 
 Other Chromium browsers and Firefox are out of scope for v0.1 (see `docs/roadmap.md`).
 

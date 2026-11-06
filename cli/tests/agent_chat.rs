@@ -72,6 +72,7 @@ fn spawn_host(ep: String, replies: Vec<(String, Option<&'static str>)>) -> commo
                 text,
                 conversation_url: url.map(str::to_string),
                 warning: None,
+                diagnostics: None,
             };
             write_frame(&mut writer, &serde_json::to_vec(&reply).unwrap()).unwrap();
             writer.flush().unwrap();

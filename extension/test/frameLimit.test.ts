@@ -67,3 +67,35 @@ test("frameLimit.capped_frame_is_a_small_wire_error_with_the_same_id", () => {
   // The answer text is not carried into the error.
   assert.ok(!JSON.stringify(capped).includes("zzzz"));
 });
+
+test("frameLimit.a_capture_that_does_not_fit_is_dropped_whole_and_never_fails_the_answer", () => {
+  const check = { streamChars: 3, pageChars: 6, mismatch: true };
+  // Text and capture together over the limit: the capture is left out, never
+  // cut (its joined text sits at its end, where a cut could halve a secret);
+  // the answer and the check stay whole, and the frame says why.
+  const text = "t".repeat(300_000);
+  const capture = 'data: {"v": "«text 0+1»"}\n\n'.repeat(30_000) + "AKIAIOSFODNN7EXAMPLE";
+  const frame = askResultFrame("c1", text, null, null, { streamCheck: check, streamCapture: capture });
+  assert.ok(hostFrameSize(frame) > BUDGET);
+  const capped = capHostFrame(frame);
+  assert.deepEqual(capped, {
+    type: "ask_result",
+    id: "c1",
+    text,
+    diagnostics: {
+      stream_check: { stream_chars: 3, page_chars: 6, mismatch: true },
+      stream_capture_dropped: true,
+    },
+  });
+  assert.ok(hostFrameSize(capped) <= BUDGET);
+  // The shape the Rust side reads (protocol message.rs
+  // a_dropped_capture_still_parses): checked there with this same JSON.
+  assert.equal(
+    JSON.stringify(capHostFrame(askResultFrame("c9", "a".repeat(BUDGET - 200), null, null, { streamCapture: "x".repeat(10_000) }))).replace(/"text":"a+"/, '"text":"A"'),
+    '{"type":"ask_result","id":"c9","text":"A","diagnostics":{"stream_capture_dropped":true}}',
+  );
+
+  // An answer over the limit by itself is still refused.
+  const over = askResultFrame("c3", "a".repeat(BUDGET + 1), null, null, { streamCapture: "x" });
+  assert.equal(capHostFrame(over).type, "error");
+});

@@ -1,0 +1,3 @@
+Сейчас прочитаю конфиг шлюза.
+
+[{"name": "read", "arguments": {"path": "gateway/src/config.rs"}}]

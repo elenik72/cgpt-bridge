@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cgpt_bridge_protocol::{
-    connect, default_endpoint, new_request_id, round_trip, AskRequest, BridgeRequest,
-    BridgeResponse, ChatTarget, ErrorCode, PingRequest, ReadFrameError, StatusRequest, StopRequest,
-    CLIENT_TIMEOUT_GRACE_MS,
+    connect, default_endpoint, new_request_id, round_trip, AskDiagnostics, AskRequest, Attachment,
+    BridgeRequest, BridgeResponse, ChatTarget, ErrorCode, PingRequest, ReadFrameError,
+    StatusRequest, StopAskRequest, StopRequest, CLIENT_TIMEOUT_GRACE_MS,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,20 +64,24 @@ pub struct PeerBuilds {
     pub extension: Option<String>,
 }
 
-/// An answered ask: the text, the chat it came from, and the bridge's warning
-/// (say, the new chat went to a plain new chat instead of the project).
+/// An answered ask: the text, the chat it came from, the bridge's warning
+/// (say, the new chat went to a plain new chat instead of the project), and
+/// what the extension noticed about the answer (the stream next to the page,
+/// the raw stream when it was asked for).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Answer {
     pub text: String,
     pub conversation_url: Option<String>,
     pub warning: Option<String>,
+    pub diagnostics: AskDiagnostics,
 }
 
 /// `ask` returns the answer text and the conversation URL it came from.
 ///
 /// Methods take `&self` and the trait is `Sync` on purpose: `stop` has to run
 /// while an `ask` of the same backend is still blocked (the client of that
-/// ask went away). The gateway serializes asks itself.
+/// ask went away), and asks of different sessions may run at once (the
+/// gateway keeps one turn per session, see `lanes`).
 pub trait ChatBackend: Send + Sync {
     fn ask(
         &self,
@@ -118,11 +122,58 @@ pub trait ChatBackend: Send + Sync {
             text,
             conversation_url,
             warning: None,
+            diagnostics: AskDiagnostics::default(),
         })
     }
 
-    /// Press "Stop generating" in the gateway's ChatGPT tab.
+    /// [`ask_in_project`](Self::ask_in_project) with files the page puts into
+    /// the composer before the text (`attachments`; the engine sends them
+    /// only when [`attachments`](Self::attachments) says the extension takes
+    /// them). A backend that has no bridge sends none: it refuses an ask
+    /// with files rather than drop them.
+    fn ask_with_files(
+        &self,
+        id: &str,
+        text: &str,
+        target: &ChatTarget,
+        project: Option<&str>,
+        attachments: &[Attachment],
+        timeout_ms: u64,
+    ) -> Result<Answer, BackendError> {
+        if !attachments.is_empty() {
+            return Err(BackendError::Other(
+                "этот бэкенд не передаёт файлы".to_string(),
+            ));
+        }
+        self.ask_in_project(id, text, target, project, timeout_ms)
+    }
+
+    /// [`ask_with_files`](Self::ask_with_files), asking the bridge for the
+    /// answer's event stream as well (the gateway's `debug_capture_turns`).
+    /// A backend without a bridge has none to give.
+    fn ask_capturing(
+        &self,
+        id: &str,
+        text: &str,
+        target: &ChatTarget,
+        project: Option<&str>,
+        attachments: &[Attachment],
+        timeout_ms: u64,
+    ) -> Result<Answer, BackendError> {
+        self.ask_with_files(id, text, target, project, attachments, timeout_ms)
+    }
+
+    /// Press "Stop generating" in the gateway's ChatGPT tab (an extension
+    /// with several own tabs stops every gateway ask).
     fn stop(&self) -> Result<(), BackendError>;
+
+    /// Stop the one ask sent under bridge id `ask_id`, leaving every other
+    /// ask alone (several sessions at once). `Outdated` from a bridge (or a
+    /// backend) that does not know it; whether the plain [`stop`](Self::stop)
+    /// may go instead is `engine::stop_request`'s choice.
+    fn stop_ask(&self, _ask_id: &str) -> Result<(), BackendError> {
+        Err(BackendError::Outdated)
+    }
 
     /// Whether an extension answered `status`. Only an extension that knows
     /// `status` answers it, so `Ok(true)` proves a current one; an old host
@@ -133,6 +184,21 @@ pub trait ChatBackend: Send + Sync {
     /// before one, and from a backend without a bridge.
     fn peer_builds(&self) -> Option<PeerBuilds> {
         None
+    }
+
+    /// The own tabs the extension said it keeps (`own_tabs`) at the last
+    /// `status` it answered; `None` before one, from an extension or host
+    /// older than the field, and from a backend without a bridge.
+    fn own_tabs(&self) -> Option<u32> {
+        None
+    }
+
+    /// Whether the extension said at the last `status` it answered that it
+    /// puts an ask's files into the composer (`attachments`); false before
+    /// one, from an extension or host older than the field, and from a
+    /// backend without a bridge.
+    fn attachments(&self) -> bool {
+        false
     }
 }
 
@@ -167,8 +233,36 @@ impl<T: ChatBackend + ?Sized> ChatBackend for Arc<T> {
         (**self).ask_in_project(id, text, target, project, timeout_ms)
     }
 
+    fn ask_with_files(
+        &self,
+        id: &str,
+        text: &str,
+        target: &ChatTarget,
+        project: Option<&str>,
+        attachments: &[Attachment],
+        timeout_ms: u64,
+    ) -> Result<Answer, BackendError> {
+        (**self).ask_with_files(id, text, target, project, attachments, timeout_ms)
+    }
+
+    fn ask_capturing(
+        &self,
+        id: &str,
+        text: &str,
+        target: &ChatTarget,
+        project: Option<&str>,
+        attachments: &[Attachment],
+        timeout_ms: u64,
+    ) -> Result<Answer, BackendError> {
+        (**self).ask_capturing(id, text, target, project, attachments, timeout_ms)
+    }
+
     fn stop(&self) -> Result<(), BackendError> {
         (**self).stop()
+    }
+
+    fn stop_ask(&self, ask_id: &str) -> Result<(), BackendError> {
+        (**self).stop_ask(ask_id)
     }
 
     fn status(&self) -> Result<bool, BackendError> {
@@ -177,6 +271,14 @@ impl<T: ChatBackend + ?Sized> ChatBackend for Arc<T> {
 
     fn peer_builds(&self) -> Option<PeerBuilds> {
         (**self).peer_builds()
+    }
+
+    fn own_tabs(&self) -> Option<u32> {
+        (**self).own_tabs()
+    }
+
+    fn attachments(&self) -> bool {
+        (**self).attachments()
     }
 }
 
@@ -211,6 +313,10 @@ pub struct BridgeBackend {
     endpoint: String,
     /// See [`ChatBackend::peer_builds`].
     builds: Mutex<Option<PeerBuilds>>,
+    /// See [`ChatBackend::own_tabs`].
+    own_tabs: Mutex<Option<u32>>,
+    /// See [`ChatBackend::attachments`].
+    attachments: Mutex<bool>,
 }
 
 impl BridgeBackend {
@@ -218,11 +324,63 @@ impl BridgeBackend {
         BridgeBackend {
             endpoint,
             builds: Mutex::new(None),
+            own_tabs: Mutex::new(None),
+            attachments: Mutex::new(false),
         }
     }
 
     pub fn with_default_endpoint() -> BridgeBackend {
         BridgeBackend::new(default_endpoint())
+    }
+
+    /// One `ask` with its files; `capture` asks the extension for the
+    /// answer's event stream.
+    #[allow(clippy::too_many_arguments)]
+    fn ask_bridge(
+        &self,
+        id: &str,
+        text: &str,
+        target: &ChatTarget,
+        project: Option<&str>,
+        attachments: &[Attachment],
+        timeout_ms: u64,
+        capture: bool,
+    ) -> Result<Answer, BackendError> {
+        let request = BridgeRequest::Ask(AskRequest {
+            id: id.to_string(),
+            text: text.to_string(),
+            timeout_ms,
+            target: Some(target.clone()),
+            project: project.map(str::to_string),
+            capture_stream: capture,
+            attachments: attachments.to_vec(),
+        });
+        let response = self.exchange(
+            &request,
+            timeout_ms.saturating_add(CLIENT_TIMEOUT_GRACE_MS),
+            Some(id),
+        )?;
+        match response {
+            BridgeResponse::AskResult {
+                text,
+                conversation_url,
+                warning,
+                diagnostics,
+                ..
+            } => Ok(Answer {
+                text,
+                conversation_url,
+                warning,
+                diagnostics: diagnostics.unwrap_or_default(),
+            }),
+            BridgeResponse::Error { code, message, .. } => {
+                Err(with_bridge_id(map_error(code, message), id))
+            }
+            other => Err(with_bridge_id(
+                BackendError::Other(format!("неожиданный ответ хоста: {:?}", other)),
+                id,
+            )),
+        }
     }
 
     /// `id` is the bridge id to name in the text of a failure after the
@@ -364,37 +522,31 @@ impl ChatBackend for BridgeBackend {
         project: Option<&str>,
         timeout_ms: u64,
     ) -> Result<Answer, BackendError> {
-        let request = BridgeRequest::Ask(AskRequest {
-            id: id.to_string(),
-            text: text.to_string(),
-            timeout_ms,
-            target: Some(target.clone()),
-            project: project.map(str::to_string),
-        });
-        let response = self.exchange(
-            &request,
-            timeout_ms.saturating_add(CLIENT_TIMEOUT_GRACE_MS),
-            Some(id),
-        )?;
-        match response {
-            BridgeResponse::AskResult {
-                text,
-                conversation_url,
-                warning,
-                ..
-            } => Ok(Answer {
-                text,
-                conversation_url,
-                warning,
-            }),
-            BridgeResponse::Error { code, message, .. } => {
-                Err(with_bridge_id(map_error(code, message), id))
-            }
-            other => Err(with_bridge_id(
-                BackendError::Other(format!("неожиданный ответ хоста: {:?}", other)),
-                id,
-            )),
-        }
+        self.ask_bridge(id, text, target, project, &[], timeout_ms, false)
+    }
+
+    fn ask_with_files(
+        &self,
+        id: &str,
+        text: &str,
+        target: &ChatTarget,
+        project: Option<&str>,
+        attachments: &[Attachment],
+        timeout_ms: u64,
+    ) -> Result<Answer, BackendError> {
+        self.ask_bridge(id, text, target, project, attachments, timeout_ms, false)
+    }
+
+    fn ask_capturing(
+        &self,
+        id: &str,
+        text: &str,
+        target: &ChatTarget,
+        project: Option<&str>,
+        attachments: &[Attachment],
+        timeout_ms: u64,
+    ) -> Result<Answer, BackendError> {
+        self.ask_bridge(id, text, target, project, attachments, timeout_ms, true)
     }
 
     fn stop(&self) -> Result<(), BackendError> {
@@ -411,15 +563,37 @@ impl ChatBackend for BridgeBackend {
         }
     }
 
+    fn stop_ask(&self, ask_id: &str) -> Result<(), BackendError> {
+        let request = BridgeRequest::StopAsk(StopAskRequest {
+            id: new_request_id("gw_stop"),
+            ask_id: ask_id.to_string(),
+        });
+        // A host older than `stop_ask` answers `Outdated` (unknown variant).
+        match self.exchange(&request, STOP_TIMEOUT_MS, None)? {
+            BridgeResponse::Stopped { .. } => Ok(()),
+            BridgeResponse::Error { code, message, .. } => Err(map_error(code, message)),
+            other => Err(BackendError::Other(format!(
+                "неожиданный ответ хоста: {:?}",
+                other
+            ))),
+        }
+    }
+
     fn status(&self) -> Result<bool, BackendError> {
         let request = BridgeRequest::Status(StatusRequest {
             id: new_request_id("gw_status"),
         });
         match self.exchange(&request, STOP_TIMEOUT_MS, None)? {
             BridgeResponse::StatusResult {
-                extension, build, ..
+                extension,
+                build,
+                own_tabs,
+                attachments,
+                ..
             } => {
                 if extension {
+                    *self.own_tabs.lock().unwrap() = own_tabs;
+                    *self.attachments.lock().unwrap() = attachments;
                     let host = self.host_build();
                     let mut builds = self.builds.lock().unwrap();
                     // A failed ping says nothing about the host's build: keep
@@ -449,6 +623,14 @@ impl ChatBackend for BridgeBackend {
     fn peer_builds(&self) -> Option<PeerBuilds> {
         self.builds.lock().unwrap().clone()
     }
+
+    fn own_tabs(&self) -> Option<u32> {
+        *self.own_tabs.lock().unwrap()
+    }
+
+    fn attachments(&self) -> bool {
+        *self.attachments.lock().unwrap()
+    }
 }
 
 impl BridgeBackend {
@@ -472,11 +654,13 @@ pub use fake::{FakeBackend, IN_TARGET_CHAT};
 #[cfg(test)]
 mod fake {
     use super::*;
-    use std::collections::VecDeque;
+    use cgpt_bridge_protocol::StreamCheck;
+    use std::collections::{HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
 
     type AskResult = Result<(String, Option<String>), BackendError>;
+    type Responder = dyn Fn(&str, &ChatTarget) -> AskResult + Send + Sync;
 
     /// A scripted chat URL meaning "the chat the ask was sent to", for asks
     /// whose order is not known in advance.
@@ -496,7 +680,20 @@ mod fake {
         pub sent: Mutex<Vec<(String, ChatTarget)>>,
         /// The bridge id of every `ask_with_id`, in order.
         pub ids: Mutex<Vec<String>>,
+        /// `stop` and `stop_ask` calls together.
         pub stops: AtomicUsize,
+        /// The bridge id of every `stop_ask`, in order.
+        pub stop_ask_ids: Mutex<Vec<String>>,
+        /// What `own_tabs` reports.
+        pub own_tabs: Mutex<Option<u32>>,
+        /// When set, answers every ask instead of `replies` (for asks of
+        /// several sessions at once, whose order is not known). Called
+        /// outside any lock of the fake, so it may block one ask.
+        responder: Mutex<Option<Arc<Responder>>>,
+        /// Asks a `stop_ask` has named: each ends early, the others go on.
+        stopped_ids: Mutex<HashSet<String>>,
+        /// What every `stop_ask` fails with, when set.
+        stop_ask_error: Mutex<Option<BackendError>>,
         /// How long every `ask` takes.
         pub delay: Mutex<Duration>,
         /// How far every `ask` moves the turn's clock on, without a real
@@ -515,6 +712,17 @@ mod fake {
         pub projects: Mutex<Vec<Option<String>>>,
         /// The warning every answered `ask_in_project` carries.
         pub warning: Mutex<Option<String>>,
+        /// The stream check every answered ask carries.
+        pub stream_check: Mutex<Option<StreamCheck>>,
+        /// The raw stream every `ask_capturing` returns.
+        pub capture: Mutex<Option<String>>,
+        /// The bridge id of every `ask_capturing`, in order.
+        pub capturing_ids: Mutex<Vec<String>>,
+        /// The files of every `ask_with_files`, in order (empty for an ask
+        /// sent without).
+        pub files: Mutex<Vec<Vec<Attachment>>>,
+        /// What `attachments` reports.
+        pub takes_files: AtomicBool,
         status_probes: AtomicUsize,
         in_flight: AtomicUsize,
         stopped: AtomicBool,
@@ -560,6 +768,45 @@ mod fake {
 
         pub fn set_stop_delay(&self, delay: Duration) {
             *self.stop_delay.lock().unwrap() = delay;
+        }
+
+        pub fn set_own_tabs(&self, own_tabs: Option<u32>) {
+            *self.own_tabs.lock().unwrap() = own_tabs;
+        }
+
+        pub fn set_attachments(&self, takes_files: bool) {
+            self.takes_files.store(takes_files, Ordering::SeqCst);
+        }
+
+        pub fn sent_files(&self) -> Vec<Vec<Attachment>> {
+            self.files.lock().unwrap().clone()
+        }
+
+        pub fn set_responder(
+            &self,
+            responder: impl Fn(&str, &ChatTarget) -> AskResult + Send + Sync + 'static,
+        ) {
+            *self.responder.lock().unwrap() = Some(Arc::new(responder));
+        }
+
+        pub fn stop_ask_ids(&self) -> Vec<String> {
+            self.stop_ask_ids.lock().unwrap().clone()
+        }
+
+        /// The plain `stop` calls (of the own tab).
+        pub fn plain_stops(&self) -> usize {
+            self.stops.load(Ordering::SeqCst) - self.stop_ask_ids.lock().unwrap().len()
+        }
+
+        /// Make every `stop_ask` fail with `e` (recorded, nothing stopped).
+        pub fn set_stop_ask_error(&self, e: Option<BackendError>) {
+            *self.stop_ask_error.lock().unwrap() = e;
+        }
+
+        /// Whether the ask `id` is to end now: a `stop`, or a `stop_ask`
+        /// naming it.
+        fn is_stopped(&self, id: &str) -> bool {
+            self.stopped.load(Ordering::SeqCst) || self.stopped_ids.lock().unwrap().contains(id)
         }
 
         /// Make every following `ask` wait for `open_gate` (or `stop`).
@@ -631,7 +878,7 @@ mod fake {
                 gate.started += 1;
                 self.gate_changed.notify_all();
                 let deadline = std::time::Instant::now() + GATE_LIMIT;
-                while gate.closed && !self.stopped.load(Ordering::SeqCst) {
+                while gate.closed && !self.is_stopped(id) {
                     let left = deadline.saturating_duration_since(std::time::Instant::now());
                     assert!(!left.is_zero(), "the test never opened the ask gate");
                     gate = self
@@ -643,22 +890,24 @@ mod fake {
             }
             let delay = *self.delay.lock().unwrap();
             let started = std::time::Instant::now();
-            while started.elapsed() < delay && !self.stopped.load(Ordering::SeqCst) {
+            while started.elapsed() < delay && !self.is_stopped(id) {
                 std::thread::sleep(Duration::from_millis(5));
             }
             crate::engine::test_clock::advance(*self.turn_time.lock().unwrap());
-            let reply = self
-                .replies
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Err(BackendError::Other("no scripted reply".to_string())))
-                .map(|(text, url)| match (url, target) {
-                    (Some(u), ChatTarget::Conversation { url }) if u == IN_TARGET_CHAT => {
-                        (text, Some(url.clone()))
-                    }
-                    (url, _) => (text, url),
-                });
+            let responder = self.responder.lock().unwrap().clone();
+            let scripted =
+                match responder {
+                    Some(respond) => respond(text, target),
+                    None => self.replies.lock().unwrap().pop_front().unwrap_or_else(|| {
+                        Err(BackendError::Other("no scripted reply".to_string()))
+                    }),
+                };
+            let reply = scripted.map(|(text, url)| match (url, target) {
+                (Some(u), ChatTarget::Conversation { url }) if u == IN_TARGET_CHAT => {
+                    (text, Some(url.clone()))
+                }
+                (url, _) => (text, url),
+            });
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             reply
         }
@@ -680,7 +929,44 @@ mod fake {
                 text,
                 conversation_url,
                 warning: self.warning.lock().unwrap().clone(),
+                diagnostics: AskDiagnostics {
+                    stream_check: self.stream_check.lock().unwrap().clone(),
+                    ..AskDiagnostics::default()
+                },
             })
+        }
+
+        fn ask_with_files(
+            &self,
+            id: &str,
+            text: &str,
+            target: &ChatTarget,
+            project: Option<&str>,
+            attachments: &[Attachment],
+            timeout_ms: u64,
+        ) -> Result<Answer, BackendError> {
+            self.files.lock().unwrap().push(attachments.to_vec());
+            self.ask_in_project(id, text, target, project, timeout_ms)
+        }
+
+        fn ask_capturing(
+            &self,
+            id: &str,
+            text: &str,
+            target: &ChatTarget,
+            project: Option<&str>,
+            attachments: &[Attachment],
+            timeout_ms: u64,
+        ) -> Result<Answer, BackendError> {
+            self.capturing_ids.lock().unwrap().push(id.to_string());
+            let mut answer =
+                self.ask_with_files(id, text, target, project, attachments, timeout_ms)?;
+            answer.diagnostics.stream_capture = self.capture.lock().unwrap().clone();
+            Ok(answer)
+        }
+
+        fn attachments(&self) -> bool {
+            self.takes_files.load(Ordering::SeqCst)
         }
 
         fn stop(&self) -> Result<(), BackendError> {
@@ -695,6 +981,28 @@ mod fake {
             std::thread::sleep(*self.stop_delay.lock().unwrap());
             self.log.lock().unwrap().push("stop_end".to_string());
             Ok(())
+        }
+
+        /// Like `stop`, but ends only the ask `ask_id` names.
+        fn stop_ask(&self, ask_id: &str) -> Result<(), BackendError> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            self.stop_ask_ids.lock().unwrap().push(ask_id.to_string());
+            if let Some(e) = self.stop_ask_error.lock().unwrap().clone() {
+                return Err(e);
+            }
+            self.log.lock().unwrap().push("stop_begin".to_string());
+            {
+                let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+                self.stopped_ids.lock().unwrap().insert(ask_id.to_string());
+                self.gate_changed.notify_all();
+            }
+            std::thread::sleep(*self.stop_delay.lock().unwrap());
+            self.log.lock().unwrap().push("stop_end".to_string());
+            Ok(())
+        }
+
+        fn own_tabs(&self) -> Option<u32> {
+            *self.own_tabs.lock().unwrap()
         }
 
         fn status(&self) -> Result<bool, BackendError> {
@@ -914,9 +1222,13 @@ mod tests {
                 text: "ok".into(),
                 conversation_url: Some("https://chatgpt.com/c/1".into()),
                 warning: Some("not in the project".into()),
+                diagnostics: AskDiagnostics::default(),
             }
         );
-        assert_eq!(host.join().unwrap()["project"], "cgpt-bridge");
+        let request = host.join().unwrap();
+        assert_eq!(request["project"], "cgpt-bridge");
+        // No capture unless asked for.
+        assert!(request.get("capture_stream").is_none());
         // Without a project the field is left out.
         let (ep, host) = fake_host(
             "no-project",
@@ -927,6 +1239,103 @@ mod tests {
             .unwrap();
         assert_eq!(answer.warning, None);
         assert!(host.join().unwrap().get("project").is_none());
+    }
+
+    #[test]
+    fn a_capturing_ask_asks_for_the_stream_and_returns_the_diagnostics() {
+        let (ep, host) = fake_host(
+            "capture",
+            serde_json::json!({"type":"ask_result","id":"gw_ask_c","text":"ok",
+                "conversation_url":"https://chatgpt.com/c/1",
+                "diagnostics":{"stream_check":{"stream_chars":4,"page_chars":8,"mismatch":true},
+                    "stream_capture":"data: {}\n\n"}}),
+        );
+        let answer = BridgeBackend::new(ep)
+            .ask_capturing("gw_ask_c", "hi", &ChatTarget::NewChat, None, &[], 5_000)
+            .unwrap();
+        assert_eq!(host.join().unwrap()["capture_stream"], true);
+        assert_eq!(
+            answer.diagnostics,
+            AskDiagnostics {
+                stream_check: Some(cgpt_bridge_protocol::StreamCheck {
+                    stream_chars: 4,
+                    page_chars: 8,
+                    mismatch: true
+                }),
+                stream_capture: Some("data: {}\n\n".into()),
+                stream_capture_dropped: false,
+            }
+        );
+    }
+
+    #[test]
+    fn bridge_backend_sends_the_files_and_leaves_the_field_out_without_them() {
+        let png = Attachment {
+            name: "image-1.png".into(),
+            mime: "image/png".into(),
+            data_base64: "iVBORw0KGgo=".into(),
+        };
+        let (ep, host) = fake_host(
+            "files",
+            serde_json::json!({"type":"ask_result","id":"gw_ask_f","text":"ok","conversation_url":"https://chatgpt.com/c/1"}),
+        );
+        BridgeBackend::new(ep)
+            .ask_with_files(
+                "gw_ask_f",
+                "hi",
+                &ChatTarget::NewChat,
+                None,
+                std::slice::from_ref(&png),
+                5_000,
+            )
+            .unwrap();
+        assert_eq!(
+            host.join().unwrap()["attachments"],
+            serde_json::json!([{"name":"image-1.png","mime":"image/png","data_base64":"iVBORw0KGgo="}])
+        );
+        let (ep, host) = fake_host(
+            "no-files",
+            serde_json::json!({"type":"ask_result","id":"gw_ask_g","text":"ok","conversation_url":"https://chatgpt.com/c/1"}),
+        );
+        BridgeBackend::new(ep)
+            .ask_in_project("gw_ask_g", "hi", &ChatTarget::NewChat, None, 5_000)
+            .unwrap();
+        assert!(host.join().unwrap().get("attachments").is_none());
+    }
+
+    #[test]
+    fn bridge_backend_records_whether_the_extension_takes_files() {
+        let status = |attachments: Option<bool>, extension: bool| {
+            let mut v = serde_json::json!({"type":"status_result","id":"x",
+                "extension":extension,"tab_open":true,"logged_in":true});
+            if let Some(a) = attachments {
+                v["attachments"] = serde_json::json!(a);
+            }
+            v
+        };
+        let pong = serde_json::json!({"type":"pong","id":"y","host_version":"0.0.1",
+            "build":"h1","echo":null,"ts_unix_ms":1});
+        let (ep, host) = fake_host_seq(
+            "takes-files",
+            vec![
+                status(Some(true), true),
+                pong.clone(),
+                // No extension: says nothing about it.
+                status(None, false),
+                // An extension without the field (older): no files.
+                status(None, true),
+                pong,
+            ],
+        );
+        let backend = BridgeBackend::new(ep);
+        assert!(!backend.attachments(), "nothing before a status");
+        assert_eq!(backend.status(), Ok(true));
+        assert!(backend.attachments());
+        assert_eq!(backend.status(), Ok(false));
+        assert!(backend.attachments());
+        assert_eq!(backend.status(), Ok(true));
+        assert!(!backend.attachments());
+        host.join().unwrap();
     }
 
     #[test]
@@ -1138,6 +1547,69 @@ mod tests {
         assert_eq!(request["type"], "stop");
         assert!(request["id"].as_str().unwrap().starts_with("gw_stop_"));
         assert_ne!(new_request_id("gw_stop"), new_request_id("gw_stop"));
+    }
+
+    #[test]
+    fn bridge_backend_stop_ask_names_the_ask() {
+        let (ep, host) = fake_host(
+            "stop-ask",
+            serde_json::json!({"type":"stopped","id":"x","was_generating":true}),
+        );
+        BridgeBackend::new(ep).stop_ask("gw_ask_1").unwrap();
+        let request = host.join().unwrap();
+        assert_eq!(request["type"], "stop_ask");
+        assert_eq!(request["ask_id"], "gw_ask_1");
+        assert!(request["id"].as_str().unwrap().starts_with("gw_stop_"));
+    }
+
+    #[test]
+    fn bridge_backend_stop_ask_on_a_host_without_it_is_outdated() {
+        // Whether the plain stop goes instead is engine::stop_request's call.
+        let (ep, host) = fake_host(
+            "stop-ask-old",
+            serde_json::json!({"type":"error","id":"x","code":"bad_request",
+                "message":"invalid request: unknown variant `stop_ask`, expected `ask` or `ping`"}),
+        );
+        assert_eq!(
+            BridgeBackend::new(ep).stop_ask("gw_ask_2"),
+            Err(BackendError::Outdated)
+        );
+        assert_eq!(host.join().unwrap()["type"], "stop_ask");
+    }
+
+    #[test]
+    fn bridge_backend_records_own_tabs_from_the_last_status_an_extension_answered() {
+        let status = |own_tabs: Option<u32>, extension: bool| {
+            let mut v = serde_json::json!({"type":"status_result","id":"x",
+                "extension":extension,"tab_open":true,"logged_in":true});
+            if let Some(n) = own_tabs {
+                v["own_tabs"] = serde_json::json!(n);
+            }
+            v
+        };
+        let pong = serde_json::json!({"type":"pong","id":"y","host_version":"0.0.1",
+            "build":"h1","echo":null,"ts_unix_ms":1});
+        let (ep, host) = fake_host_seq(
+            "own-tabs",
+            vec![
+                status(Some(8), true),
+                pong.clone(),
+                // No extension: says nothing about its tabs.
+                status(None, false),
+                // An extension without the field (older): none.
+                status(None, true),
+                pong,
+            ],
+        );
+        let backend = BridgeBackend::new(ep);
+        assert_eq!(backend.own_tabs(), None, "nothing before a status");
+        assert_eq!(backend.status(), Ok(true));
+        assert_eq!(backend.own_tabs(), Some(8));
+        assert_eq!(backend.status(), Ok(false));
+        assert_eq!(backend.own_tabs(), Some(8));
+        assert_eq!(backend.status(), Ok(true));
+        assert_eq!(backend.own_tabs(), None);
+        host.join().unwrap();
     }
 
     #[test]

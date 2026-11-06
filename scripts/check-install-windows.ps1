@@ -81,6 +81,7 @@ $OcDir = Join-Path $env:USERPROFILE '.config\opencode'
 $Oc = Join-Path $OcDir 'opencode.json'
 $AgentDir = Join-Path $OcDir 'agents'
 $Agent = Join-Path $AgentDir 'cgpt.md'
+$Sub = Join-Path $AgentDir 'cgpt-sub.md'
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $GatewayExe = Join-Path $App 'bin\cgpt-gateway.exe'
 $Launcher = Join-Path $App 'start-gateway.ps1'
@@ -105,8 +106,10 @@ function ReadJson($path) { [System.IO.File]::ReadAllText($path) | ConvertFrom-Js
 function Compact($obj) { if ($null -eq $obj) { '' } else { ConvertTo-Json -InputObject $obj -Depth 32 -Compress } }
 function Has($obj, $name) { $null -ne $obj -and $null -ne $obj.PSObject.Properties[$name] }
 function FileHashOf($path) { if (Test-Path -LiteralPath $path -PathType Leaf) { (Get-FileHash -LiteralPath $path).Hash } else { 'missing' } }
-# The line the installer prints right after "==> OpenCode agent cgpt: ...".
-function AgentLine([string]$out) { if ($out -match '==> OpenCode agent cgpt[^\n]*\n([^\r\n]*)') { $Matches[1] } else { '' } }
+# The line the installer prints right after "==> OpenCode agent cgpt: ..."
+# (and after "==> OpenCode agent cgpt-sub: ...").
+function AgentLine([string]$out) { if ($out -match '==> OpenCode agent cgpt: [^\n]*\n([^\r\n]*)') { $Matches[1] } else { '' } }
+function SubLine([string]$out) { if ($out -match '==> OpenCode agent cgpt-sub: [^\n]*\n([^\r\n]*)') { $Matches[1] } else { '' } }
 function Run($file, [string[]]$extra = @()) {
   $out = & $Shell -NoProfile -ExecutionPolicy Bypass -File $file @extra 2>&1 | Out-String
   return @{ Code = $LASTEXITCODE; Out = $out }
@@ -180,6 +183,7 @@ try {
   Copy-Item -LiteralPath $Bundle -Destination (Join-Path $Work 'bundle') -Recurse
   $Bundle = Join-Path $Work 'bundle'
   $AgentSrc = Join-Path $Bundle 'opencode-agent-cgpt.md'
+  $SubSrc = Join-Path $Bundle 'opencode-agent-cgpt-sub.md'
   Set-Content -LiteralPath (Join-Path $Bundle 'bin\cgpt-gateway.exe') -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3"
 
   # -------------------------------------------------------------------------
@@ -262,14 +266,59 @@ try {
   Check 'opencode.json gets no agent key' (-not (Has $ocJson 'agent'))
   Check 'opencode.json gets no default_agent' (-not (Has $ocJson 'default_agent'))
 
+  # Rules match last to first, so where it matters the order is checked:
+  # opencode_* is denied before the two MCP resource readers ask again, and
+  # in read: the .env rules (both cases) come after "*": allow, with
+  # .env.example allowed last. grep asks: it is checked against the search
+  # pattern, not the path, so an allowed grep could print a .env file.
+  function AgentRuleOrder([string]$name, [string[]]$lines) {
+    $mcp = @($lines | Where-Object { $_ -ceq '  "opencode_*": deny' -or $_ -ceq '  opencode_list_mcp_resources: ask' -or $_ -ceq '  opencode_read_mcp_resource: ask' })
+    Eq "${name}: opencode_* denied, then the MCP resource readers ask" ($mcp -join '|') `
+      '  "opencode_*": deny|  opencode_list_mcp_resources: ask|  opencode_read_mcp_resource: ask'
+    $at = [Array]::IndexOf($lines, '  read:')
+    $block = if ($at -ge 0) { $lines[$at..([Math]::Min($at + 6, $lines.Count - 1))] } else { @() }
+    Eq "${name}: read allowed, .env and .ENV ask, .env.example allowed last" ($block -join '|') `
+      '  read:|    "*": allow|    "*.env": ask|    "*.env.*": ask|    "*.ENV": ask|    "*.ENV.*": ask|    "*.env.example": allow'
+    Check "${name}: grep asks" ($lines -ccontains '  grep: ask')
+  }
+
   Check 'agent cgpt created' (Test-Path -LiteralPath $Agent -PathType Leaf)
   Eq 'agent file is the bundled template' (FileHashOf $Agent) (FileHashOf $AgentSrc)
   $agentBytes = if (Test-Path -LiteralPath $Agent -PathType Leaf) { [System.IO.File]::ReadAllBytes($Agent) } else { [byte[]]@() }
   $agentLines = $Utf8NoBom.GetString($agentBytes).Split([char]10)
   foreach ($line in 'model: cgpt/chatgpt-web', 'mode: primary', '  bash: ask', '  edit: ask', '  webfetch: ask',
-                    '  task: deny', '  question: allow') {
+                    '  skill: ask', '  execute: deny', '  "opencode_*": deny', '  task:', '  subagent:', '  question: allow') {
     Check "agent file has '$line'" ($agentLines -ccontains $line)
   }
+  # Everything not named below asks (MCP tools have no common name): the
+  # catch-all must be the first rule, since rules match last to first.
+  $permAt = [Array]::IndexOf($agentLines, 'permission:')
+  Eq 'agent cgpt asks for everything by default (first rule)' $(if ($permAt -ge 0 -and $permAt + 1 -lt $agentLines.Count) { $agentLines[$permAt + 1] } else { '' }) '  "*": ask'
+  # task (OpenCode before 2.1) and subagent (2.1 and later): deny all, then
+  # allow cgpt-sub. Rules match last to first, so the order matters.
+  $subRules = @()
+  for ($i = 0; $i -lt $agentLines.Count; $i++) {
+    if ($agentLines[$i] -cmatch '^  (task|subagent):$') { $subRules += $agentLines[$i..([Math]::Min($i + 2, $agentLines.Count - 1))] }
+  }
+  Eq 'agent cgpt may start only cgpt-sub, under both permission names' ($subRules -join '|') `
+    '  task:|    "*": deny|    cgpt-sub: allow|  subagent:|    "*": deny|    cgpt-sub: allow'
+  AgentRuleOrder 'agent cgpt' $agentLines
+  Check 'subagent cgpt-sub created' (Test-Path -LiteralPath $Sub -PathType Leaf)
+  Eq 'subagent file is the bundled template' (FileHashOf $Sub) (FileHashOf $SubSrc)
+  $subBytes = if (Test-Path -LiteralPath $Sub -PathType Leaf) { [System.IO.File]::ReadAllBytes($Sub) } else { [byte[]]@() }
+  $subLines = $Utf8NoBom.GetString($subBytes).Split([char]10)
+  foreach ($line in 'model: cgpt/chatgpt-web', 'mode: subagent', '  bash: ask', '  shell: ask', '  edit: ask',
+                    '  webfetch: ask', '  skill: ask', '  execute: deny', '  "opencode_*": deny', '  task: deny', '  subagent: deny') {
+    Check "subagent file has '$line'" ($subLines -ccontains $line)
+  }
+  $permAt = [Array]::IndexOf($subLines, 'permission:')
+  Eq 'subagent cgpt-sub asks for everything by default (first rule)' $(if ($permAt -ge 0 -and $permAt + 1 -lt $subLines.Count) { $subLines[$permAt + 1] } else { '' }) '  "*": ask'
+  AgentRuleOrder 'subagent cgpt-sub' $subLines
+  Check 'the subagent description is plain YAML and carries our mark' (@($subLines | Where-Object { $_ -cmatch '^description: ChatGPT Web \(bridge\)[^:]+$' }).Count -eq 1)
+  Check 'subagent file has LF line ends only' (@($subBytes | Where-Object { $_ -eq 13 }).Count -eq 0)
+  Check 'the bundled subagent template has LF line ends only' (@([System.IO.File]::ReadAllBytes($SubSrc) | Where-Object { $_ -eq 13 }).Count -eq 0)
+  Check 'installer says the subagent was added' ($r.Out -match 'agent cgpt-sub: added')
+  Check 'installer tells that cgpt may start only cgpt-sub' ($r.Out -match 'it may start only cgpt-sub')
   Check "the agent description is plain YAML (no ': ' in the value)" (@($agentLines | Where-Object { $_ -cmatch '^description: [^:]+$' }).Count -eq 1)
   Check 'agent file has LF line ends only' (@($agentBytes | Where-Object { $_ -eq 13 }).Count -eq 0)
   Check 'agent file has no BOM' (-not ($agentBytes.Length -ge 3 -and $agentBytes[0] -eq 0xEF -and $agentBytes[1] -eq 0xBB -and $agentBytes[2] -eq 0xBF))
@@ -308,7 +357,8 @@ try {
   Eq 'uninstall.ps1 exits 0' $r.Code 0
   if ($r.Code -ne 0) { Write-Host $r.Out }
   Eq 'uninstall stops the gateway' (GatewayProcesses).Count 0
-  foreach ($f in 'bin', 'extension', 'uninstall.ps1', 'gateway.log', 'com.cgpt_bridge.host.json', 'opencode-agent-cgpt.md') {
+  foreach ($f in 'bin', 'extension', 'uninstall.ps1', 'gateway.log', 'com.cgpt_bridge.host.json', 'opencode-agent-cgpt.md',
+                 'opencode-agent-cgpt-sub.md') {
     Check "uninstall removes $f" (-not (Test-Path -LiteralPath (Join-Path $App $f)))
   }
   Check 'uninstall keeps a foreign file in the install dir' (Test-Path -LiteralPath (Join-Path $App 'notes.txt'))
@@ -328,6 +378,7 @@ try {
   Eq 'uninstall keeps the other provider' (Compact $ocJson.provider.anthropic) (Compact $orig.provider.anthropic)
   Eq 'uninstall keeps UTF-8' (@($ocJson.instructions)[0]) $RuText
   Check 'uninstall removes agent cgpt' (-not (Test-Path -LiteralPath $Agent))
+  Check 'uninstall removes subagent cgpt-sub' (-not (Test-Path -LiteralPath $Sub))
   Check 'uninstall removes the agents folder it left empty' (-not (Test-Path -LiteralPath $AgentDir))
   Remove-Item -LiteralPath $App -Recurse -Force
 
@@ -445,7 +496,7 @@ try {
   $bundleV2 = Join-Path $Work 'bundle-v2'
   Copy-Item -LiteralPath $Bundle -Destination $bundleV2 -Recurse
   $srcV2 = Join-Path $bundleV2 'opencode-agent-cgpt.md'
-  [System.IO.File]::WriteAllText($srcV2, ([System.IO.File]::ReadAllText($srcV2)).Replace("edits and web fetches`n", "edits and web fetches (v2)`n"), $Utf8NoBom)
+  [System.IO.File]::WriteAllText($srcV2, ([System.IO.File]::ReadAllText($srcV2)).Replace("MCP tools and skills`n", "MCP tools and skills (v2)`n"), $Utf8NoBom)
   Check 'the v2 template differs from v1' ((FileHashOf $srcV2) -ne (FileHashOf $AgentSrc))
   $r = Run (Join-Path $bundleV2 'install.ps1') @('-NoStart')
   Eq 'an update to a changed template exits 0' $r.Code 0
@@ -515,6 +566,39 @@ try {
   }
   Remove-Item -LiteralPath $Agent -Force
 
+  # A cgpt-sub the user wrote is not ours: left alone by install and
+  # uninstall, and install warns, since agent cgpt may start it.
+  New-Item -ItemType Directory -Force -Path $AgentDir | Out-Null
+  [System.IO.File]::WriteAllText($Sub, "---`ndescription: my own helper`nmode: subagent`n---`nBe brief.`n", $Utf8NoBom)
+  $foreignSubHash = FileHashOf $Sub
+  $r = Install @('-NoStart')
+  Eq 'install.ps1 next to a foreign cgpt-sub exits 0' $r.Code 0
+  Eq 'install does not overwrite a foreign cgpt-sub' (FileHashOf $Sub) $foreignSubHash
+  Check 'install says the subagent was not added' ((SubLine $r.Out) -match 'not added')
+  # Windows PowerShell 5.1 wraps long output lines at the console width.
+  Check 'install warns that cgpt may start the foreign cgpt-sub' (($r.Out -replace '\r?\n', '') -match 'agent cgpt may start cgpt-sub, which is not ours')
+  Eq 'agent cgpt is still added' (FileHashOf $Agent) (FileHashOf $AgentSrc)
+  $r = Uninstall
+  Eq 'uninstall.ps1 exits 0' $r.Code 0
+  Eq 'uninstall keeps a foreign cgpt-sub' (FileHashOf $Sub) $foreignSubHash
+  Check 'uninstall removes agent cgpt next to a foreign cgpt-sub' (-not (Test-Path -LiteralPath $Agent))
+  Remove-Item -LiteralPath $Sub -Force
+  # An edited cgpt-sub of ours is replaced and kept as cgpt-sub.md.bak.
+  $r = Install @('-NoStart')
+  Eq 'install.ps1 exits 0' $r.Code 0
+  $subEdited = ([System.IO.File]::ReadAllText($Sub)).Replace('  shell: ask', '  shell: allow')
+  [System.IO.File]::WriteAllText($Sub, $subEdited, $Utf8NoBom)
+  $subEditedHash = FileHashOf $Sub
+  $r = Install @('-NoStart')
+  Eq 'install.ps1 over an edited cgpt-sub exits 0' $r.Code 0
+  Eq 'an edited cgpt-sub of ours is replaced' (FileHashOf $Sub) (FileHashOf $SubSrc)
+  Eq 'the edited cgpt-sub is kept as cgpt-sub.md.bak' (FileHashOf "$Sub.bak") $subEditedHash
+  Check 'install says where the edited cgpt-sub went' ((SubLine $r.Out) -match 'agent cgpt-sub: updated \(previous saved as cgpt-sub\.md\.bak\)')
+  $r = Uninstall
+  Eq 'uninstall.ps1 exits 0' $r.Code 0
+  Check 'uninstall removes an unedited cgpt-sub' (-not (Test-Path -LiteralPath $Sub))
+  Remove-Item -LiteralPath "$Sub.bak" -Force -ErrorAction SilentlyContinue
+
   # default_agent cgpt (the user made our agent the default) would point at
   # nothing once the agent is gone: uninstall drops it, like a cgpt/ model.
   [System.IO.File]::WriteAllText($Oc, '{ "default_agent": "cgpt", "theme": "dark" }')
@@ -574,6 +658,7 @@ try {
     $r = Uninstall
     Eq 'uninstall.ps1 exits 0' $r.Code 0
     Check 'uninstall removes agent cgpt from the linked folder' (-not (Test-Path -LiteralPath (Join-Path $dotAgents 'cgpt.md')))
+    Check 'uninstall removes subagent cgpt-sub from the linked folder' (-not (Test-Path -LiteralPath (Join-Path $dotAgents 'cgpt-sub.md')))
     Eq 'uninstall keeps the agents link' ((Get-Item -LiteralPath $AgentDir -Force -ErrorAction SilentlyContinue).LinkType) 'SymbolicLink'
     [System.IO.Directory]::Delete($AgentDir)
   }

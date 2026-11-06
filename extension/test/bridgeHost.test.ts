@@ -13,6 +13,7 @@ import { readFileSync } from "node:fs";
 // bridge.ts reads the `chrome` global when it loads; the fake goes first.
 import { resetWorld, useTabs, world, type ContentReply } from "./harness/fakeChrome";
 import { startBridge } from "../src/bridge";
+import { OWN_TABS_MAX } from "../src/targetTab";
 import {
   EXTENSION_BUILD,
   MAX_HOST_FRAME_BYTES,
@@ -53,8 +54,10 @@ let tabs: FakeTabs;
 beforeEach(() => {
   resetWorld();
   tabs = fakeTabs({ id: TAB_ID, status: "complete", url: CHAT_URL });
+  (tabs.tab as { windowId?: number }).windowId = 1;
   useTabs(tabs);
-  // The own tab the gateway's asks run in.
+  // The own window the gateway's asks run in, with one tab (the earlier
+  // single-tab record, read as a pool of one).
   world.session.ownTab = { windowId: 1, tabId: TAB_ID };
   // Every test starts with a host that reported no build (an older one), so
   // the order of the tests cannot decide whether `cancelled` goes out.
@@ -135,6 +138,39 @@ test("bridgeHost.the_project_reaches_the_page_and_its_warning_the_host", async (
   assert.deepEqual(sent?.target, ask.target);
 });
 
+test("bridgeHost.capture_stream_reaches_the_page_and_its_diagnostics_the_host", async () => {
+  const want = fixture("response_ask_result_diagnostics");
+  const wire = want.diagnostics as {
+    stream_check: { stream_chars: number; page_chars: number; mismatch: boolean };
+    stream_capture: string;
+  };
+  world.content = async (_id, req) => ({
+    id: req.id,
+    ok: true,
+    kind: "test.ask",
+    text: want.text as string,
+    conversationUrl: want.conversation_url as string,
+    diagnostics: {
+      streamCheck: {
+        streamChars: wire.stream_check.stream_chars,
+        pageChars: wire.stream_check.page_chars,
+        mismatch: wire.stream_check.mismatch,
+      },
+      streamCapture: wire.stream_capture,
+    },
+  });
+  receive(fixture("request_ask_conversation_capture"));
+  await until(() => posted("a6").length > 0);
+  assert.deepEqual(world.posted, [want]);
+  assert.equal(askSends()[0]?.captureStream, true);
+
+  // Only `true` asks for it.
+  world.content = async (_id, req) => answer(req);
+  receive({ ...fixture("request_ask_conversation_capture"), id: "a7", capture_stream: "yes" });
+  await until(() => posted("a7").length > 0);
+  assert.equal(askSends()[1]?.captureStream, undefined);
+});
+
 test("bridgeHost.a_bad_project_is_refused_before_the_page", async () => {
   world.content = async (_id, req) => answer(req);
   for (const [i, project] of ["", " padded", "a\u0007b", "я".repeat(101), 42].entries()) {
@@ -142,6 +178,37 @@ test("bridgeHost.a_bad_project_is_refused_before_the_page", async () => {
     receive({ ...fixture("request_ask_new_chat_project"), id, project });
     await until(() => posted(id).length > 0);
     assert.equal(posted(id)[0]?.code, "bad_request", JSON.stringify(project));
+  }
+  assert.equal(askSends().length, 0);
+});
+
+test("bridgeHost.the_files_of_an_ask_reach_the_page", async () => {
+  world.content = async (_id, req) => answer(req);
+  const ask = fixture("request_ask_conversation_attachments");
+  receive(ask);
+  await until(() => posted("a6").length > 0);
+  assert.equal(posted("a6")[0]?.type, "ask_result");
+  const [sent] = askSends();
+  const [file] = ask.attachments as Array<Record<string, string>>;
+  assert.deepEqual(sent?.attachments, [{ name: file!.name, mime: file!.mime, dataBase64: file!.data_base64 }]);
+});
+
+test("bridgeHost.bad_files_are_refused_before_the_page", async () => {
+  world.content = async (_id, req) => answer(req);
+  const good = (fixture("request_ask_conversation_attachments").attachments as unknown[])[0] as Record<string, string>;
+  const bad: unknown[] = [
+    "not a list",
+    [{ ...good, name: "../etc/passwd" }],
+    [{ ...good, mime: "image/svg+xml" }],
+    [{ ...good, data_base64: "not base64!" }],
+    [{ ...good, data_base64: "" }],
+    Array.from({ length: 11 }, () => good),
+  ];
+  for (const [i, attachments] of bad.entries()) {
+    const id = `badfile-${i}`;
+    receive({ ...fixture("request_ask_conversation_attachments"), id, attachments });
+    await until(() => posted(id).length > 0);
+    assert.equal(posted(id)[0]?.code, "bad_request", JSON.stringify(attachments).slice(0, 80));
   }
   assert.equal(askSends().length, 0);
 });
@@ -307,6 +374,55 @@ test("bridgeHost.a_stop_while_the_page_scripts_go_in_ends_the_ask_at_once_and_no
 
   await advance(2_000);
   assert.equal(askSends().length, 1, "only the first send, which nobody received");
+});
+
+// Review N1: a `stop_ask` while the page scripts go in for an ask (the tab
+// had no content script) finds no receiver either. The ask then ends
+// cancelled without being sent, so the host is told `not_sent`, not
+// "nothing was generating" (which the CLI printed as "not stopped").
+test("bridgeHost.stop_ask_while_the_page_scripts_go_in_says_the_prompt_was_not_sent", async () => {
+  const quiet = mock.method(console, "warn", () => {});
+  try {
+    receive(fixture("response_pong"));
+  } finally {
+    quiet.mock.restore();
+  }
+  world.inject = (i) =>
+    i.file !== "content.js"
+      ? Promise.resolve()
+      : new Promise<void>((resolve) =>
+          setTimeout(() => {
+            world.content = async (_id, req) => answer(req);
+            resolve();
+          }, 1_000),
+        );
+  world.content = async () => ({ lastError: NO_LISTENER });
+  receive(fixture("request_ask_conversation")); // a2, the gateway's
+  await until(() => world.injected.some((i) => i.file === "content.js"));
+
+  receive({ ...fixture("request_stop_ask"), ask_id: "a2" });
+  await until(() => posted("s2").length > 0 && posted("a2").length > 0);
+  assert.deepEqual(posted("s2"), [fixture("response_stopped_not_sent")]);
+  assert.deepEqual(posted("a2"), [errorFrame("a2", "cancelled", "cancelled by stop")]);
+  await advance(2_000);
+  assert.equal(askSends().length, 1, "only the first send, which nobody received");
+});
+
+// Between page loads after the request was received (the page reloaded
+// mid-answer): the stop finds no receiver, but the prompt may be in the
+// chat, so it is not called "not sent".
+test("bridgeHost.stop_ask_with_no_receiver_after_the_ask_was_received_is_not_called_not_sent", async () => {
+  withUserTab();
+  const cli = gate();
+  world.content = (_tabId, req) =>
+    req.type === "test.ask" ? cli.promise : Promise.resolve({ lastError: NO_LISTENER });
+  receive(fixture("request_ask"));
+  await until(() => askSends().length === 1);
+  receive(fixture("request_stop_ask"));
+  await until(() => posted("s2").length > 0);
+  assert.deepEqual(posted("s2"), [stoppedFrame("s2", false)]);
+  cli.release({ id: askSends()[0]!.id, ok: false, errorCode: "cancelled", message: "cancelled by stop" });
+  await until(() => posted("a1").length > 0);
 });
 
 test("bridgeHost.a_tab_that_left_chatgpt_gets_nothing_injected_and_is_named_without_its_query", async () => {
@@ -886,10 +1002,20 @@ test("bridgeHost.status_without_an_own_tab_says_the_tab_is_not_open", async () =
   world.session = {};
   receive(fixture("request_status"));
   await until(() => posted("t1").length > 0);
+  // How many own tabs the extension keeps, and that it takes an ask's files,
+  // go out with no tab open as well.
   assert.deepEqual(world.posted, [
-    statusResultFrame("t1", { tabOpen: false, loggedIn: false, conversationUrl: null }),
+    statusResultFrame("t1", {
+      tabOpen: false,
+      loggedIn: false,
+      conversationUrl: null,
+      ownTabs: OWN_TABS_MAX,
+      attachments: true,
+    }),
   ]);
-  assert.deepEqual(keysOf(world.posted[0]!), keysOf(fixture("response_status_result")));
+  assert.equal(world.posted[0]?.own_tabs, 8);
+  assert.equal(world.posted[0]?.attachments, true);
+  assert.deepEqual(keysOf(world.posted[0]!), keysOf(fixture("response_status_result_attachments")));
   assert.equal(world.sent.length, 0);
 });
 
@@ -908,6 +1034,8 @@ test("bridgeHost.status_takes_login_and_chat_from_the_page", async () => {
       tabOpen: true,
       loggedIn: true,
       conversationUrl: "https://chatgpt.com/c/from-page",
+      ownTabs: OWN_TABS_MAX,
+      attachments: true,
     }),
   ]);
 });
@@ -917,8 +1045,10 @@ test("bridgeHost.status_of_a_page_that_does_not_answer_is_not_logged_in_with_the
   receive(fixture("request_status"));
   await until(() => posted("t1").length > 0);
   // The very frame of the fixture: open, not logged in, the chat of the URL
-  // (and this extension's build).
-  assert.deepEqual(world.posted, [{ ...fixture("response_status_result"), build: EXTENSION_BUILD }]);
+  // (and this extension's build, own tab count and files).
+  assert.deepEqual(world.posted, [
+    { ...fixture("response_status_result"), build: EXTENSION_BUILD, own_tabs: OWN_TABS_MAX, attachments: true },
+  ]);
 });
 
 test("bridgeHost.status_of_a_tab_that_left_chatgpt_says_the_tab_is_not_open", async () => {

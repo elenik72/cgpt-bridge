@@ -1,0 +1,1 @@
+{ "type": "ask", "id": "a6", "text": "what is on the screenshot?", "timeout_ms": 60000, "target": { "kind": "conversation", "url": "https://chatgpt.com/c/abc-123" }, "attachments": [{ "name": "image-1.png", "mime": "image/png", "data_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==" }] }

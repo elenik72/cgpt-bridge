@@ -254,7 +254,7 @@ pub fn safe_text(raw: &str) -> String {
 /// Columns a character takes on the terminal, overestimated on purpose (a
 /// row that wraps early is harmless, one that the terminal wraps is not): a
 /// tab can jump up to 8, any non-ASCII character is counted as double width.
-fn char_cols(c: char) -> usize {
+pub(crate) fn char_cols(c: char) -> usize {
     match c {
         '\t' => 8,
         c if c.is_ascii() => 1,

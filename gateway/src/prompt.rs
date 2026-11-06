@@ -23,6 +23,7 @@ const RULES: &str = "Правила шлюза
 ```
 
 - Перед блоком можно написать короткий текст.
+- Метка блока — ровно tool_calls, без id и других дописок в той же строке.
 - Несколько вызовов в одном блоке допустимы. Блок tool_calls в ответе — только один.
 - Имена инструментов и параметров — только из списка инструментов ниже; обязательные параметры указывай всегда.
 - Без блока ответ считается окончательным текстом для пользователя.
@@ -30,7 +31,7 @@ const RULES: &str = "Правила шлюза
 - Отвечай на языке пользователя.";
 
 /// The one-line format reminder at the end of every message.
-pub const REMINDER: &str = "Напоминание: чтобы вызвать инструменты, ответь одним блоком ```tool_calls с JSON-массивом [{\"name\": \"...\", \"arguments\": {...}}]; без блока ответ — окончательный текст для пользователя.";
+pub const REMINDER: &str = "Напоминание: чтобы вызвать инструменты, ответь одним блоком ```tool_calls (метка ровно tool_calls, без id) с JSON-массивом [{\"name\": \"...\", \"arguments\": {...}}]; без блока ответ — окончательный текст для пользователя.";
 /// Opens the first message to a chat whose previous turn was cut off.
 pub const INTERRUPTED_NOTE: &str =
     "Предыдущее сообщение прервано, ответ на него не нужен; продолжаем с этого места.";
@@ -252,8 +253,9 @@ fn enum_values(schema: &Value) -> Option<String> {
 /// User messages (the original task included), the system prompt and the
 /// latest step are never dropped. When they alone exceed two parts, the
 /// pack is sent in more parts; every part is still at most
-/// `MAX_MESSAGE_CHARS`.
-pub fn bootstrap(req: &ChatRequest, allow: &[String]) -> Vec<String> {
+/// `MAX_MESSAGE_CHARS`. When the last part carries files, it leaves them
+/// `room` (see [`split_after_room`]); `usize::MAX` without files.
+pub fn bootstrap_room(req: &ChatRequest, allow: &[String], room: usize) -> Vec<String> {
     let system: Vec<String> = req
         .messages
         .iter()
@@ -307,12 +309,16 @@ pub fn bootstrap(req: &ChatRequest, allow: &[String]) -> Vec<String> {
     while first_kept < last_step && fixed + pack_chars(&items, first_kept) > BOOTSTRAP_BUDGET {
         first_kept += 1;
     }
-    split(&format!(
+    let text = format!(
         "{}{}{}",
         head,
         pack_blocks(&items, first_kept).join("\n\n"),
         tail
-    ))
+    );
+    split_after_room(&redact(&text, "").stdout, 0, room)
+        .into_iter()
+        .map(|(part, _)| part)
+        .collect()
 }
 
 /// Cut the full results of `step` so that the whole pack (`total` now) fits:
@@ -371,6 +377,12 @@ fn pack_chars(items: &[Item], first_kept: usize) -> usize {
         lens.push(chars(&omitted_note(first_kept)));
     }
     lens.iter().sum::<usize>() + 2 * lens.len().saturating_sub(1)
+}
+
+/// [`bootstrap_room`] without files.
+#[cfg(test)]
+pub fn bootstrap(req: &ChatRequest, allow: &[String]) -> Vec<String> {
+    bootstrap_room(req, allow, usize::MAX)
 }
 
 /// The parts of [`delta_text`].
@@ -445,7 +457,16 @@ pub fn split_redacted(text: &str) -> Vec<(String, usize)> {
 /// parts the chat has: its parts are numbered on from `answered + 1`, a
 /// single one too.
 pub fn split_after(text: &str, answered: usize) -> Vec<(String, usize)> {
-    if answered == 0 && chars(text) <= MAX_MESSAGE_CHARS {
+    split_after_room(text, answered, usize::MAX)
+}
+
+/// [`split_after`] of a message whose last part carries files (see
+/// `images`): that part, with its header, takes at most `room` bytes as a
+/// JSON string, the rest of the bridge frame being the files'. What does not
+/// fit goes into a part of its own before it, cut at a line break when one is
+/// near.
+pub fn split_after_room(text: &str, answered: usize, room: usize) -> Vec<(String, usize)> {
+    if answered == 0 && chars(text) <= MAX_MESSAGE_CHARS && json_len(text) <= room {
         return vec![(text.to_string(), text.len())];
     }
     let mut chunks: Vec<&str> = Vec::new();
@@ -466,6 +487,13 @@ pub fn split_after(text: &str, answered: usize) -> Vec<(String, usize)> {
         };
         chunks.push(&rest[..cut]);
         rest = &rest[cut..];
+    }
+    if let Some(last) = chunks.pop() {
+        let start = tail_start(last, room.saturating_sub(HEADER_JSON_RESERVE));
+        if start > 0 {
+            chunks.push(&last[..start]);
+        }
+        chunks.push(&last[start..]);
     }
     let m = answered + chunks.len();
     let mut end = 0;
@@ -593,6 +621,48 @@ fn clip_note(cap: usize, total: usize) -> String {
 
 fn clean(text: &str) -> String {
     redact(text, "").stdout
+}
+
+/// Room for a part's "часть N из M" header as JSON (at most 50 characters,
+/// two bytes each in UTF-8).
+const HEADER_JSON_RESERVE: usize = 256;
+
+/// Bytes `c` takes inside a JSON string as serde_json writes it.
+fn json_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Bytes of `s` inside a JSON string (without the quotes).
+fn json_len(s: &str) -> usize {
+    s.chars().map(json_char_len).sum()
+}
+
+/// Where the tail of `s` that takes at most `limit` bytes of JSON starts
+/// (0: all of it fits). The tail starts after a line break when one is
+/// within `LINE_WINDOW` characters past the tightest cut.
+fn tail_start(s: &str, limit: usize) -> usize {
+    if json_len(s) <= limit {
+        return 0;
+    }
+    let mut used = 0;
+    let mut start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        used += json_char_len(c);
+        if used > limit {
+            break;
+        }
+        start = i;
+    }
+    match s[start..].find('\n') {
+        Some(nl) if start + nl + 1 < s.len() && chars(&s[start..start + nl]) < LINE_WINDOW => {
+            start + nl + 1
+        }
+        _ => start,
+    }
 }
 
 fn chars(s: &str) -> usize {
@@ -819,6 +889,53 @@ mod tests {
         assert!(!t.contains("### execute"));
         assert!(t.contains("- command: string [required]"));
         assert!(t.contains("Прочитай a.txt и скажи, что в нём"));
+    }
+
+    /// OpenCode 2.2.5 captures (fake provider, one MCP server `demo` with the
+    /// tool `echo_text`). With Code Mode on (agent `build`) MCP tools come only
+    /// inside `execute`, which ChatGPT is not shown; the plain tools still come
+    /// directly. With `execute: deny` (agent `cgpt`) the MCP tool is a plain one.
+    #[test]
+    fn opencode_225_code_mode_keeps_plain_tools_and_mcp_needs_execute_denied() {
+        let plain = [
+            "glob",
+            "grep",
+            "patch",
+            "question",
+            "read",
+            "shell",
+            "skill",
+            "subagent",
+            "webfetch",
+            "websearch",
+        ];
+        let code_mode: ChatRequest =
+            serde_json::from_str(include_str!("../tests/fixtures/opencode-225-codemode.json"))
+                .unwrap();
+        let t = &bootstrap(&code_mode, &[])[0];
+        for name in plain {
+            assert!(
+                t.contains(&format!("### {}\n", name)),
+                "tool {} missing",
+                name
+            );
+        }
+        assert!(!t.contains("### execute"));
+        assert!(!t.contains("### demo_echo_text"));
+        let agent: ChatRequest = serde_json::from_str(include_str!(
+            "../tests/fixtures/opencode-225-agent-cgpt.json"
+        ))
+        .unwrap();
+        let t = &bootstrap(&agent, &[])[0];
+        for name in plain.iter().chain(&["demo_echo_text"]) {
+            assert!(
+                t.contains(&format!("### {}\n", name)),
+                "tool {} missing",
+                name
+            );
+        }
+        assert!(!t.contains("### execute"));
+        assert!(!t.contains("# Code Mode"));
     }
 
     #[test]
@@ -1206,5 +1323,74 @@ mod tests {
         );
         // Nothing answered: as before.
         assert_eq!(split_after("коротко", 0), split_redacted("коротко"));
+    }
+}
+
+#[cfg(test)]
+mod room_tests {
+    use super::*;
+
+    /// The pieces of `parts` without their headers, each checked against
+    /// the offset it came with, put together.
+    fn pieces(text: &str, parts: &[(String, usize)]) -> String {
+        let mut prev = 0;
+        let mut out = String::new();
+        for (part, end) in parts {
+            let body = part.split_once("\n\n").unwrap().1;
+            assert_eq!(&text[prev..*end], body);
+            prev = *end;
+            out.push_str(body);
+        }
+        out
+    }
+
+    #[test]
+    fn the_part_that_carries_files_leaves_them_room_in_the_frame() {
+        // Quotes and tabs take two bytes as JSON, Cyrillic two in UTF-8.
+        let text = "строка с \"кавычками\" и\tтабуляцией\n".repeat(3_000);
+        assert!(chars(&text) <= MAX_MESSAGE_CHARS);
+        let room = 60_000;
+        let parts = split_after_room(&text, 0, room);
+        assert_eq!(parts.len(), 2, "one message fits the chat, not the frame");
+        assert!(json_len(&parts[1].0) <= room);
+        assert!(parts[0].0.starts_with("часть 1 из 2, ответь словом ok\n\n"));
+        assert!(parts[1].0.starts_with("часть 2 из 2, последняя\n\n"));
+        // Cut at a line break, and nothing lost or doubled.
+        assert!(parts[0].0.ends_with('\n'));
+        assert_eq!(pieces(&text, &parts), text);
+        // Without files the same text is one part, as before.
+        assert_eq!(split_after_room(&text, 0, usize::MAX), split_after(&text, 0));
+        assert_eq!(split_after(&text, 0).len(), 1);
+        // A short text that fits stays one part without a header.
+        assert_eq!(
+            split_after_room("коротко", 0, room),
+            vec![("коротко".to_string(), "коротко".len())]
+        );
+    }
+
+    #[test]
+    fn a_long_message_with_files_ends_in_a_short_last_part() {
+        let text = "строка данных\n".repeat(MAX_MESSAGE_CHARS * 3 / 2 / 14);
+        let room = 50_000;
+        let parts = split_after_room(&text, 0, room);
+        assert_eq!(parts.len(), 3);
+        assert!(json_len(&parts[2].0) <= room);
+        assert!(parts.iter().all(|(p, _)| chars(p) <= MAX_MESSAGE_CHARS));
+        assert_eq!(pieces(&text, &parts), text);
+        // The rest after an answered part: numbered on, the last still short.
+        let rest = split_after_room(&text[parts[0].1..], 1, room);
+        assert!(rest[0].0.starts_with("часть 2 из"));
+        assert!(json_len(&rest.last().unwrap().0) <= room);
+    }
+
+    #[test]
+    fn json_lengths_match_serde() {
+        for s in ["", "abc", "строка", "a\"b\\c\nd\te\u{1}f\u{1f}", "😀\r\u{8}\u{c}"] {
+            assert_eq!(
+                json_len(s) + 2,
+                serde_json::to_string(s).unwrap().len(),
+                "{s:?}"
+            );
+        }
     }
 }

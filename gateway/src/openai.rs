@@ -36,12 +36,24 @@ pub enum Content {
     Parts(Vec<Part>),
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+/// One part of a message's content. Besides text, OpenCode (2.2.5,
+/// `packages/ai/src/protocols/openai-chat.ts`) sends an image as
+/// `{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}` (or
+/// an http(s) URL) and a PDF as `{"type":"file","file":{"filename":…,
+/// "file_data":"data:application/pdf;base64,…"}}`; images a tool read come
+/// as a user message of their own after the tool results. `image_url` and
+/// `file` are kept as JSON: some clients send `image_url` as a bare string.
+/// What the gateway makes of them is `images`'s.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Part {
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]

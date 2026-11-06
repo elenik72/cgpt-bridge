@@ -17,6 +17,7 @@ import {
   hostBuildOf,
   isValidProjectName,
   MAX_PROJECT_NAME_CHARS,
+  parseAttachments,
   statusResultFrame,
   stoppedFrame,
   type WireErrorCode,
@@ -51,6 +52,30 @@ test("wire.ask_result_matches_fixture", () => {
   assert.deepEqual(
     askResultFrame(fx.id as string, fx.text as string, null),
     without(fx, "conversation_url"),
+  );
+});
+
+test("wire.ask_result_with_diagnostics_matches_fixture", () => {
+  const fx = fixture("response_ask_result_diagnostics");
+  const wire = fx.diagnostics as {
+    stream_check: { stream_chars: number; page_chars: number; mismatch: boolean };
+    stream_capture: string;
+  };
+  assert.deepEqual(
+    askResultFrame(fx.id as string, fx.text as string, fx.conversation_url as string, null, {
+      streamCheck: {
+        streamChars: wire.stream_check.stream_chars,
+        pageChars: wire.stream_check.page_chars,
+        mismatch: wire.stream_check.mismatch,
+      },
+      streamCapture: wire.stream_capture,
+    }),
+    fx,
+  );
+  // Nothing to report: the field is left out.
+  assert.deepEqual(
+    askResultFrame(fx.id as string, fx.text as string, fx.conversation_url as string, null, {}),
+    without(fx, "diagnostics"),
   );
 });
 
@@ -109,6 +134,33 @@ test("wire.status_result_matches_fixture", () => {
     ),
     { ...fx, tab_open: !status.tabOpen, logged_in: !status.loggedIn },
   );
+});
+
+test("wire.status_result_with_files_matches_fixture", () => {
+  const fx = fixture("response_status_result_attachments");
+  const status = {
+    tabOpen: fx.tab_open as boolean,
+    loggedIn: fx.logged_in as boolean,
+    conversationUrl: fx.conversation_url as string | null,
+    ownTabs: fx.own_tabs as number,
+  };
+  assert.deepEqual(statusResultFrame(fx.id as string, { ...status, attachments: true }, fx.build as string), fx);
+  // Not said: left out, as an older extension sends it.
+  assert.deepEqual(
+    statusResultFrame(fx.id as string, { ...status, attachments: false }, fx.build as string),
+    without(fx, "attachments"),
+  );
+});
+
+test("wire.ask_files_from_the_fixture_parse", () => {
+  const fx = fixture("request_ask_conversation_attachments");
+  const [file] = fx.attachments as Array<Record<string, string>>;
+  assert.deepEqual(parseAttachments(fx.attachments), {
+    ok: true,
+    attachments: [{ name: file!.name, mime: file!.mime, dataBase64: file!.data_base64 }],
+  });
+  // No field: no files.
+  assert.deepEqual(parseAttachments(fixture("request_ask").attachments), { ok: true, attachments: [] });
 });
 
 test("wire.error_codes_match_fixtures", () => {

@@ -137,6 +137,11 @@ pub struct SessionSummary {
     pub cwd: String,
     /// True if a `final.md` file is present in the run dir.
     pub has_final: bool,
+    /// The session's `status` (`active`, `final`, `needs_user_input`, …)
+    /// from its own `runs/<id>/session.json`, or from the root
+    /// `session.json` when that one belongs to it (sessions from before the
+    /// per-session file); `None` when neither says.
+    pub status: Option<String>,
 }
 
 pub struct PlanStore {
@@ -268,6 +273,15 @@ impl PlanStore {
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok());
             let has_final = dir.join("final.md").is_file();
+            let read_status = |path: &Path| {
+                fs::read(path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<SessionMetadata>(&b).ok())
+                    .filter(|m| m.session_id == session_id)
+                    .map(|m| m.status)
+            };
+            let status = read_status(&dir.join("session.json"))
+                .or_else(|| read_status(&project_root.join(DEFAULT_DIR_NAME).join("session.json")));
             let (started, task, cwd) = match meta {
                 Some(m) => (m.started_at_unix_ms, m.task, m.cwd),
                 None => {
@@ -289,6 +303,7 @@ impl PlanStore {
                 task,
                 cwd,
                 has_final,
+                status,
             });
         }
         out.sort_by(|a, b| b.started_at_unix_ms.cmp(&a.started_at_unix_ms));
@@ -870,6 +885,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(own.status, "final");
+    }
+
+    #[test]
+    fn list_sessions_reads_each_sessions_status() {
+        let root = tmp_root();
+        let first = PlanStore::open(&root, "s-first".into(), "t").unwrap();
+        let second = PlanStore::open(&root, "s-second".into(), "t").unwrap();
+        first.update_session_status("final").unwrap();
+        second.update_session_status("needs_user_input").unwrap();
+        // An old session with neither file of its own nor the root file.
+        fs::create_dir_all(root.join(".cgpt-bridge/runs/s-old")).unwrap();
+        // An old session the root file belongs to.
+        let older = PlanStore::open(&root, "s-root".into(), "t").unwrap();
+        older.update_session_status("blocked").unwrap();
+        fs::remove_file(root.join(".cgpt-bridge/runs/s-root/session.json")).unwrap();
+        let status = |id: &str| {
+            PlanStore::list_sessions(&root)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.session_id == id)
+                .unwrap()
+                .status
+        };
+        assert_eq!(status("s-first").as_deref(), Some("final"));
+        assert_eq!(status("s-second").as_deref(), Some("needs_user_input"));
+        assert_eq!(status("s-root").as_deref(), Some("blocked"));
+        assert_eq!(status("s-old"), None);
     }
 
     #[test]

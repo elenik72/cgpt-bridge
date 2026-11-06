@@ -11,6 +11,9 @@ mod config;
 mod cooldown;
 mod engine;
 mod http;
+mod images;
+mod journal;
+mod lanes;
 mod log;
 mod openai;
 mod prompt;
@@ -44,7 +47,7 @@ fn main() -> ExitCode {
 
 fn run(print_config: bool) -> std::io::Result<()> {
     let dir = config::gateway_dir()?;
-    let (cfg, config_warning) = config::load_or_create(&dir)?;
+    let (cfg, config_warnings) = config::load_or_create(&dir)?;
     if print_config {
         println!(
             "{}",
@@ -57,12 +60,22 @@ fn run(print_config: bool) -> std::io::Result<()> {
         "cgpt-gateway: config {}",
         dir.join("config.json").display()
     ));
-    if let Some(warning) = config_warning {
+    for warning in config_warnings {
         log(warning);
     }
     let sessions = session::Sessions::new(dir.join("sessions"));
     let cooldown = cooldown::Cooldown::new(dir.join("cooldown.json"));
-    let engine = engine::Engine::new(sessions, cfg.allow_tools.clone(), cooldown);
+    if cfg.debug_capture_turns > 0 {
+        log(format_args!(
+            "cgpt-gateway: debug: the raw answer streams of the next {} turn(s) are written, \
+             redacted, to {} (they hold answer text; delete them when done)",
+            cfg.debug_capture_turns,
+            dir.join(journal::CAPTURES_DIR).display()
+        ));
+    }
+    let journal = std::sync::Arc::new(journal::Journal::new(dir.clone(), cfg.debug_capture_turns));
+    let engine =
+        engine::Engine::new(sessions, cfg.allow_tools.clone(), cooldown).with_journal(journal);
     http::serve(
         cfg,
         Box::new(backend::BridgeBackend::with_default_endpoint()),

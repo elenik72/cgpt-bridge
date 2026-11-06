@@ -67,6 +67,7 @@ fn spawn_mock_ok(endpoint: String, reply_text: String) -> thread::JoinHandle<Res
             text: reply_text,
             conversation_url: None,
             warning: None,
+            diagnostics: None,
         };
         let body = serde_json::to_vec(&resp).map_err(|e| format!("serialize: {}", e))?;
         write_frame(&mut writer, &body).map_err(|e| format!("write_frame: {}", e))?;
@@ -122,6 +123,8 @@ fn round_trip_ask_returns_assistant_text() {
         timeout_ms: 5000,
         target: None,
         project: None,
+        capture_stream: false,
+        attachments: Vec::new(),
     };
     let outcome = ask_once(&socket, &req, 5000);
     server
@@ -154,6 +157,8 @@ fn server_error_is_surfaced() {
         timeout_ms: 5000,
         target: None,
         project: None,
+        capture_stream: false,
+        attachments: Vec::new(),
     };
     let outcome = ask_once(&socket, &req, 5000);
     server.join().expect("server panic").expect("server err");
@@ -178,6 +183,8 @@ fn missing_socket_is_reported_as_socket_missing() {
         timeout_ms: 200,
         target: None,
         project: None,
+        capture_stream: false,
+        attachments: Vec::new(),
     };
     let outcome = ask_once(&socket, &req, 200);
     assert!(

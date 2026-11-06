@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { ask, goTo, h, loadPage, sendToContent } from "./harness/fakeWindow";
 import { AccountChat, later, pageFetchesAnswerStream, settlePage, type AnswerStream } from "./harness/chatPage";
-import { assertAnsweredInTarget } from "../src/chatgptAdapter";
+import { assertAnsweredInTarget, showsSameChatId } from "../src/chatgptAdapter";
 import { useAutoClock } from "./harness/clock";
 
 await loadPage();
@@ -211,6 +211,63 @@ test("audit.e3_new_chat_with_two_user_turns_fails_the_turn", async () => {
   } finally {
     await settlePage();
   }
+});
+
+// Seen live (block 6, 02.11): the new chat got its address, then the user
+// clicked another chat (one with two questions) in the bridge window while
+// the answer was written. The error used to count that chat's user turns
+// ("holds 2 user turns… want 1"); it now says what happened, and that the
+// answer goes on in the new chat. The stop that follows presses nothing.
+test("audit.e3_new_chat_left_by_a_click_says_so", async () => {
+  const chat = new AccountChat("/");
+  let stream = null as AnswerStream | null;
+  try {
+    chat.onSend = () => {
+      goTo("/c/local-chatgpt:1e2f");
+      chat.beginTurn();
+      const s = pageFetchesAnswerStream();
+      stream = s;
+      later(50, () => s.startAnswer("m1", "Our answer"));
+      later(100, () => goTo("/c/saved-new"));
+      later(300, () => {
+        chat.showOtherChat("/c/cities", [
+          { id: "c1", text: "Ten cities." },
+          { id: "c2", text: "A hundred cities." },
+        ]);
+        chat.beginTurn();
+      });
+      later(400, () => {
+        s.append(" in full.");
+        s.endTurn();
+        s.done();
+      });
+    };
+    const reply = await ask("e3-click", "project question", { target: { kind: "new_chat" } });
+    assert.equal(reply.ok, false, JSON.stringify(reply));
+    assert.equal(reply.errorCode, "target_mismatch");
+    assert.match(reply.message ?? "", /switched to another chat by a click/);
+    assert.match(reply.message ?? "", /shows \/c\/cities, the prompt went to https:\/\/chatgpt\.com\/c\/saved-new/);
+    assert.match(reply.message ?? "", /goes on answering it in that chat/);
+    assert.doesNotMatch(reply.message ?? "", /user turns/);
+    const stopped = await stopFromGateway("e3-click-stop");
+    assert.deepEqual(stopped, { id: "e3-click-stop", ok: true, kind: "stop", wasGenerating: false });
+    assert.equal(chat.stop.clicks, 0);
+  } finally {
+    await settlePage([stream]);
+  }
+});
+
+// A new chat in a project may first show `/c/<id>` and only later its
+// project prefix (page test: pageProjects). Compared by chat id only.
+const PROJECT = "g-p-0123456789abcdef0123456789abcdef";
+test("audit.e3_chat_id_compare_ignores_the_project_prefix_only", () => {
+  const url = "https://chatgpt.com/c/saved-p";
+  assert.equal(showsSameChatId(url, "/c/saved-p"), true);
+  assert.equal(showsSameChatId(url, `/g/${PROJECT}-my-proj/c/saved-p`), true);
+  assert.equal(showsSameChatId(url, "/c/other"), false);
+  assert.equal(showsSameChatId(url, `/g/${PROJECT}-my-proj/c/other`), false);
+  assert.equal(showsSameChatId(url, `/g/${PROJECT}/project`), false);
+  assert.equal(showsSameChatId(url, "/"), false);
 });
 
 // Stop pressed in the gateway's window: the turn ends `cancelled` and its

@@ -20,8 +20,11 @@ import { resolve } from "node:path";
 import {
   SseFramer,
   answerText,
+  captureEvent,
   isComplete,
   newSseState,
+  newStreamCapture,
+  renderCapture,
   sseAccumulate,
   type SseState,
 } from "../src/sseParser";
@@ -298,4 +301,58 @@ test("sseFramer.splits_the_same_events_at_every_chunk_size", () => {
     out.push(...framer.flush());
     assert.deepEqual(out, expected, `chunk size ${size}`);
   }
+});
+
+test("sseParser.capture_keeps_events_with_text_as_references_and_stops_at_its_cap", () => {
+  const state = newSseState();
+  const c = newStreamCapture(10_000);
+  const events = [
+    JSON.stringify({
+      p: "",
+      o: "add",
+      v: {
+        message: {
+          id: "m1",
+          author: { role: "assistant" },
+          content: { content_type: "text", parts: ["He"] },
+          recipient: "all",
+        },
+      },
+    }),
+    JSON.stringify({ p: "/message/content/parts/0", o: "append", v: "llo" }),
+    JSON.stringify({ v: " wor" }),
+    JSON.stringify({ p: "/message/status", o: "replace", v: "finished_successfully" }),
+    "[DONE]",
+    "not json, maybe a secret",
+  ];
+  for (const ev of events) captureEvent(state, ev, c);
+  // The parser saw everything as usual.
+  assert.equal(answerText(state), "Hello wor");
+  assert.equal(isComplete(state), true);
+  const out = renderCapture(c);
+  assert.ok(out.includes('"parts":["«text 0+2»"]'), out);
+  assert.ok(out.includes('{"p":"/message/content/parts/0","o":"append","v":"«text 2+3»"}'), out);
+  assert.ok(out.includes('{"v":"«text 5+4»"}'), out);
+  // Other strings stay whole, non-JSON events only by their length.
+  assert.ok(out.includes('"v":"finished_successfully"'), out);
+  assert.ok(out.includes("data: [DONE]\n"), out);
+  assert.ok(out.includes("data: «24 chars»\n"), out);
+  assert.ok(out.endsWith("above points here\nHello wor"), out);
+
+  // Past the cap nothing more is kept, and the capture says so; the parser
+  // still sees every event.
+  const small = newStreamCapture(80);
+  const st = newSseState();
+  for (const ev of events) captureEvent(st, ev, small);
+  assert.equal(answerText(st), "Hello wor");
+  assert.ok(renderCapture(small).includes("capture full"), renderCapture(small));
+
+  // A token whose rest did not fit is dropped from the kept text too.
+  const cut = newStreamCapture(400);
+  const s3 = newSseState();
+  captureEvent(s3, events[0]!, cut);
+  captureEvent(s3, JSON.stringify({ p: "/message/content/parts/0", o: "append", v: " key AKIAIOSF" }), cut);
+  captureEvent(s3, JSON.stringify({ v: "ODNN7EXAMPLE".repeat(20) }), cut);
+  assert.ok(cut.full);
+  assert.equal(cut.pieces, "He key ");
 });

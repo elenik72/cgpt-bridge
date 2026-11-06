@@ -43,6 +43,29 @@ export class AnswerNotDetectedError extends CgptBridgeError {
   }
 }
 
+// The ask's files did not get into the composer, or did not finish uploading,
+// in time; the prompt was not sent. The wire has no code of its own for it
+// (it goes as `dom_failure`), so the message starts with this one.
+export class AttachmentUploadFailedError extends CgptBridgeError {
+  constructor(message = "The attached files did not upload in ChatGPT; the prompt was not sent.") {
+    super("attachment_upload_failed", `attachment_upload_failed: ${message}`);
+    this.name = "AttachmentUploadFailedError";
+  }
+}
+
+// The own tab's composer holds files this ask did not put there (left by a
+// failed ask) and they could not be removed: Send would carry them into this
+// chat. Refused before anything was typed; `dom_failure` on the wire, so the
+// message starts with the code.
+export class AttachmentsLeftOverError extends CgptBridgeError {
+  constructor(
+    message = "The composer holds files of an earlier ask that could not be removed; the prompt was not sent. Remove them in the cgpt-bridge window.",
+  ) {
+    super("attachments_left_over", `attachments_left_over: ${message}`);
+    this.name = "AttachmentsLeftOverError";
+  }
+}
+
 export class StopButtonNotFoundError extends CgptBridgeError {
   constructor(message = "ChatGPT is generating but its Stop button was not found.") {
     super("stop_button_not_found", message);

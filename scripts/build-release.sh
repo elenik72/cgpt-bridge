@@ -89,7 +89,8 @@ cp -R extension/dist/. "$STAGE_DIR/extension/"
 # agent, LaunchAgent) sits at the top of the bundle.
 if [[ "$OS_TAG" == "macos" ]]; then
   cp install/macos/install.sh install/macos/uninstall.sh \
-     install/macos/com.cgpt-bridge.gateway.plist install/opencode-agent-cgpt.md "$STAGE_DIR/"
+     install/macos/com.cgpt-bridge.gateway.plist install/opencode-agent-cgpt.md \
+     install/opencode-agent-cgpt-sub.md "$STAGE_DIR/"
   chmod +x "$STAGE_DIR/install.sh" "$STAGE_DIR/uninstall.sh"
 fi
 
@@ -121,8 +122,10 @@ This bundle contains:
 - `bin/cgpt-bridge-host` — the Chrome Native Messaging host.
 - `bin/cgpt` — the CLI (`cgpt ask`, `cgpt agent`).
 - `extension/` — the unpacked Chrome extension.
-- macOS: `install.sh`, `uninstall.sh`, the gateway LaunchAgent template and
-  `opencode-agent-cgpt.md` (the OpenCode agent `cgpt`).
+- macOS: `install.sh`, `uninstall.sh`, the gateway LaunchAgent template,
+  `opencode-agent-cgpt.md` (the OpenCode agent `cgpt`) and
+  `opencode-agent-cgpt-sub.md` (`cgpt-sub`, the only subagent `cgpt` may
+  start).
 - `install/linux/install-host.sh` — host-only installer for Linux.
 
 ## macOS
@@ -131,8 +134,8 @@ This bundle contains:
    `~/Library/Application Support/cgpt-bridge/`, registers the native host
    with Chrome, creates the gateway config with its token, adds provider
    `cgpt` to `~/.config/opencode/opencode.json` (the previous file is kept as
-   `opencode.json.bak`), adds the OpenCode agent `cgpt`
-   (`~/.config/opencode/agents/cgpt.md`; `--no-agent` skips it) and starts
+   `opencode.json.bak`), adds the OpenCode agents `cgpt` and `cgpt-sub`
+   (`~/.config/opencode/agents/`; `--no-agent` skips them) and starts
    the gateway at login via
    `~/Library/LaunchAgents/com.cgpt-bridge.gateway.plist`.
 2. Chrome → `chrome://extensions` → *Developer mode* → *Load unpacked* →
@@ -144,7 +147,8 @@ This bundle contains:
    a temporary chat.
 4. In OpenCode press Tab to switch to the agent `cgpt` (or run
    `opencode --agent cgpt`). It uses the model `cgpt/chatgpt-web` and asks
-   before every command, file edit and web fetch. It is not the default
+   before every command, file edit, web access, MCP tool and skill. It is
+   not the default
    agent: pick it with Tab each time. The model `cgpt/chatgpt-web` chosen in
    another agent works too, but nothing asks there.
 5. On the first request the extension opens its own ChatGPT window without

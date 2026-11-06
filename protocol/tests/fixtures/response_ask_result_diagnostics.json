@@ -1,0 +1,1 @@
+{ "type": "ask_result", "id": "a6", "text": "hello back", "conversation_url": "https://chatgpt.com/c/abc-123", "diagnostics": { "stream_check": { "stream_chars": 9, "page_chars": 18, "mismatch": true }, "stream_capture": "data: {\"v\": \"hello back\"}\n\ndata: [DONE]\n\n" } }

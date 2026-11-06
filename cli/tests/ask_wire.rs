@@ -63,6 +63,7 @@ fn ok_reply(id: String) -> BridgeResponse {
         text: "late answer".into(),
         conversation_url: None,
         warning: None,
+        diagnostics: None,
     }
 }
 
@@ -84,6 +85,8 @@ fn assert_frame_matches_fixture(label: &str, target: Option<ChatTarget>, fixture
         timeout_ms: 60_000,
         target,
         project: None,
+        capture_stream: false,
+        attachments: Vec::new(),
     };
     let outcome = ask_once(&ep, &req, 60_000);
     host.join().expect("host panicked");
@@ -128,6 +131,8 @@ fn reply_just_after_timeout_ms_is_printed_not_timed_out() {
         timeout_ms,
         target: None,
         project: None,
+        capture_stream: false,
+        attachments: Vec::new(),
     };
     let outcome = ask_once(&ep, &req, timeout_ms);
     host.join().expect("host panicked");
@@ -161,6 +166,8 @@ fn hosts_own_timeout_error_arrives_before_client_gives_up() {
         timeout_ms,
         target: None,
         project: None,
+        capture_stream: false,
+        attachments: Vec::new(),
     };
     let outcome = ask_once(&ep, &req, timeout_ms);
     host.join().expect("host panicked");

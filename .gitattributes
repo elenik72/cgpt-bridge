@@ -5,3 +5,6 @@
 # either).
 * text=auto eol=lf
 *.ps1 text eol=crlf
+# Inno Setup scripts: CRLF and UTF-8 with BOM (ISCC reads a script without
+# a BOM in the ANSI code page, which would garble the Russian messages).
+*.iss text eol=crlf

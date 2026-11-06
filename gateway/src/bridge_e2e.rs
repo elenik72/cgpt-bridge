@@ -598,6 +598,7 @@ fn stop_during_an_ask_drops_its_answer_and_holds_the_queue_until_stopped() {
     let b_stream = post(port, &b_request);
     let b = thread::spawn(move || answer(b_stream));
     drop(a);
+    // This extension reports no own tabs and A runs alone: the plain stop.
     let stop = host.ext.expect("stop");
 
     // A's answer still arrives, then the extension takes its time to stop.

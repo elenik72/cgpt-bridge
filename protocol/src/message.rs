@@ -75,6 +75,33 @@ pub struct AskRequest {
     /// ask then goes to a plain new chat).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Debug aid (the gateway's `debug_capture_turns`): the extension
+    /// returns the answer's event stream in `ask_result` (`stream_capture`).
+    /// Off unless set; a host or extension built before it drops it, and no
+    /// capture comes back.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_stream: bool,
+    /// Files to put into the composer before the text is sent (images from
+    /// OpenCode, sent by the gateway). Empty: none, and left out of the
+    /// frame. A host or extension built before this field drops it, so the
+    /// gateway sends files only to an extension that reports
+    /// `attachments: true` in `status_result`. The whole frame, base64
+    /// included, must stay within [`MAX_FRAME_BYTES`](crate::MAX_FRAME_BYTES)
+    /// (Chrome's 1 MB limit for a message from the host).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+/// One file of an `ask`. Wire form:
+/// `{"name":"image-1.png","mime":"image/png","data_base64":"iVBOR…"}`.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    /// The file name the page shows (made by the sender, never a path).
+    pub name: String,
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub mime: String,
+    /// The file's bytes, standard base64 with padding.
+    pub data_base64: String,
 }
 
 /// Longest project name an `ask` may carry, in characters.
@@ -102,6 +129,36 @@ pub fn check_project_name(name: &str) -> Result<(), String> {
         return Err("project name holds a control character".to_string());
     }
     Ok(())
+}
+
+/// What the extension reports about an answered ask beside its text.
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+pub struct AskDiagnostics {
+    /// How the answer read from the stream compares with the answer the
+    /// page shows; absent when the page showed no settled answer to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_check: Option<StreamCheck>,
+    /// The answer's event stream, capped, when the ask set `capture_stream`
+    /// (absent otherwise): every event with its text pieces replaced by
+    /// `«text OFF+LEN»`, then the pieces joined (extension `sseParser.ts`
+    /// `captureEvent`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_capture: Option<String>,
+    /// The ask set `capture_stream`, but the capture was left out whole:
+    /// the frame would have been too big with it (a capture is never cut).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream_capture_dropped: bool,
+}
+
+/// The answer as read from ChatGPT's stream next to the answer the page
+/// shows, both normalized the same way (whitespace and markdown syntax
+/// dropped, see the extension's `compareStreamAndPage`): their lengths in
+/// characters, and whether they differ.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct StreamCheck {
+    pub stream_chars: u64,
+    pub page_chars: u64,
+    pub mismatch: bool,
 }
 
 /// Where an `ask` should land. Wire form: `{"kind":"conversation","url":"…"}`
@@ -170,6 +227,12 @@ pub enum BridgeResponse {
         conversation_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
+        /// What the extension noticed about the answer (see
+        /// [`AskDiagnostics`]); absent when there is nothing to say, and
+        /// from a component built before it. Only a report: `text` is the
+        /// same either way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diagnostics: Option<AskDiagnostics>,
     },
 
     /// Answer to `stop` and `stop_ask`. `was_generating` is false when there
@@ -198,6 +261,17 @@ pub enum BridgeResponse {
         conversation_url: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build: Option<String>,
+        /// How many own tabs the extension is ready to keep for gateway asks
+        /// (several gateway sessions at once). An extension or host that
+        /// predates it sends none, and the gateway then runs one turn at a
+        /// time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        own_tabs: Option<u32>,
+        /// Whether the extension puts an ask's `attachments` into the
+        /// composer. An extension or host that predates it sends none (read
+        /// as false), and the gateway then sends no files.
+        #[serde(default, skip_serializing_if = "is_false")]
+        attachments: bool,
     },
 
     /// Anything that went wrong. Stable, machine-readable `code` field;
@@ -354,6 +428,8 @@ mod tests {
                 url: "https://chatgpt.com/c/abc".into(),
             }),
             project: None,
+            capture_stream: false,
+            attachments: Vec::new(),
         };
         let s = serde_json::to_string(&BridgeRequest::Ask(conv)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -376,6 +452,8 @@ mod tests {
             timeout_ms: 1000,
             target: Some(ChatTarget::NewChat),
             project: None,
+            capture_stream: false,
+            attachments: Vec::new(),
         };
         let s = serde_json::to_string(&BridgeRequest::Ask(new_chat)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -441,6 +519,33 @@ mod tests {
         ] {
             assert!(check_project_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_dropped_capture_still_parses_and_says_so() {
+        // What the extension's capHostFrame sends when the frame would be too
+        // big with the capture (extension/test/frameLimit.test.ts checks the
+        // same JSON): the answer whole, the capture left out, never cut.
+        let dropped = r#"{"type":"ask_result","id":"c9","text":"A","diagnostics":{"stream_capture_dropped":true}}"#;
+        let resp: BridgeResponse = serde_json::from_str(dropped).unwrap();
+        match &resp {
+            BridgeResponse::AskResult {
+                text, diagnostics, ..
+            } => {
+                assert_eq!(text, "A");
+                let d = diagnostics.as_ref().unwrap();
+                assert!(d.stream_capture_dropped);
+                assert_eq!(d.stream_capture, None);
+            }
+            other => panic!("{:?}", other),
+        }
+        // Passed on unchanged by the host; false is left out.
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap()["diagnostics"],
+            serde_json::json!({"stream_capture_dropped": true})
+        );
+        let plain = serde_json::to_value(AskDiagnostics::default()).unwrap();
+        assert_eq!(plain, serde_json::json!({}));
     }
 
     #[test]
@@ -528,9 +633,114 @@ mod tests {
                 logged_in: false,
                 conversation_url: None,
                 build: None,
+                own_tabs: None,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn status_result_own_tabs_round_trips_and_is_optional() {
+        let with: BridgeResponse = serde_json::from_str(
+            r#"{"type":"status_result","id":"t2","extension":true,"tab_open":true,"logged_in":true,"conversation_url":null,"own_tabs":8}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            with,
+            BridgeResponse::StatusResult {
+                own_tabs: Some(8),
+                ..
+            }
+        ));
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains(r#""own_tabs":8"#), "{}", text);
+        let back: BridgeResponse = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            back,
+            BridgeResponse::StatusResult {
+                own_tabs: Some(8),
+                ..
+            }
+        ));
+
+        // Without the field (an older extension, or the host's own answer
+        // when no extension is connected): none, and none written back.
+        let without = BridgeResponse::StatusResult {
+            id: "t3".into(),
+            extension: false,
+            tab_open: false,
+            logged_in: false,
+            conversation_url: None,
+            build: None,
+            own_tabs: None,
+            attachments: false,
+        };
+        let text = serde_json::to_string(&without).unwrap();
+        assert!(!text.contains("own_tabs"), "{}", text);
+        let back: BridgeResponse = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            back,
+            BridgeResponse::StatusResult { own_tabs: None, .. }
+        ));
+    }
+
+    #[test]
+    fn ask_attachments_round_trip_and_are_left_out_when_empty() {
+        let req: BridgeRequest = serde_json::from_str(
+            r#"{"type":"ask","id":"a1","text":"hi","timeout_ms":1000,"attachments":[{"name":"image-1.png","mime":"image/png","data_base64":"iVBORw0KGgo="}]}"#,
+        )
+        .unwrap();
+        let BridgeRequest::Ask(a) = req else {
+            panic!("expected ask");
+        };
+        assert_eq!(
+            a.attachments,
+            vec![Attachment {
+                name: "image-1.png".into(),
+                mime: "image/png".into(),
+                data_base64: "iVBORw0KGgo=".into(),
+            }]
+        );
+        let s = serde_json::to_string(&BridgeRequest::Ask(a.clone())).unwrap();
+        assert!(s.contains(r#""data_base64":"iVBORw0KGgo=""#), "{s}");
+        // Without files the frame is the one from before the field.
+        let none = AskRequest {
+            attachments: Vec::new(),
+            ..a
+        };
+        let s = serde_json::to_string(&BridgeRequest::Ask(none)).unwrap();
+        assert!(!s.contains("attachments"), "{s}");
+    }
+
+    #[test]
+    fn status_result_attachments_is_optional_and_left_out_when_false() {
+        let with: BridgeResponse = serde_json::from_str(
+            r#"{"type":"status_result","id":"t2","extension":true,"tab_open":true,"logged_in":true,"conversation_url":null,"own_tabs":8,"attachments":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            with,
+            BridgeResponse::StatusResult {
+                attachments: true,
+                ..
+            }
+        ));
+        let text = serde_json::to_string(&with).unwrap();
+        assert!(text.contains(r#""attachments":true"#), "{text}");
+        // An older extension (or the host's own answer): false, left out.
+        let old: BridgeResponse = serde_json::from_str(
+            r#"{"type":"status_result","id":"t3","extension":true,"tab_open":true,"logged_in":true,"conversation_url":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            BridgeResponse::StatusResult {
+                attachments: false,
+                ..
+            }
+        ));
+        let text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("attachments"), "{text}");
     }
 
     #[test]

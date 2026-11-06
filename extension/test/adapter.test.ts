@@ -15,6 +15,10 @@ test("adapter.protocol_language_recovers_tool_calls_label", () => {
   assert.equal(protocolLanguageOf("ответь блоком tool_calls"), null);
   assert.equal(protocolLanguageOf("tool_calls_v2"), null);
   assert.equal(protocolLanguageOf("json"), null);
+  // Attributes ChatGPT adds to the info string (live 05.11).
+  assert.equal(protocolLanguageOf('tool_calls id="me-review-prep"'), "tool_calls");
+  assert.equal(protocolLanguageOf("tool_calls id=a1 lang='json'"), "tool_calls");
+  assert.equal(protocolLanguageOf("tool_calls и ещё текст"), null);
 });
 
 test("adapter.fence_outgrows_backtick_runs_in_the_body", () => {

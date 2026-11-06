@@ -1,12 +1,12 @@
 //! The HTTP side: loopback-only listener, bearer auth, routes, SSE and JSON
-//! answers, keepalive, and strictly serialized turns.
+//! answers, keepalive, and turns: one at a time per session, sessions side by
+//! side up to the limit (see [`Lanes`]).
 
-use std::collections::VecDeque;
 use std::io::{self, Cursor, Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,10 +16,11 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use crate::backend::{BackendError, ChatBackend};
 use crate::config::{Config, MAX_TURN_TIMEOUT_MS};
 use crate::cooldown::{self, Cooldown};
-use crate::engine::Engine;
+use crate::engine::{stop_request, Engine, TurnWatch};
+use crate::lanes::{lock, Lanes};
 use crate::log::log;
 use crate::openai::{chunk_json, completion_json, error_json, sse_line, ChatRequest, Reply, Usage};
-use crate::session::now_ms;
+use crate::session::{now_ms, Sessions};
 use crate::title::local_title;
 
 pub const MODEL_CHATGPT: &str = "chatgpt-web";
@@ -237,134 +238,19 @@ fn retry_after_secs(until_ms: u128, now_ms: u128) -> u128 {
     until_ms.saturating_sub(now_ms).div_ceil(1000).max(1)
 }
 
-// ------------------------------------------------------------ serialized turns
-
-/// A one-seat queue: the value (the engine) is handed to one turn at a time,
-/// strictly in the order the requests came (spec 6.1): a request takes its
-/// ticket once it has fully arrived (`ticket`) and waits on it later
-/// (`wait`), on whatever thread runs the turn. Waiting is bounded, so a
-/// request stuck behind a long turn can give up and leave the line.
-struct TurnGate<T> {
-    state: Mutex<GateState<T>>,
-    freed: Condvar,
-    /// Times a waiter went to sleep on `freed`, for tests to observe.
-    #[cfg(test)]
-    parked: std::sync::atomic::AtomicUsize,
-}
-
-struct GateState<T> {
-    value: Option<T>,
-    /// Tickets of the waiting requests, first come first.
-    line: VecDeque<u64>,
-    next_ticket: u64,
-}
-
-struct Turn<'a, T> {
-    gate: &'a TurnGate<T>,
-    value: Option<T>,
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-impl<T> TurnGate<T> {
-    fn new(value: T) -> TurnGate<T> {
-        TurnGate {
-            state: Mutex::new(GateState {
-                value: Some(value),
-                line: VecDeque::new(),
-                next_ticket: 0,
-            }),
-            freed: Condvar::new(),
-            #[cfg(test)]
-            parked: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    /// Tickets taken so far, whether or not they are still in line.
-    #[cfg(test)]
-    fn tickets_taken(&self) -> u64 {
-        lock(&self.state).next_ticket
-    }
-
-    /// Times a waiter has found its turn not yet come and gone to sleep.
-    #[cfg(test)]
-    fn parked(&self) -> usize {
-        self.parked.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// A place at the end of the line. It must be waited on or left.
-    fn ticket(&self) -> u64 {
-        let mut state = lock(&self.state);
-        let ticket = state.next_ticket;
-        state.next_ticket += 1;
-        state.line.push_back(ticket);
-        ticket
-    }
-
-    /// Give up a ticket that will not be waited on.
-    fn leave(&self, ticket: u64) {
-        lock(&self.state).line.retain(|&t| t != ticket);
-        // The next in line may be free to go now.
-        self.freed.notify_all();
-    }
-
-    #[cfg(test)]
-    fn acquire(&self, timeout: Duration) -> Option<Turn<'_, T>> {
-        self.wait(self.ticket(), timeout)
-    }
-
-    /// Wait until `ticket` is first in line and the value is free; `None`
-    /// after `timeout`, and the ticket has left the line.
-    fn wait(&self, ticket: u64, timeout: Duration) -> Option<Turn<'_, T>> {
-        let start = Instant::now();
-        let mut state = lock(&self.state);
-        loop {
-            if state.line.front() == Some(&ticket) {
-                if let Some(value) = state.value.take() {
-                    state.line.pop_front();
-                    return Some(Turn {
-                        gate: self,
-                        value: Some(value),
-                    });
-                }
-            }
-            let left = timeout.saturating_sub(start.elapsed());
-            if left.is_zero() {
-                state.line.retain(|&t| t != ticket);
-                // The next in line may be free to go now.
-                self.freed.notify_all();
-                return None;
-            }
-            #[cfg(test)]
-            self.parked
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            state = self
-                .freed
-                .wait_timeout(state, left)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
-    }
-}
-
-impl<T> Drop for Turn<'_, T> {
-    fn drop(&mut self) {
-        lock(&self.gate.state).value = self.value.take();
-        // Every waiter checks whether it is first in line.
-        self.gate.freed.notify_all();
-    }
-}
+// --------------------------------------------------------------------- turns
 
 /// Ties a streamed request's handler to its worker, so that a client leaving
-/// stops exactly this request's generation and nothing else, and so that the
-/// next turn starts only after the stop is done.
+/// stops exactly this request's generation and nothing else (`stop_ask` with
+/// the bridge id of the part the turn sent last), and so that the next turn
+/// of the same session starts only after the stop is done.
 ///
-/// All of it happens under one lock: the worker marks `in_ask` while its ask
-/// runs; the handler, on disconnect, sets `cancelled` and, if `in_ask`, takes
-/// the stop (`Issuing`) and sends it. After its ask returns the worker clears
-/// `in_ask` and waits out an `Issuing` stop before releasing the turn gate.
+/// All of it happens under one lock: the worker marks `in_ask` while its turn
+/// runs and records the id of every part before it is sent (`sending`); the
+/// handler, on disconnect, sets `cancelled` and, if `in_ask` and a part was
+/// sent, takes the stop (`Issuing`) and sends it. A part announced after that
+/// is not sent. After its turn returns the worker clears `in_ask` and waits
+/// out an `Issuing` stop before giving up its seat.
 #[derive(Default)]
 struct Cancel {
     state: Mutex<CancelState>,
@@ -376,6 +262,8 @@ struct CancelState {
     cancelled: bool,
     in_ask: bool,
     stop: StopPhase,
+    /// The bridge id of the part of the turn sent last.
+    sent: Option<String>,
 }
 
 #[derive(Default, PartialEq, Clone, Copy)]
@@ -387,7 +275,7 @@ enum StopPhase {
 }
 
 /// Marks an issued stop as done when dropped, so a worker waiting in
-/// `end_ask` is released even if `stop()` panics.
+/// `end_ask` is released even if the stop panics.
 struct StopDone<'a>(&'a Cancel);
 
 impl Drop for StopDone<'_> {
@@ -399,28 +287,38 @@ impl Drop for StopDone<'_> {
 
 impl Cancel {
     /// Handler side: the client is gone.
-    fn cancel(&self, backend: &dyn ChatBackend) {
+    /// `others_running`: the turns running beside this request's (see
+    /// [`stop_request`], which chooses the stop).
+    fn cancel(&self, backend: &dyn ChatBackend, others_running: usize) {
         let mut state = lock(&self.state);
         state.cancelled = true;
         if !(state.in_ask && state.stop == StopPhase::Idle) {
             log("cgpt-gateway: client went away, nothing to stop");
             return;
         }
+        // The plain stop of the own tab goes as it always did, whether or
+        // not a part was sent; otherwise only a part sent can be stopped
+        // (`sending` refuses any part from now on).
+        let plain = others_running == 0 && backend.own_tabs().is_none();
+        let id = state.sent.clone();
+        if !plain && id.is_none() {
+            log("cgpt-gateway: client went away before anything was sent, nothing to stop");
+            return;
+        }
         state.stop = StopPhase::Issuing;
         drop(state);
         let _done = StopDone(self);
-        match backend.stop() {
-            Ok(()) => log("cgpt-gateway: client went away, generation stopped"),
+        let named = id.as_deref().unwrap_or("-");
+        match stop_request(backend, id.as_deref(), others_running) {
+            Ok(()) => log(format_args!(
+                "cgpt-gateway: client went away, generation stopped [{}]",
+                named
+            )),
             Err(e) => log(format_args!(
-                "cgpt-gateway: client went away, stop failed: {:?}",
-                e
+                "cgpt-gateway: client went away, stop [{}] failed: {:?}",
+                named, e
             )),
         }
-    }
-
-    /// Worker side, during the turn: whether the client already left.
-    fn is_cancelled(&self) -> bool {
-        lock(&self.state).cancelled
     }
 
     /// Worker side, before the ask: `None` if the client already left.
@@ -437,8 +335,8 @@ impl Cancel {
     }
 
     /// Worker side, after the ask: wait for a stop that is being sent, so the
-    /// turn gate is not released into a stop still in flight. Returns whether
-    /// the turn was stopped.
+    /// session's next turn does not start into a stop still in flight.
+    /// Returns whether the turn was stopped.
     fn end_ask(&self) -> bool {
         let mut state = lock(&self.state);
         state.in_ask = false;
@@ -449,6 +347,25 @@ impl Cancel {
                 .unwrap_or_else(|e| e.into_inner());
         }
         state.stop != StopPhase::Idle
+    }
+}
+
+/// Worker side, during the turn.
+impl TurnWatch for Cancel {
+    /// Whether the client already left.
+    fn stopped(&self) -> bool {
+        lock(&self.state).cancelled
+    }
+
+    /// The part `ask_id` is about to be sent: a stop from now on names it.
+    /// `false` if the client already left.
+    fn sending(&self, ask_id: &str) -> bool {
+        let mut state = lock(&self.state);
+        if state.cancelled {
+            return false;
+        }
+        state.sent = Some(ask_id.to_string());
+        true
     }
 }
 
@@ -475,21 +392,21 @@ impl Drop for Ask<'_> {
     }
 }
 
-/// A chat request's ticket in the turn line. It is taken as soon as the
-/// request has fully arrived (its body read and checked), so complete
-/// requests go in arrival order and a client that stalls while sending its
-/// body holds no place; it leaves the line when dropped without being waited
-/// on (`local-title`).
+/// A chat request's ticket in the turn line, for its session `key`. It is
+/// taken as soon as the request has fully arrived (its body read and
+/// checked), so complete requests go in arrival order and a client that
+/// stalls while sending its body holds no place; it leaves the line when
+/// dropped without being waited on.
 struct Place {
     sh: Arc<Shared>,
     ticket: Option<u64>,
 }
 
 impl Place {
-    fn take(sh: &Arc<Shared>) -> Place {
+    fn take(sh: &Arc<Shared>, key: String) -> Place {
         Place {
             sh: sh.clone(),
-            ticket: Some(sh.gate.ticket()),
+            ticket: Some(sh.lanes.ticket(key)),
         }
     }
 
@@ -504,7 +421,7 @@ impl Place {
 impl Drop for Place {
     fn drop(&mut self) {
         if let Some(ticket) = self.ticket.take() {
-            self.sh.gate.leave(ticket);
+            self.sh.lanes.leave(ticket);
         }
     }
 }
@@ -514,7 +431,9 @@ struct Shared {
     backend: Box<dyn ChatBackend>,
     /// The engine's pause, checked before a request is queued.
     cooldown: Cooldown,
-    gate: TurnGate<Engine>,
+    /// Which requests may run their turn now.
+    lanes: Arc<Lanes>,
+    engine: Engine,
     /// Streams whose client was found gone, for tests to observe.
     #[cfg(test)]
     hangups: std::sync::atomic::AtomicUsize,
@@ -524,22 +443,22 @@ struct Shared {
 }
 
 /// Run one request to its answer. `local-title` never touches ChatGPT or the
-/// queue; everything else waits its turn (the wait counts against the turn
-/// timeout) and then runs the engine.
+/// line (it has no place); everything else waits its turn (the wait counts
+/// against the turn timeout) and then runs the engine.
 fn run_turn(
     sh: &Shared,
-    place: Place,
+    place: Option<Place>,
     req: &ChatRequest,
     headers: &[(String, String)],
     cancel: &Cancel,
 ) -> Result<Reply, BackendError> {
-    if req.model == MODEL_TITLE {
+    let Some(place) = place.filter(|_| req.model != MODEL_TITLE) else {
         return Ok(Reply::Text(local_title(req)));
-    }
+    };
     let budget = Duration::from_millis(sh.cfg.turn_timeout_ms.min(MAX_TURN_TIMEOUT_MS));
     let started = Instant::now();
-    let mut turn = sh
-        .gate
+    let _seat = sh
+        .lanes
         .wait(place.into_ticket(), budget)
         .ok_or(BackendError::QueueTimeout)?;
     let remaining = budget.saturating_sub(started.elapsed()).as_millis() as u64;
@@ -547,22 +466,22 @@ fn run_turn(
         // Queueing ate the budget: an ask would be cut off mid-answer.
         return Err(BackendError::QueueTimeout);
     }
-    // Dropped before `turn`: the gate is released after the ask has ended.
+    // Dropped before `_seat`: the seat is given up after the ask has ended.
     let Some(ask) = cancel.begin_ask() else {
         return Err(BackendError::Other("запрос отменён клиентом".to_string()));
     };
-    let engine = turn.value.as_mut().expect("turn holds the engine");
-    let result = engine.handle(headers, req, &*sh.backend, remaining, &|| {
-        cancel.is_cancelled()
-    });
-    // The turn is released (end of this function) only after a stop that is
+    let handled = sh.engine.run(headers, req, &*sh.backend, remaining, cancel);
+    // The seat is given up (end of this function) only after a stop that is
     // being sent has finished; the result of a stopped turn is dropped, and
-    // its session is marked interrupted even if the answer had arrived.
+    // its session (only its own) is marked interrupted even if the answer had
+    // arrived.
     if ask.end() {
-        engine.interrupt_last_turn();
+        if let Some(undo) = handled.undo {
+            sh.engine.undo(undo);
+        }
         return Err(BackendError::Other("запрос остановлен".to_string()));
     }
-    result
+    handled.result
 }
 
 // -------------------------------------------------------------------- server
@@ -594,7 +513,19 @@ impl Running {
     /// Chat requests that have taken their place in the turn line so far.
     #[cfg(test)]
     pub fn tickets_taken(&self) -> u64 {
-        self.shared.gate.tickets_taken()
+        self.shared.lanes.tickets_taken()
+    }
+
+    /// Turns that may run at once now.
+    #[cfg(test)]
+    pub fn limit(&self) -> usize {
+        self.shared.lanes.limit()
+    }
+
+    /// Turns running now.
+    #[cfg(test)]
+    pub fn running(&self) -> usize {
+        self.shared.lanes.running()
     }
 
     /// Chat requests whose handler has begun to read the body.
@@ -623,10 +554,13 @@ impl Running {
 /// Bind `127.0.0.1:<cfg.port>` (never another interface) and serve in the
 /// background.
 pub fn start(cfg: Config, backend: Box<dyn ChatBackend>, engine: Engine) -> io::Result<Running> {
+    let lanes = Arc::new(Lanes::new(cfg.max_parallel));
     // The same minimum guards every part of a turn, not only the first.
-    let engine = engine.with_min_ask_budget_ms(cfg.effective_min_ask_budget_ms());
-    let server = Server::http(("127.0.0.1", cfg.port))
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let engine = engine
+        .with_min_ask_budget_ms(cfg.effective_min_ask_budget_ms())
+        .with_lanes(lanes.clone());
+    let server =
+        Server::http(("127.0.0.1", cfg.port)).map_err(|e| io::Error::other(e.to_string()))?;
     let addr = server
         .server_addr()
         .to_ip()
@@ -636,7 +570,8 @@ pub fn start(cfg: Config, backend: Box<dyn ChatBackend>, engine: Engine) -> io::
         cfg,
         backend,
         cooldown: engine.cooldown(),
-        gate: TurnGate::new(engine),
+        lanes,
+        engine,
         #[cfg(test)]
         hangups: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(test)]
@@ -813,8 +748,10 @@ fn chat(sh: &Arc<Shared>, mut request: Request) {
             return respond_backend_error(request, &e);
         }
     }
-    // The request is complete: its place in the turn line.
-    let place = Place::take(sh);
+    // The request is complete: its place in its session's lane (the key the
+    // engine will use). The title model never waits in line.
+    let place =
+        (req.model == MODEL_CHATGPT).then(|| Place::take(sh, Sessions::key_for(&headers, &req)));
     if req.wants_stream() {
         chat_stream(sh, request, req, headers, place);
     } else {
@@ -846,7 +783,7 @@ fn chat_stream(
     request: Request,
     req: ChatRequest,
     headers: Vec<(String, String)>,
-    place: Place,
+    place: Option<Place>,
 ) {
     let id = completion_id();
     let model = req.model.clone();
@@ -899,8 +836,9 @@ fn chat_stream(
                 keepalive: sh.cfg.keepalive_ms,
             };
             if live.run(request, &rx).is_err() {
-                // A write failed: the client is gone.
-                cancel.cancel(&*sh.backend);
+                // A write failed: the client is gone. A turn of its own
+                // that runs holds one of the seats.
+                cancel.cancel(&*sh.backend, sh.lanes.running().saturating_sub(1));
                 #[cfg(test)]
                 sh.hangups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
@@ -1042,7 +980,6 @@ mod tests {
     use crate::backend::{FakeBackend, IN_TARGET_CHAT};
     use crate::openai::{FunctionCall, ToolCall};
     use crate::session::tests::temp_dir;
-    use crate::session::Sessions;
     use cgpt_bridge_protocol::ChatTarget;
     use std::io::Write;
     use std::net::TcpStream;
@@ -1640,7 +1577,16 @@ mod tests {
 
     #[test]
     fn client_disconnect_calls_backend_stop() {
+        // An extension that reports no own tabs (older, or unknown), and
+        // one that does; the turn runs alone either way.
+        for own_tabs in [None, Some(8)] {
+            client_disconnect_stops(own_tabs);
+        }
+    }
+
+    fn client_disconnect_stops(own_tabs: Option<u32>) {
         let fake = FakeBackend::new();
+        fake.set_own_tabs(own_tabs);
         // The answer never comes by itself: only `stop` ends the ask.
         fake.close_gate();
         fake.push_reply(Ok(("never read".into(), Some(CHAT.into()))));
@@ -1669,6 +1615,14 @@ mod tests {
         wait_for("stop after disconnect", || {
             fake.stops.load(Ordering::SeqCst) == 1
         });
+        if own_tabs.is_none() {
+            // The plain stop of the own tab, exactly as before several
+            // sessions at once (such an extension may not know stop_ask).
+            assert!(fake.stop_ask_ids().is_empty());
+        } else {
+            // The stop names the ask of this request, not the whole tab.
+            assert_eq!(fake.stop_ask_ids(), *fake.ids.lock().unwrap());
+        }
         gw.shutdown();
     }
 
@@ -1791,6 +1745,50 @@ mod tests {
             }
             // One ask per request: nothing was resent.
             assert_eq!(fake.sent_texts().len(), 2, "stream={}", stream);
+            gw.shutdown();
+        }
+    }
+
+    /// An image over the limit is no error: the turn goes, with a note in
+    /// the image's place and no file (a refusal would refuse every later turn
+    /// of the session, the image staying in OpenCode's history).
+    #[test]
+    fn an_image_over_the_limit_becomes_a_note_and_the_turn_goes() {
+        use crate::images::tests::{data_url, png_of};
+        let big = data_url("image/png", &png_of(2_200_000));
+        for stream in [false, true] {
+            let fake = FakeBackend::new();
+            fake.set_attachments(true);
+            fake.push_reply(Ok(("Не вижу изображения.".into(), Some(CHAT.into()))));
+            let gw = start_with(&fake, |c| c.first_byte_wait_ms = 10_000);
+            let body = json!({
+                "model": "chatgpt-web",
+                "messages": [
+                    { "role": "system", "content": "rules" },
+                    { "role": "user", "content": [
+                        { "type": "text", "text": "что на снимке?" },
+                        { "type": "image_url", "image_url": { "url": big } },
+                    ] },
+                ],
+                "stream": stream,
+            })
+            .to_string();
+            let resp = call(
+                gw.port(),
+                "POST",
+                "/v1/chat/completions",
+                Some(TOKEN),
+                Some(&body),
+            );
+            assert_eq!(resp.status, 200, "stream={}", stream);
+            let sent = fake.sent_texts();
+            assert_eq!(sent.len(), 1, "stream={}", stream);
+            assert!(
+                sent[0].contains("[изображение не отправлено: 2,1 МБ, предел 700 КБ на сообщение]"),
+                "{}",
+                sent[0]
+            );
+            assert_eq!(fake.sent_files(), vec![Vec::new()]);
             gw.shutdown();
         }
     }
@@ -2632,7 +2630,8 @@ mod tests {
         gw.shutdown();
     }
 
-    // ---- serialization
+    // ---- serialization (limit 1: the fake extension reports no own tabs,
+    // as one older than several sessions at once)
 
     #[test]
     fn requests_are_serialized() {
@@ -2943,7 +2942,8 @@ mod tests {
         std::mem::forget(cancel.begin_ask().expect("ask begins"));
         let handler = {
             let cancel = cancel.clone();
-            thread::spawn(move || cancel.cancel(&PanickingStop))
+            // No own tabs reported, nothing else running: the plain stop.
+            thread::spawn(move || cancel.cancel(&PanickingStop, 0))
         };
         assert!(handler.join().is_err(), "stop panicked");
         // The worker is not left waiting for a stop that will never finish.
@@ -3130,29 +3130,31 @@ mod tests {
             cfg: Config::with_token(TOKEN.to_string()),
             backend: Box::new(PanickingAsk(stops.clone())),
             cooldown: Cooldown::new(dir.join("cooldown.json")),
-            gate: TurnGate::new(Engine::new(
+            lanes: Arc::new(Lanes::new(3)),
+            engine: Engine::new(
                 Sessions::new(dir.clone()),
                 Vec::new(),
                 Cooldown::new(dir.join("cooldown.json")),
-            )),
+            ),
             hangups: std::sync::atomic::AtomicUsize::new(0),
             body_reads: std::sync::atomic::AtomicUsize::new(0),
         });
         let req: ChatRequest =
             serde_json::from_str(&chat_body("chatgpt-web", "hi", false)).unwrap();
+        let key = Sessions::key_for(&[], &req);
         let cancel = Cancel::default();
         let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_turn(&sh, Place::take(&sh), &req, &[], &cancel)
+            run_turn(&sh, Some(Place::take(&sh, key.clone())), &req, &[], &cancel)
         }));
         assert!(got.is_err(), "the ask panicked");
         assert!(!lock(&cancel.state).in_ask, "the ask was ended");
         // A client leaving now must not stop a generation that is not this
         // request's.
-        cancel.cancel(&*sh.backend);
+        cancel.cancel(&*sh.backend, 0);
         assert_eq!(stops.load(Ordering::SeqCst), 0);
         assert!(
-            sh.gate.acquire(Duration::from_millis(100)).is_some(),
-            "the gate is free"
+            sh.lanes.acquire(&key, Duration::from_millis(100)).is_some(),
+            "the session's lane is free"
         );
     }
 
@@ -3283,85 +3285,509 @@ mod tests {
         gw.shutdown();
     }
 
+    // ---- several sessions at once
+
+    /// Answer every ask with its own question, in its own chat (a new chat
+    /// is named after the question).
+    fn answer_by_question(fake: &FakeBackend) {
+        fake.set_responder(|text, target| {
+            let question = user_of(text);
+            let url = match target {
+                ChatTarget::Conversation { url } => url.clone(),
+                ChatTarget::NewChat => format!(
+                    "https://chatgpt.com/c/{:016x}",
+                    crate::session::fnv1a(question.as_bytes())
+                ),
+            };
+            Ok((format!("ответ: {}", question), Some(url)))
+        });
+    }
+
+    /// A gateway with `max_parallel` as given whose extension reports 8 own
+    /// tabs, after one turn (of its own session) has told it the limit.
+    /// Every ask is answered with its own question.
+    fn start_parallel(
+        fake: &Arc<FakeBackend>,
+        max_parallel: u32,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Running {
+        fake.set_own_tabs(Some(8));
+        answer_by_question(fake);
+        let gw = start_with(fake, move |c| {
+            c.max_parallel = max_parallel;
+            c.keepalive_ms = 50;
+            c.first_byte_wait_ms = 20;
+            tweak(c);
+        });
+        assert_eq!(gw.limit(), 1, "one at a time until a status names own tabs");
+        let warm_up = chat_body("chatgpt-web", "разминка", false);
+        let resp = read_response(send_session(gw.port(), "ses_warm", &warm_up));
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(gw.limit(), max_parallel as usize);
+        gw
+    }
+
+    /// A request of `session` with one question, in the background: its
+    /// status and its answer (or error body).
+    fn ask_in_background(
+        port: u16,
+        session: &str,
+        question: &str,
+    ) -> thread::JoinHandle<(u16, String)> {
+        let session = session.to_string();
+        let body = chat_body("chatgpt-web", question, false);
+        thread::spawn(move || {
+            let resp = read_response(send_session(port, &session, &body));
+            let text = match resp.status {
+                200 => resp.json()["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+                _ => resp.text(),
+            };
+            (resp.status, text)
+        })
+    }
+
+    /// The questions of the asks so far, the warm-up left out.
+    fn questions(fake: &FakeBackend) -> Vec<String> {
+        asked(fake)
+            .into_iter()
+            .filter(|q| q != "разминка")
+            .collect()
+    }
+
     #[test]
-    fn turn_gate_serves_waiters_first_come_first_served() {
-        let gate = Arc::new(TurnGate::new(()));
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let held = gate.acquire(Duration::from_secs(1)).unwrap();
-        let mut waiters = Vec::new();
-        for (i, name) in ["A", "B", "C"].into_iter().enumerate() {
-            let (line, order) = (gate.clone(), order.clone());
-            waiters.push(thread::spawn(move || {
-                let _turn = line.acquire(Duration::from_secs(5)).unwrap();
-                lock(&order).push(name);
-            }));
-            // Each waiter is in line before the next one comes (the holder
-            // took the first ticket).
-            wait_for("the waiter to take its ticket", || {
-                gate.tickets_taken() == i as u64 + 2
+    fn turns_of_different_sessions_overlap_up_to_the_limit_and_the_next_waits() {
+        let fake = FakeBackend::new();
+        let gw = start_parallel(&fake, 2, |_| {});
+        let port = gw.port();
+        // The asks are held until the third request has waited a while.
+        fake.close_gate();
+        let mut requests = Vec::new();
+        for (i, s) in ["A", "B", "C"].into_iter().enumerate() {
+            requests.push(ask_in_background(
+                port,
+                &format!("ses_{}", s),
+                &format!("задача {}", s),
+            ));
+            wait_for("the request to take its place", || {
+                gw.tickets_taken() == i as u64 + 2
             });
         }
-        // The holder lets go and asks again at once: it is behind A, B and C.
-        drop(held);
-        let again = gate.acquire(Duration::from_secs(5)).unwrap();
-        lock(&order).push("D");
-        drop(again);
-        for w in waiters {
-            w.join().unwrap();
+        // Warm-up, A and B.
+        assert!(fake.wait_for_asks(3), "A and B reached the backend");
+        assert_eq!(gw.running(), 2);
+        // C stands in line: no seat is free. Nothing here can let it in, so
+        // the wait only gives a wrong gateway the chance to show.
+        let_time_pass(Duration::from_millis(100));
+        // A and B in either order: they run side by side.
+        let mut asked = questions(&fake);
+        asked.sort();
+        assert_eq!(asked, ["задача A", "задача B"]);
+        fake.open_gate();
+        for (r, s) in requests.into_iter().zip(["A", "B", "C"]) {
+            assert_eq!(r.join().unwrap(), (200, format!("ответ: задача {}", s)));
         }
-        assert_eq!(*lock(&order), ["A", "B", "C", "D"]);
+        assert_eq!(fake.max_concurrent.load(Ordering::SeqCst), 2);
+        gw.shutdown();
     }
 
     #[test]
-    fn turn_gate_serves_tickets_in_the_order_they_were_taken() {
-        // The ticket is taken when the request arrives; the handler may come
-        // to wait later than one that arrived after it.
-        let gate = Arc::new(TurnGate::new(()));
-        let order = Arc::new(Mutex::new(Vec::new()));
-        let a = gate.ticket();
-        let b = gate.ticket();
-        let second = {
-            let (gate, order) = (gate.clone(), order.clone());
-            thread::spawn(move || {
-                let _turn = gate.wait(b, Duration::from_secs(5)).unwrap();
-                lock(&order).push("B");
+    fn turns_of_one_session_never_overlap_and_keep_their_order() {
+        let fake = FakeBackend::new();
+        let gw = start_parallel(&fake, 3, |_| {});
+        let port = gw.port();
+        fake.close_gate();
+        let mut requests = Vec::new();
+        for i in 0..3 {
+            requests.push(ask_in_background(port, "ses_one", &format!("вопрос {}", i)));
+            wait_for("the request to take its place", || {
+                gw.tickets_taken() == i as u64 + 2
+            });
+        }
+        assert!(fake.wait_for_asks(2), "the first reached the backend");
+        // Seats are free, but the session has its turn running.
+        let_time_pass(Duration::from_millis(100));
+        assert_eq!(gw.running(), 1);
+        assert_eq!(questions(&fake), ["вопрос 0"]);
+        fake.open_gate();
+        for (i, r) in requests.into_iter().enumerate() {
+            assert_eq!(r.join().unwrap(), (200, format!("ответ: вопрос {}", i)));
+        }
+        assert_eq!(questions(&fake), ["вопрос 0", "вопрос 1", "вопрос 2"]);
+        assert_eq!(fake.max_concurrent.load(Ordering::SeqCst), 1);
+        gw.shutdown();
+    }
+
+    #[test]
+    fn the_limit_is_1_without_own_tabs_and_follows_every_status() {
+        let fake = FakeBackend::new();
+        answer_by_question(&fake);
+        let gw = start_with(&fake, |c| c.max_parallel = 3);
+        let port = gw.port();
+        let turn = |own_tabs: Option<u32>| {
+            fake.set_own_tabs(own_tabs);
+            assert_eq!(
+                ask_in_background(port, "ses_l", "привет").join().unwrap().0,
+                200
+            );
+            gw.limit()
+        };
+        // An extension (or host) older than `own_tabs`: one at a time.
+        assert_eq!(turn(None), 1);
+        assert_eq!(turn(Some(2)), 2);
+        assert_eq!(turn(Some(8)), 3, "max_parallel");
+        assert_eq!(turn(None), 1, "a later status without them");
+
+        // At limit 1 two sessions do not overlap.
+        fake.close_gate();
+        let a = ask_in_background(port, "ses_a", "задача A");
+        assert!(fake.wait_for_asks(5), "A reached the backend");
+        let b = ask_in_background(port, "ses_b", "задача B");
+        wait_for("B to take its place", || gw.tickets_taken() == 6);
+        let_time_pass(Duration::from_millis(100));
+        assert_eq!(fake.sent_texts().len(), 5, "B waits for A");
+        fake.open_gate();
+        assert_eq!(a.join().unwrap().0, 200);
+        assert_eq!(b.join().unwrap().0, 200);
+        assert_eq!(fake.max_concurrent.load(Ordering::SeqCst), 1);
+        gw.shutdown();
+    }
+
+    #[test]
+    fn waiting_for_a_seat_counts_against_the_turn_timeout() {
+        let fake = FakeBackend::new();
+        let gw = start_parallel(&fake, 2, |c| {
+            c.turn_timeout_ms = 250;
+            c.min_ask_budget_ms = 0;
+        });
+        let port = gw.port();
+        fake.close_gate();
+        let a = ask_in_background(port, "ses_a", "задача A");
+        let b = ask_in_background(port, "ses_b", "задача B");
+        assert!(fake.wait_for_asks(3), "A and B hold both seats");
+        // C finds no seat within its 250 ms: a 504 that may be resent.
+        let c = read_response(send_session(
+            port,
+            "ses_c",
+            &chat_body("chatgpt-web", "задача C", false),
+        ));
+        assert_eq!(c.status, 504, "{}", c.text());
+        let v = c.json();
+        assert_eq!(v["error"]["code"], "timeout");
+        assert_retry_advice(&v, c.header("x-should-retry"), true, "no seat");
+        fake.open_gate();
+        assert_eq!(a.join().unwrap().0, 200);
+        assert_eq!(b.join().unwrap().0, 200);
+        // A and B in either order.
+        let mut asked = questions(&fake);
+        asked.sort();
+        assert_eq!(asked, ["задача A", "задача B"], "C never reached ChatGPT");
+        gw.shutdown();
+    }
+
+    #[test]
+    fn a_hang_up_stops_only_its_own_ask_and_holds_only_its_own_session() {
+        let fake = FakeBackend::new();
+        let gw = start_parallel(&fake, 3, |_| {});
+        let port = gw.port();
+        fake.close_gate();
+        // A streams, B does not; both asks are held.
+        let mut a = send_session(port, "ses_a", &chat_body("chatgpt-web", "задача A", true));
+        let mut raw = Vec::new();
+        read_until(&mut a, &mut raw, |seen| {
+            seen.contains("\"role\":\"assistant\"")
+        });
+        assert!(fake.wait_for_asks(2), "A reached the backend");
+        let id_a = fake.ids.lock().unwrap()[1].clone();
+        let b = ask_in_background(port, "ses_b", "задача B");
+        assert!(fake.wait_for_asks(3), "B reached the backend");
+        // A's stop takes a while; the stop is long enough for anything that
+        // waited on it by mistake to show.
+        fake.set_stop_delay(Duration::from_millis(1_500));
+        drop(a);
+        wait_for("the stop to begin", || {
+            fake.log().contains(&"stop_begin".to_string())
+        });
+        // A's session sends again (it waits for the stop); another session
+        // starts at once.
+        let a2 = ask_in_background(port, "ses_a", "задача A");
+        let c = ask_in_background(port, "ses_c", "задача C");
+        assert!(fake.wait_for_asks(4), "C reached the backend");
+        assert!(
+            !fake.log().contains(&"stop_end".to_string()),
+            "C did not wait for A's stop: {:?}",
+            fake.log()
+        );
+        fake.open_gate();
+        assert_eq!(b.join().unwrap(), (200, "ответ: задача B".to_string()));
+        assert_eq!(c.join().unwrap(), (200, "ответ: задача C".to_string()));
+        assert_eq!(a2.join().unwrap(), (200, "ответ: задача A".to_string()));
+        // Only A's ask was stopped, by its id.
+        assert_eq!(fake.stop_ask_ids(), [id_a]);
+        assert_eq!(fake.stops.load(Ordering::SeqCst), 1);
+        // A's next ask came only after its stop had finished.
+        let log: Vec<String> = fake
+            .log()
+            .iter()
+            .map(|l| match l.strip_prefix("ask:") {
+                Some(text) => format!("ask:{}", user_of(text)),
+                None => l.clone(),
+            })
+            .collect();
+        let stop_end = log.iter().position(|l| l == "stop_end").unwrap();
+        let a_asks: Vec<usize> = (0..log.len())
+            .filter(|&i| log[i] == "ask:задача A")
+            .collect();
+        assert_eq!(a_asks.len(), 2, "{:?}", log);
+        assert!(a_asks[1] > stop_end, "{:?}", log);
+        assert!(
+            log.iter().position(|l| l == "ask:задача C").unwrap() < stop_end,
+            "{:?}",
+            log
+        );
+        gw.shutdown();
+    }
+
+    #[test]
+    fn a_rate_limit_in_one_session_pauses_every_session() {
+        let fake = FakeBackend::new();
+        let gw = start_parallel(&fake, 2, |_| {});
+        let port = gw.port();
+        // A hits the limit; B's ask was already out and is answered later,
+        // when the test lets it.
+        let (release_b, b_released) = mpsc::channel::<()>();
+        let b_released = Mutex::new(b_released);
+        fake.set_responder(move |text, target| {
+            let question = user_of(text);
+            if question == "задача A" {
+                return Err(BackendError::RateLimited);
+            }
+            if question == "задача B" {
+                lock(&b_released)
+                    .recv_timeout(Duration::from_secs(20))
+                    .expect("the test releases B");
+            }
+            let url = match target {
+                ChatTarget::Conversation { url } => url.clone(),
+                ChatTarget::NewChat => "https://chatgpt.com/c/other".to_string(),
+            };
+            Ok((format!("ответ: {}", question), Some(url)))
+        });
+        let before = now_ms();
+        fake.close_gate();
+        let a = ask_in_background(port, "ses_a", "задача A");
+        assert!(fake.wait_for_asks(2), "A is out");
+        let id_a = fake.ids.lock().unwrap()[1].clone();
+        let b = ask_in_background(port, "ses_b", "задача B");
+        assert!(fake.wait_for_asks(3), "B is out");
+        // C waits for a seat.
+        let c = ask_in_background(port, "ses_c", "задача C");
+        wait_for("C to take its place", || gw.tickets_taken() == 4);
+        fake.open_gate();
+        // A's 429 frees its seat for C, which finds the pause and asks nothing.
+        let (status, _) = a.join().unwrap();
+        assert_eq!(status, 429);
+        let (status, body) = c.join().unwrap();
+        assert_eq!(status, 429, "{}", body);
+        // A new session is refused before the line.
+        let d = read_response(send_session(
+            port,
+            "ses_d",
+            &chat_body("chatgpt-web", "задача D", false),
+        ));
+        assert_retry_after(&d, before);
+        // B's ask was out before the pause: its answer still arrives.
+        release_b.send(()).unwrap();
+        assert_eq!(b.join().unwrap(), (200, "ответ: задача B".to_string()));
+        assert_eq!(questions(&fake), ["задача A", "задача B"]);
+        // A's failed ask was stopped by its id, B's was left alone.
+        assert_eq!(fake.stop_ask_ids(), [id_a]);
+        gw.shutdown();
+    }
+
+    /// A responder that holds every ask until the test releases it (one
+    /// `send` per ask), then answers it with `answer(question)`.
+    fn held_answers(
+        fake: &FakeBackend,
+        answer: impl Fn(&str) -> Result<String, BackendError> + Send + Sync + 'static,
+    ) -> mpsc::Sender<()> {
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        fake.set_responder(move |text, target| {
+            let question = user_of(text);
+            lock(&released)
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the test releases the ask");
+            let url = match target {
+                ChatTarget::Conversation { url } => url.clone(),
+                ChatTarget::NewChat => "https://chatgpt.com/c/held".to_string(),
+            };
+            answer(&question).map(|text| (text, Some(url)))
+        });
+        release
+    }
+
+    #[test]
+    fn simultaneous_rate_limits_of_three_sessions_make_one_5_minute_pause() {
+        let fake = FakeBackend::new();
+        let gw = start_parallel(&fake, 3, |_| {});
+        let port = gw.port();
+        let release = held_answers(&fake, |_| Err(BackendError::RateLimited));
+        let before = now_ms();
+        let requests: Vec<_> = ["A", "B", "C"]
+            .into_iter()
+            .map(|s| {
+                let body = chat_body("chatgpt-web", &format!("задача {}", s), false);
+                let session = format!("ses_{}", s);
+                thread::spawn(move || read_response(send_session(port, &session, &body)))
+            })
+            .collect();
+        assert!(fake.wait_for_asks(4), "all three asks are out");
+        for _ in 0..3 {
+            release.send(()).unwrap();
+        }
+        // Each gets the same 5-minute pause, not 5, 15 and 30.
+        for r in requests {
+            assert_retry_after(&r.join().unwrap(), before);
+        }
+        let next = read_response(send_session(
+            port,
+            "ses_D",
+            &chat_body("chatgpt-web", "задача D", false),
+        ));
+        assert_retry_after(&next, before);
+        gw.shutdown();
+    }
+
+    #[test]
+    fn a_failed_ask_stops_only_itself_while_others_run_though_the_limit_dropped() {
+        for stop_ask in [
+            None,
+            Some(BackendError::Unavailable("нет ответа".into())),
+            Some(BackendError::Timeout),
+        ] {
+            let fake = FakeBackend::new();
+            let gw = start_parallel(&fake, 3, |_| {});
+            let port = gw.port();
+            let release = held_answers(&fake, |question| match question {
+                "задача A" => Err(BackendError::Timeout),
+                q => Ok(format!("ответ: {}", q)),
+            });
+            let a = ask_in_background(port, "ses_a", "задача A");
+            assert!(fake.wait_for_asks(2), "A is out");
+            let id_a = fake.ids.lock().unwrap()[1].clone();
+            let b = ask_in_background(port, "ses_b", "задача B");
+            assert!(fake.wait_for_asks(3), "B is out");
+            let c = ask_in_background(port, "ses_c", "задача C");
+            assert!(fake.wait_for_asks(4), "C is out");
+            assert_eq!(gw.running(), 3);
+            // A later status names no own tabs: the limit is 1 again while
+            // three turns still run.
+            fake.set_own_tabs(None);
+            gw.shared.lanes.set_own_tabs(None);
+            assert_eq!(gw.limit(), 1);
+            fake.set_stop_ask_error(stop_ask.clone());
+            // Answers are released in the order the asks wait: A first.
+            release.send(()).unwrap();
+            assert_eq!(a.join().unwrap().0, 504);
+            assert_eq!(fake.stop_ask_ids(), [id_a], "{:?}", stop_ask);
+            assert_eq!(fake.plain_stops(), 0, "{:?}: no plain stop", stop_ask);
+            release.send(()).unwrap();
+            release.send(()).unwrap();
+            assert_eq!(b.join().unwrap(), (200, "ответ: задача B".to_string()));
+            assert_eq!(c.join().unwrap(), (200, "ответ: задача C".to_string()));
+            gw.shutdown();
+        }
+    }
+
+    #[test]
+    fn a_stopped_turn_restores_its_session_while_another_session_goes_on() {
+        let fake = FakeBackend::new();
+        let gw = start_parallel(&fake, 2, |_| {});
+        let port = gw.port();
+        // Both sessions have their chat.
+        let first = |s: &str| {
+            json!({
+                "model": "chatgpt-web",
+                "messages": [{ "role": "user", "content": format!("задача {}", s) }],
             })
         };
-        // B has found the gate free but A first in line, and sleeps.
-        wait_for("B to wait for its turn", || gate.parked() >= 1);
-        assert!(lock(&order).is_empty(), "B went ahead of A");
-        let turn = gate.wait(a, Duration::from_secs(1)).unwrap();
-        lock(&order).push("A");
-        drop(turn);
-        second.join().unwrap();
-        assert_eq!(*lock(&order), ["A", "B"]);
-    }
-
-    #[test]
-    fn turn_gate_ticket_left_unused_leaves_the_line() {
-        let gate = TurnGate::new(());
-        let a = gate.ticket();
-        let b = gate.ticket();
-        gate.leave(a);
-        assert!(gate.wait(b, Duration::from_millis(100)).is_some());
-    }
-
-    #[test]
-    fn turn_gate_waiter_that_gives_up_leaves_the_line() {
-        let gate = Arc::new(TurnGate::new(()));
-        let held = gate.acquire(Duration::from_secs(1)).unwrap();
-        assert!(gate.acquire(Duration::from_millis(50)).is_none());
-        let next = {
-            let gate = gate.clone();
-            thread::spawn(move || gate.acquire(Duration::from_secs(5)).is_some())
+        for s in ["A", "B"] {
+            let resp = read_response(send_session(
+                port,
+                &format!("ses_{}", s),
+                &first(s).to_string(),
+            ));
+            assert_eq!(resp.status, 200);
+        }
+        let next = |s: &str, stream: bool| {
+            let mut body = first(s);
+            body["messages"].as_array_mut().unwrap().extend([
+                json!({"role": "assistant", "content": format!("ответ: задача {}", s)}),
+                json!({"role": "user", "content": format!("ещё {}", s)}),
+            ]);
+            body["stream"] = json!(stream);
+            body.to_string()
         };
-        // Held's ticket was taken first, the leaver's second, this one's third.
-        wait_for("the next one to take its ticket", || {
-            gate.tickets_taken() == 3
+        // A's next turn streams and its client leaves; B's next turn runs
+        // beside it all the while.
+        fake.close_gate();
+        let mut a = send_session(port, "ses_A", &next("A", true));
+        let mut raw = Vec::new();
+        read_until(&mut a, &mut raw, |seen| {
+            seen.contains("\"role\":\"assistant\"")
         });
-        drop(held);
-        assert!(next.join().unwrap(), "the one behind the leaver is served");
-        assert!(gate.acquire(Duration::from_millis(100)).is_some());
+        assert!(fake.wait_for_asks(4), "A's ask is out");
+        let b = {
+            let body = next("B", false);
+            thread::spawn(move || read_response(send_session(port, "ses_B", &body)))
+        };
+        assert!(fake.wait_for_asks(5), "B's ask is out");
+        drop(a);
+        wait_for("A's stop", || fake.stops.load(Ordering::SeqCst) == 1);
+        fake.open_gate();
+        let b = b.join().unwrap();
+        assert_eq!(b.status, 200);
+        assert_eq!(b.json()["choices"][0]["message"]["content"], "ответ: ещё B");
+        // A sends the same again: the note, its chat, no new chat. B goes on
+        // without a note.
+        let a = read_response(send_session(port, "ses_A", &next("A", false)));
+        assert_eq!(a.status, 200);
+        let mut b_next: Value = serde_json::from_str(&next("B", false)).unwrap();
+        b_next["messages"].as_array_mut().unwrap().extend([
+            json!({"role": "assistant", "content": "ответ: ещё B"}),
+            json!({"role": "user", "content": "и ещё B"}),
+        ]);
+        let b = read_response(send_session(port, "ses_B", &b_next.to_string()));
+        assert_eq!(b.status, 200);
+        let sent = fake.sent.lock().unwrap().clone();
+        let (a_retry, b_more) = (&sent[sent.len() - 2], &sent[sent.len() - 1]);
+        assert!(
+            a_retry.0.starts_with(crate::prompt::INTERRUPTED_NOTE),
+            "{}",
+            a_retry.0
+        );
+        assert_eq!(a_retry.0.matches("ещё A").count(), 1, "{}", a_retry.0);
+        assert!(!a_retry.0.contains("Правила шлюза"), "no new chat for A");
+        assert!(
+            !b_more.0.contains(crate::prompt::INTERRUPTED_NOTE),
+            "{}",
+            b_more.0
+        );
+        assert!(b_more.0.contains("и ещё B"), "{}", b_more.0);
+        assert!(!b_more.0.contains("Правила шлюза"), "no new chat for B");
+        // Each keeps its chat: the one its first question opened.
+        let chat_of = |question: &str| ChatTarget::Conversation {
+            url: format!(
+                "https://chatgpt.com/c/{:016x}",
+                crate::session::fnv1a(question.as_bytes())
+            ),
+        };
+        assert_eq!(a_retry.1, chat_of("задача A"));
+        assert_eq!(b_more.1, chat_of("задача B"));
+        gw.shutdown();
     }
 
     #[test]

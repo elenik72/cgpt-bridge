@@ -162,6 +162,13 @@ jobs:
           echo "name=$NAME"             >> "$GITHUB_OUTPUT"
           echo "file=dist/$NAME.$EXT"   >> "$GITHUB_OUTPUT"
           echo "sums=dist/SHA256SUMS"   >> "$GITHUB_OUTPUT"
+          # The Windows setup .exe (built after the installer checks); on the
+          # other systems the upload lists SHA256SUMS twice instead.
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            echo "setup=dist/$NAME-setup.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "setup=dist/SHA256SUMS" >> "$GITHUB_OUTPUT"
+          fi
 
       # The build script writes SHA256SUMS next to the bundle; check it
       # really matches the packed file before it is published.
@@ -259,6 +266,33 @@ jobs:
         shell: pwsh
         run: ./scripts/check-install-windows.ps1 -Bundle "${{ runner.temp }}/unpacked/${{ steps.bundle.outputs.name }}" -Shell pwsh
 
+      # The one-file setup for Windows: Inno Setup 6 wraps the unpacked
+      # bundle (what the checks above used) and runs its install.ps1. Inno
+      # Setup comes from the runner image, else from Chocolatey.
+      - name: Inno Setup (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc -and -not (Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Build setup.exe (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-setup.ps1 -Bundle "${{ runner.temp }}/unpacked/${{ steps.bundle.outputs.name }}" -OutDir dist
+
+      # Installs the .exe silently for the runner's own account, updates it,
+      # uninstalls it through its "Installed apps" entry, and again without
+      # the OpenCode agent; checks what each step leaves.
+      - name: Setup checks (Windows)
+        if: runner.os == 'Windows'
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./scripts/check-setup-windows.ps1 -Setup "${{ steps.bundle.outputs.setup }}"
+
       - name: Upload bundle artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -266,6 +300,7 @@ jobs:
           path: |
             ${{ steps.bundle.outputs.file }}
             ${{ steps.bundle.outputs.sums }}
+            ${{ steps.bundle.outputs.setup }}
           if-no-files-found: error
           retention-days: 30
           # The .zip / .tar.gz is already compressed; a second zlib pass only

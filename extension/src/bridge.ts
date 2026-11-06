@@ -14,14 +14,18 @@
 //   3. Incoming requests from the host are routed to a ChatGPT tab (see
 //      targetTab.ts for which one):
 //        - `ask` without a target (CLI) → the user's active ChatGPT tab;
-//        - `ask` with a target (gateway) → the extension's own tab, switched
-//          to the target chat first; the answer carries the chat's URL;
-//        - `stop` → cancel / stop the gateway ask in flight in the own tab,
-//          or with none in flight stop what still generates there; user
-//          tabs are never touched;
-//        - `stop_ask` (Ctrl+C in `cgpt ask`) → stop the one ask it names,
-//          in whatever tab it runs, and nothing else;
-//        - `status` → state of the own tab.
+//        - `ask` with a target (gateway) → a tab of the extension's own
+//          window (a pool of tabs, so several gateway sessions run at
+//          once), switched to the target chat first; the answer carries the
+//          chat's URL;
+//        - `stop` (older gateways) → cancel / stop every gateway ask in
+//          flight, in every own tab, or with none in flight stop what still
+//          generates in the own tab of the last one; user tabs are never
+//          touched;
+//        - `stop_ask` (Ctrl+C in `cgpt ask`, newer gateways) → stop the one
+//          ask it names, in whatever tab it runs, and nothing else;
+//        - `status` → state of an own tab, and how many own tabs the
+//          extension keeps at most.
 //      Asks run one at a time per tab and within `timeout_ms`.
 //   4. If the port disconnects (host died, manifest missing, allowed_origins
 //      mismatch), we back off and try to reconnect with bounded retries.
@@ -45,8 +49,10 @@ import {
   hostBuildOf,
   isValidProjectName,
   newRequestId,
+  parseAttachments,
   statusResultFrame,
   stoppedFrame,
+  type AskAttachment,
   type ChatTarget,
   type ExtensionRequest,
   type ExtensionResponse,
@@ -60,7 +66,7 @@ import {
   type AdapterDiagnostics,
 } from "./chatgptAdapter";
 import { addressOf, describeTab, injectPageScripts, onChatGpt } from "./reinject";
-import { TabChooser } from "./targetTab";
+import { OWN_TABS_MAX, TabChooser } from "./targetTab";
 
 interface HostAskRequest {
   type: "ask";
@@ -71,6 +77,10 @@ interface HostAskRequest {
   target?: unknown;
   // Validated by isValidProjectName.
   project?: unknown;
+  // Debug aid: only `true` asks for the raw answer stream.
+  capture_stream?: unknown;
+  // Validated by parseAttachments.
+  attachments?: unknown;
 }
 
 interface HostStopRequest {
@@ -170,12 +180,14 @@ export interface AskTabApi {
 /**
  * Sends a request to the tab's content script. `mayResend` is asked before a
  * request nobody received is sent again (see `sendToTab`): false once the
- * ask was cancelled.
+ * ask was cancelled. `injecting(true)` when nobody received the request and
+ * the page scripts go in, `injecting(false)` right before it is sent again.
  */
 export type SendToTab = (
   tabId: number,
   req: ExtensionRequest,
   mayResend?: () => boolean,
+  injecting?: (on: boolean) => void,
 ) => Promise<ExtensionResponse>;
 
 /** What an own-tab ask talks to: the tab events/queries and the content script. */
@@ -184,9 +196,20 @@ export interface AskDeps {
   sendToTab: SendToTab;
 }
 
-const tabs = new TabChooser(chrome, readOwnMark);
 const asksByTab = new TabQueue();
+const tabs = new TabChooser(chrome, readOwnMark, (tabId) => asksByTab.pending(tabId));
 const inFlight = new InFlight();
+// The own tab of the latest gateway ask: a `stop` with no gateway ask in
+// flight presses Stop there (its answer may still be generating).
+let lastOwnTabId: number | null = null;
+// Gateway asks that reached their tab and have ended (a timeout, say), by
+// the host's id, oldest first: a `stop_ask` for one of them stops what may
+// still generate in its tab (see handleStopAskFromHost).
+export const ENDED_ASK_MEMORY_MS = 5 * 60_000;
+const ENDED_ASK_MEMORY_MAX = 32;
+const endedOwnAsks = new Map<string, { tabId: number; endedAt: number }>();
+// The host's id of the last ask handed to each tab.
+const lastAskInTab = new Map<number, string>();
 const liveDeps: AskDeps = { api: chrome, sendToTab };
 
 /**
@@ -353,7 +376,11 @@ function respond(
   }
   const frame = capHostFrame(payload);
   if (frame !== payload) {
-    console.warn(`[cgpt-bridge] response for ${id} is over the host frame limit, sending an error`);
+    console.warn(
+      frame.type === "error"
+        ? `[cgpt-bridge] response for ${id} is over the host frame limit, sending an error`
+        : `[cgpt-bridge] response for ${id} is over the host frame limit with its stream capture: sent without it`,
+    );
   }
   try {
     // The outcome line keeps `cancelled` and `tab_busy` even when an older
@@ -395,8 +422,14 @@ async function handleAskFromHost(ask: HostAskRequest): Promise<void> {
   // has to fit before this.
   const startedAt = Date.now();
   const deadline = startedAt + ask.timeout_ms;
-  const end = (tabId: number | null, frame: HostResponseFrame): void =>
+  const end = (tabId: number | null, frame: HostResponseFrame): void => {
+    // A gateway ask's outcome tells the next choice whether its own tab
+    // may still be generating.
+    if (tabId !== null && ask.target !== undefined && ask.target !== null) {
+      tabs.noteOutcome(tabId, frame.type === "error" ? frame.code : null);
+    }
     logAskOutcome(ask.id, tabId, respond(ask.id, frame), startedAt);
+  };
   const parsed = parseHostTarget(ask.target);
   if (!parsed.ok) {
     end(null, errorFrame(ask.id, "bad_request", parsed.message));
@@ -405,6 +438,11 @@ async function handleAskFromHost(ask: HostAskRequest): Promise<void> {
   const target = parsed.target;
   if (ask.project !== undefined && !isValidProjectName(ask.project)) {
     end(null, errorFrame(ask.id, "bad_request", "project is not a valid ChatGPT project name"));
+    return;
+  }
+  const files = parseAttachments(ask.attachments);
+  if (!files.ok) {
+    end(null, errorFrame(ask.id, "bad_request", files.message));
     return;
   }
 
@@ -430,15 +468,21 @@ async function handleAskFromHost(ask: HostAskRequest): Promise<void> {
       return;
     }
     active.tabId = tabId;
+    if (target !== undefined) lastOwnTabId = tabId;
     if (active.cancelled) {
+      if (target !== undefined) tabs.unreserve(tabId);
       end(tabId, tabErrorFrame(ask.id, "cancelled", "cancelled by stop"));
       return;
     }
     // One ask per tab at a time: a second one would type into the chat the
-    // first one is using, and the stream tee / shim are per page.
-    const queued = await asksByTab.run(tabId, deadline, () =>
-      runAsk(ask, active, tabId, target, deadline),
+    // first one is using, and the stream tee / shim are per page. `run`
+    // counts the ask in the tab's queue at once, so the own tab's
+    // reservation can go right after the call.
+    const running = asksByTab.run(tabId, deadline, () =>
+      runAsk(ask, active, tabId, target, deadline, files.attachments),
     );
+    if (target !== undefined) tabs.unreserve(tabId);
+    const queued = await running;
     if (!queued.ran) {
       end(
         tabId,
@@ -453,6 +497,14 @@ async function handleAskFromHost(ask: HostAskRequest): Promise<void> {
     end(tabId, queued.value);
   } finally {
     inFlight.finish(active);
+    if (active.own && active.handedToTab && active.tabId !== null) {
+      endedOwnAsks.delete(ask.id);
+      endedOwnAsks.set(ask.id, { tabId: active.tabId, endedAt: Date.now() });
+      for (const id of endedOwnAsks.keys()) {
+        if (endedOwnAsks.size <= ENDED_ASK_MEMORY_MAX) break;
+        endedOwnAsks.delete(id);
+      }
+    }
   }
 }
 
@@ -462,6 +514,7 @@ async function runAsk(
   tabId: number,
   target: ChatTarget | undefined,
   deadline: number,
+  attachments: AskAttachment[],
 ): Promise<HostResponseFrame> {
   // A `stop` came while this ask waited for its turn: nothing is sent.
   if (active.cancelled) return tabErrorFrame(ask.id, "cancelled", "cancelled by stop");
@@ -478,18 +531,21 @@ async function runAsk(
     // The page keeps it: an extension reload or a browser restart can then
     // tell this window from the user's tabs.
     ...(ownMark === null ? {} : { ownMark }),
+    ...(ask.capture_stream === true ? { captureStream: true } : {}),
+    ...(attachments.length === 0 ? {} : { attachments }),
   };
   active.handedToTab = true;
+  lastAskInTab.set(tabId, ask.id);
   const resp =
     target === undefined
-      ? await sendToTab(tabId, req, () => !active.cancelled)
+      ? await sendToTab(tabId, req, () => !active.cancelled, (on) => (active.scriptsGoingIn = on))
       : await askOwnTab(liveDeps, tabId, req, active);
   if (!resp.ok) return tabErrorFrame(ask.id, resp.errorCode, resp.message);
   if (resp.kind !== "test.ask") {
     return errorFrame(ask.id, "internal", `unexpected tab response kind ${resp.kind}`);
   }
   if (target === undefined) await tabs.rememberLegacyTarget(tabId);
-  return askResultFrame(ask.id, resp.text, resp.conversationUrl, resp.warning ?? null);
+  return askResultFrame(ask.id, resp.text, resp.conversationUrl, resp.warning ?? null, resp.diagnostics ?? null);
 }
 
 function tabErrorFrame(id: string, contentCode: string, message: string): HostResponseFrame {
@@ -552,7 +608,12 @@ export async function sendWhenLoaded(
   if (!loaded.ok) return fail(loaded.code, loaded.message);
   for (let attempt = 0; ; attempt++) {
     if (active.cancelled) return fail("cancelled", "cancelled by stop");
-    const resp = await deps.sendToTab(tabId, req, () => !active.cancelled);
+    const resp = await deps.sendToTab(
+      tabId,
+      req,
+      () => !active.cancelled,
+      (on) => (active.scriptsGoingIn = on),
+    );
     if (
       resp.ok ||
       resp.errorCode !== "content_script_not_ready" ||
@@ -670,36 +731,47 @@ async function describeLoadTimeout(
   });
 }
 
+// The plain `stop` of a gateway that does not know `stop_ask`: it runs one
+// turn at a time, so a stop is about every gateway ask in flight.
 async function handleStopFromHost(req: HostStopRequest): Promise<void> {
-  const stopped = (wasGenerating: boolean): void => {
-    respond(req.id, stoppedFrame(req.id, wasGenerating));
-  };
-
-  // Only the own tab is touched (only the gateway sends stops); never press
+  // Only own tabs are touched (only the gateway sends stops); never press
   // Stop in a user tab.
-  const active = inFlight.forStop();
-  // No more (re-)sends from the background, for the ask running, those
-  // queued behind it and one whose tab is still being chosen.
+  const byTab = inFlight.ownByTab();
+  // No more (re-)sends from the background, for the asks running, those
+  // queued behind them and those whose tab is still being chosen.
   for (const own of inFlight.ownAsks()) own.cancelled = true;
-  let tabId: number;
-  let askId: string | undefined;
-  if (active !== null && active.tabId !== null) {
-    tabId = active.tabId;
-    askId = active.contentRequestId;
+  let presses: Array<{ tabId: number; askId: string | undefined }>;
+  if (byTab.size > 0) {
+    presses = [...byTab].map(([tabId, a]) => ({ tabId, askId: a.contentRequestId }));
   } else {
     // No ask in a tab — but the last one may have ended (timeout) while its
-    // answer still generates in the own tab.
-    const own = await tabs.ownTab().catch((err: unknown) => {
+    // answer still generates in its own tab.
+    const pool = await tabs.ownTabs().catch((err: unknown) => {
       console.warn("[cgpt-bridge] stop: could not read the gateway tab record:", err);
-      return null;
+      return [];
     });
-    if (own === null || typeof own.id !== "number") {
-      stopped(false);
+    const tab = pool.find((t) => t.id === lastOwnTabId) ?? pool[0];
+    if (tab === undefined) {
+      respond(req.id, stoppedFrame(req.id, false));
       return;
     }
-    tabId = own.id;
+    presses = [{ tabId: tab.id, askId: undefined }];
   }
-  await stopInTab(req, tabId, askId);
+  const outcomes = await Promise.all(presses.map((p) => pressStop(p.tabId, p.askId)));
+  const stopped = outcomes.filter((o): o is StopPressed => o.ok);
+  const failed = outcomes.find((o): o is StopFailed => !o.ok);
+  if (stopped.length === 0 && failed !== undefined) {
+    respondError(req.id, failed.code, failed.message);
+    return;
+  }
+  respond(
+    req.id,
+    stoppedFrame(
+      req.id,
+      stopped.some((o) => o.wasGenerating),
+      stopped.length > 0 && stopped.every((o) => o.otherChat),
+    ),
+  );
 }
 
 // A stop of the one ask it names (Ctrl+C in `cgpt ask`), in its tab — a
@@ -709,7 +781,7 @@ async function handleStopFromHost(req: HostStopRequest): Promise<void> {
 async function handleStopAskFromHost(req: HostStopAskRequest): Promise<void> {
   const named = typeof req.ask_id === "string" ? inFlight.named(req.ask_id) : null;
   if (named === null) {
-    respond(req.id, stoppedFrame(req.id, false));
+    await stopEndedOwnAsk(req);
     return;
   }
   // No more (re-)sends for it; the asks queued behind it go on.
@@ -720,49 +792,128 @@ async function handleStopAskFromHost(req: HostStopAskRequest): Promise<void> {
     respond(req.id, stoppedFrame(req.id, false, false, true));
     return;
   }
-  await stopInTab(req, named.tabId, named.contentRequestId);
+  await stopInTab(req, named.tabId, named.contentRequestId, named);
+}
+
+// A `stop_ask` for a gateway ask that has ended — the gateway gave up on
+// its turn (timeout, page failure, its client left) after the ask itself
+// timed out here — while its answer may still be generating in its pool
+// tab. Stop is pressed there only while that ask is the last one the tab
+// got and nothing runs or waits in it, the tab is still a pool tab on
+// chatgpt.com and the ask ended less than ENDED_ASK_MEMORY_MS ago. The
+// page has closed that ask, so the stop names none: it presses Stop only if
+// the page's last gateway turn, this ask's, still generates. A CLI ask that
+// is not in flight is never looked up: nothing is touched for it.
+async function stopEndedOwnAsk(req: HostStopAskRequest): Promise<void> {
+  const nothing = (): void => {
+    respond(req.id, stoppedFrame(req.id, false));
+  };
+  const askId = typeof req.ask_id === "string" ? req.ask_id : null;
+  const ended = askId === null ? undefined : endedOwnAsks.get(askId);
+  if (ended === undefined || Date.now() - ended.endedAt >= ENDED_ASK_MEMORY_MS) {
+    nothing();
+    return;
+  }
+  const { tabId } = ended;
+  const pool = await tabs.ownTabs().catch(() => []);
+  // A tab just chosen for a new ask counts as busy too (its reservation),
+  // so the Stop never reaches a turn that is about to start there.
+  const busy =
+    asksByTab.pending(tabId) > 0 ||
+    tabs.reservations(tabId) > 0 ||
+    inFlight.ownByTab().has(tabId);
+  if (!pool.some((t) => t.id === tabId) || busy || lastAskInTab.get(tabId) !== askId) {
+    nothing();
+    return;
+  }
+  await stopInTab(req, tabId, undefined);
+}
+
+interface StopPressed {
+  ok: true;
+  wasGenerating: boolean;
+  otherChat: boolean;
+  notSent: boolean;
+  // No content script took the stop (the page scripts may be going in).
+  noReceiver?: true;
+}
+interface StopFailed {
+  ok: false;
+  code: WireErrorCode;
+  message: string;
 }
 
 // Have the content script in `tabId` press Stop — for the ask `askId` only
-// when given (it leaves any other ask alone) — and answer the host.
-async function stopInTab(
-  req: HostStopRequest | HostStopAskRequest,
-  tabId: number,
-  askId: string | undefined,
-): Promise<void> {
-  const stopped = (wasGenerating: boolean, otherChat = false, notSent = false): void => {
-    respond(req.id, stoppedFrame(req.id, wasGenerating, otherChat, notSent));
-  };
+// when given (it leaves any other ask alone).
+async function pressStop(tabId: number, askId: string | undefined): Promise<StopPressed | StopFailed> {
   const resp = await sendToTab(tabId, {
     id: newRequestId(),
     type: "stop",
     ...(askId === undefined ? {} : { askId }),
   });
   if (resp.ok && resp.kind === "stop") {
-    // `not_sent` is for `stop_ask`: the gateway has no use for it.
-    stopped(resp.wasGenerating, resp.otherChat === true, req.type === "stop_ask" && resp.notSent === true);
-  } else if (
+    return {
+      ok: true,
+      wasGenerating: resp.wasGenerating,
+      otherChat: resp.otherChat === true,
+      notSent: resp.notSent === true,
+    };
+  }
+  if (
     !resp.ok &&
     (resp.errorCode === "content_script_not_ready" || resp.errorCode === "page_reloaded")
   ) {
     // Between page loads: the prompt has not reached this page.
-    stopped(false);
-  } else if (!resp.ok) {
-    respondError(req.id, mapTabErrorCode(resp.errorCode), resp.message);
-  } else {
-    respondError(req.id, "internal", `unexpected tab response kind ${resp.kind}`);
+    return {
+      ok: true,
+      wasGenerating: false,
+      otherChat: false,
+      notSent: false,
+      ...(resp.errorCode === "content_script_not_ready" ? { noReceiver: true as const } : {}),
+    };
   }
+  if (!resp.ok) return { ok: false, code: mapTabErrorCode(resp.errorCode), message: resp.message };
+  return { ok: false, code: "internal", message: `unexpected tab response kind ${resp.kind}` };
+}
+
+// `pressStop` for a `stop_ask`, and the answer to the host. `named`: the
+// ask in flight it is for. When no content script took the stop while that
+// ask's own request had not been received either (the page scripts were
+// going in for it), the ask ends `cancelled` without a resend: its prompt
+// was not sent, and the host is told so (`not_sent`).
+async function stopInTab(
+  req: HostStopAskRequest,
+  tabId: number,
+  askId: string | undefined,
+  named?: ActiveAsk,
+): Promise<void> {
+  const outcome = await pressStop(tabId, askId);
+  if (!outcome.ok) {
+    respondError(req.id, outcome.code, outcome.message);
+    return;
+  }
+  const notSent = outcome.notSent || (outcome.noReceiver === true && named?.scriptsGoingIn === true);
+  respond(req.id, stoppedFrame(req.id, outcome.wasGenerating, outcome.otherChat, notSent));
 }
 
 async function handleStatusFromHost(req: HostStatusRequest): Promise<void> {
-  const own = await tabs.ownTab().catch((err: unknown) => {
+  const pool = await tabs.ownTabs().catch((err: unknown) => {
     console.warn("[cgpt-bridge] status: could not read the gateway tab record:", err);
-    return null;
+    return [];
   });
-  if (own === null || typeof own.id !== "number") {
+  // Any own tab tells whether the window is signed in; one with no ask in it
+  // answers at once.
+  const own = pool.find((t) => asksByTab.pending(t.id) === 0) ?? pool[0];
+  if (own === undefined) {
     respond(
       req.id,
-      statusResultFrame(req.id, { tabOpen: false, loggedIn: false, conversationUrl: null }),
+      statusResultFrame(req.id, {
+        tabOpen: false,
+        loggedIn: false,
+        conversationUrl: null,
+        ownTabs: OWN_TABS_MAX,
+        attachments: true,
+      }),
     );
     return;
   }
@@ -780,6 +931,8 @@ async function handleStatusFromHost(req: HostStatusRequest): Promise<void> {
         : tabPath === null
           ? null
           : CHATGPT_ORIGIN + tabPath,
+      ownTabs: OWN_TABS_MAX,
+      attachments: true,
     }),
   );
 }
@@ -799,6 +952,10 @@ function mapTabErrorCode(contentCode: string): WireErrorCode {
     case "target_mismatch":
     case "chat_url_missing":
     case "page_reloaded":
+    // The files did not upload, or an earlier ask's files could not be
+    // removed; nothing was sent (the message says so).
+    case "attachment_upload_failed":
+    case "attachments_left_over":
       return "dom_failure";
     // Refused before anything was typed: an earlier answer still generating,
     // or another ask running in the tab.
@@ -835,6 +992,7 @@ async function sendToTab(
   tabId: number,
   req: ExtensionRequest,
   mayResend: () => boolean = () => true,
+  injecting: (on: boolean) => void = () => {},
 ): Promise<ExtensionResponse> {
   const first = await sendOnce(tabId, req);
   if (!("noReceiver" in first)) return first;
@@ -848,10 +1006,12 @@ async function sendToTab(
         : `the tab left chatgpt.com, it is at ${addressOf(before.url ?? "(no address)")}`;
     return notReady(req, `${first.noReceiver} (${where}; nothing was injected)`);
   }
+  injecting(true);
   const notInjected = await injectUnlessCancelled(tabId, mayResend);
   if (notInjected === CANCELLED || !mayResend()) {
     return { id: req.id, ok: false, errorCode: "cancelled", message: "cancelled by stop" };
   }
+  injecting(false);
   const again = notInjected === null ? await sendOnce(tabId, req) : first;
   if (!("noReceiver" in again)) return again;
   const tab = await chrome.tabs.get(tabId).catch(() => null);

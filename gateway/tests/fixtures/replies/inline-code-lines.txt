@@ -1,0 +1,10 @@
+Сначала прочитаю файл сканера.
+`[`
+`  {`
+`    "name": "read",`
+`    "arguments": {`
+`      "path": "C:\\scanner opencode\\Scanner.cs",`
+`      "offset": 1`
+`    }`
+`  }`
+`]`

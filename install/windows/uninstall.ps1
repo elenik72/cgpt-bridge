@@ -18,15 +18,16 @@
     template
     from %LOCALAPPDATA%\cgpt-bridge (the folder itself only when nothing else
     is left in it);
-  - removes the gateway config, sessions and rate-limit state
+  - removes the gateway config, sessions, rate-limit state and records of unread answers
     (%APPDATA%\cgpt-gateway);
   - removes provider "cgpt" from the OpenCode config, small_model if it is
     cgpt/local-title, model if it names a cgpt/ model and default_agent if it
     is cgpt and no agent cgpt is left (the previous file is kept as
     opencode.json.bak);
-  - removes the OpenCode agent cgpt (opencode\agents\cgpt.md) if it is the
-    one install.ps1 wrote (a copy the user edited is kept as cgpt.md.bak), and
-    the agents folder if that leaves it empty.
+  - removes the OpenCode agents cgpt and cgpt-sub (opencode\agents\cgpt.md
+    and cgpt-sub.md), each if it is the one install.ps1 wrote (a copy the
+    user edited is kept as <name>.md.bak), and the agents folder if that
+    leaves it empty.
 #>
 param()
 
@@ -46,7 +47,7 @@ $ApprovedKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Startup
 $Gw = Join-Path $env:APPDATA 'cgpt-gateway'
 $ConfigHome = if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $env:USERPROFILE '.config' }
 $OpenCode = Join-Path $ConfigHome 'opencode\opencode.json'
-$Agent = Join-Path $ConfigHome 'opencode\agents\cgpt.md'
+$Agents = Join-Path $ConfigHome 'opencode\agents'
 $status = 0
 
 if ($PSVersionTable.PSVersion.Major -lt 6) { Remove-TypeData -TypeName System.Array -ErrorAction SilentlyContinue }
@@ -101,41 +102,47 @@ if (Test-Path -Path $RegKey) {
   }
 }
 
-Write-Host "==> OpenCode agent cgpt: $Agent"
-# Ours by the marks install.ps1 checks too; an agent the user wrote stays. A
-# copy of ours the user edited is kept as cgpt.md.bak.
-try {
-  $agentFile = Resolve-Link $Agent
-  if (Test-Path -LiteralPath $agentFile -PathType Leaf) {
-    $text = [System.IO.File]::ReadAllText($agentFile)
-    if (($text -cmatch '(?m)^model: cgpt/chatgpt-web[ \t\r]*$') -and ($text -cmatch '(?m)^description: ChatGPT Web \(bridge\)')) {
-      $installed = Join-Path $App 'opencode-agent-cgpt.md'
-      $keep = $null
-      if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) {
-        $keep = "no installed template to compare with: kept as $Agent.bak to be safe"
-      } elseif ([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($agentFile)) -cne
-                [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($installed))) {
-        $keep = "the file differs from the installed one: kept as $Agent.bak"
+# Remove-Agent <name>: agents\<name>.md, if ours by the marks install.ps1
+# checks too; an agent the user wrote stays. A copy of ours the user edited is
+# kept as <name>.md.bak.
+function Remove-Agent([string]$Name) {
+  $agent = Join-Path $Agents "$Name.md"
+  Write-Host "==> OpenCode agent ${Name}: $agent"
+  try {
+    $agentFile = Resolve-Link $agent
+    if (Test-Path -LiteralPath $agentFile -PathType Leaf) {
+      $text = [System.IO.File]::ReadAllText($agentFile)
+      if (($text -cmatch '(?m)^model: cgpt/chatgpt-web[ \t\r]*$') -and ($text -cmatch '(?m)^description: ChatGPT Web \(bridge\)')) {
+        $installed = Join-Path $App "opencode-agent-$Name.md"
+        $keep = $null
+        if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) {
+          $keep = "no installed template to compare with: kept as $agent.bak to be safe"
+        } elseif ([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($agentFile)) -cne
+                  [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($installed))) {
+          $keep = "the file differs from the installed one: kept as $agent.bak"
+        }
+        # A failed copy throws: the file then stays (see the catch below).
+        if ($keep) {
+          Copy-Item -LiteralPath $agentFile -Destination "$agent.bak" -Force
+          Write-Host "    $keep"
+        }
+        Remove-Item -LiteralPath $agentFile -Force
+        if ($agentFile -ne $agent) { Write-Host "    removed $agentFile; the link $agent to it is left in place" }
+        Remove-IfEmpty $Agents
+      } else {
+        Write-Host "    $agent is not ours; left in place"
       }
-      # A failed copy throws: the file then stays (see the catch below).
-      if ($keep) {
-        Copy-Item -LiteralPath $agentFile -Destination "$Agent.bak" -Force
-        Write-Host "    $keep"
-      }
-      Remove-Item -LiteralPath $agentFile -Force
-      if ($agentFile -ne $Agent) { Write-Host "    removed $agentFile; the link $Agent to it is left in place" }
-      Remove-IfEmpty (Split-Path -Parent $Agent)
-    } else {
-      Write-Host "    $Agent is not ours; left in place"
     }
+  } catch {
+    Write-Warning "could not remove $agent ($($_.Exception.Message)): agent $Name left in place; remove it by hand"
+    $script:status = 1
   }
-} catch {
-  Write-Warning "could not remove $Agent ($($_.Exception.Message)): agent cgpt left in place; remove it by hand"
-  $status = 1
 }
+Remove-Agent 'cgpt'
+Remove-Agent 'cgpt-sub'
 # default_agent "cgpt" is dropped from opencode.json below once no agent file
 # cgpt is left (it would name a missing agent), like a model of provider cgpt.
-$agentGone = -not (Test-Path -LiteralPath $Agent)
+$agentGone = -not (Test-Path -LiteralPath (Join-Path $Agents 'cgpt.md'))
 
 Write-Host "==> OpenCode provider cgpt: $OpenCode"
 try {
@@ -172,7 +179,8 @@ try {
 
 Write-Host "==> Files: $App"
 try {
-  foreach ($item in 'bin', 'extension', "$HostName.json", 'start-gateway.ps1', 'uninstall.ps1', 'gateway.log', 'opencode-agent-cgpt.md') {
+  foreach ($item in 'bin', 'extension', "$HostName.json", 'start-gateway.ps1', 'uninstall.ps1', 'gateway.log', 'opencode-agent-cgpt.md',
+                  'opencode-agent-cgpt-sub.md') {
     Remove-IfPresent (Join-Path $App $item)
   }
   Remove-IfEmpty $App
@@ -182,7 +190,7 @@ try {
 }
 
 Write-Host "==> Gateway config: $Gw"
-foreach ($item in 'sessions', 'config.json', 'cooldown.json') { Remove-IfPresent (Join-Path $Gw $item) }
+foreach ($item in 'sessions', 'captures', 'config.json', 'cooldown.json', 'unparsed.jsonl', 'unparsed.jsonl.1') { Remove-IfPresent (Join-Path $Gw $item) }
 Remove-IfEmpty $Gw
 
 foreach ($dir in $App, $Gw) {

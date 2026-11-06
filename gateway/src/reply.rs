@@ -14,6 +14,11 @@
 //! `<CodeBlock language="X">BODY</CodeBlock>`, instead of a fence; it is
 //! read as a fenced block labelled X. It also autolinks URLs inside the
 //! JSON as `[U](U)`; in argument strings such a link is read as plain `U`.
+//!
+//! Text without a `tool_calls` block that is still shaped like a call (see
+//! [`call_shaped`]) is never run: it only earns the repair request, so that
+//! a call ChatGPT wrote in another form is not lost as text. Live cases of
+//! every form are kept in `tests/fixtures/replies/`.
 
 use std::borrow::Cow;
 
@@ -38,6 +43,11 @@ pub enum ParseOutcome {
     /// No `tool_calls` block, but ChatGPT's own widget markup outside code
     /// blocks: what to ask ChatGPT instead, and the answer as text.
     Widget { problem: String, text: String },
+    /// No `tool_calls` block, but something shaped like a call in another
+    /// form (other keys, the OpenAI wire form, JSON without a block, a tool
+    /// name followed by its arguments): what to ask ChatGPT, and the answer
+    /// as text. Nothing of it is ever run.
+    CallShaped { problem: String, text: String },
 }
 
 /// ChatGPT's own interactive widgets reach the page text as their source
@@ -68,6 +78,14 @@ fn has_widget(text: &str) -> bool {
 pub fn parse_reply(text: &str, tools: &[Tool]) -> ParseOutcome {
     let (text, stray_calls_tag) = codeblocks_to_fences(text);
     let text = &*text;
+    // The whole answer twice over, word for word (seen live with the label
+    // `tool_calls id="..."`, cause not confirmed): the calls of one copy,
+    // which leave no doubt. Anything else is read as it is.
+    if let Some(half) = doubled_half(text).filter(|_| text.contains(LABEL)) {
+        if let calls @ ParseOutcome::Calls { .. } = parse_reply(half, tools) {
+            return calls;
+        }
+    }
     let blocks = fenced_blocks(text);
     let ours: Vec<&Block> = blocks
         .iter()
@@ -79,16 +97,11 @@ pub fn parse_reply(text: &str, tools: &[Tool]) -> ParseOutcome {
             // as text: ask for the right label instead.
             if let Some(b) = blocks
                 .iter()
-                .find(|b| b.closed && looks_like_calls(&b.body, tools))
+                .find(|b| looks_like_calls(&block_body(b), tools))
             {
-                let label = if b.label().is_empty() {
-                    "без метки"
-                } else {
-                    b.label()
-                };
                 return ParseOutcome::Invalid(format!(
                     "вызовы оформлены блоком «{}», нужна метка tool_calls",
-                    label
+                    label_name(b)
                 ));
             }
             if stray_calls_tag {
@@ -97,6 +110,27 @@ pub fn parse_reply(text: &str, tools: &[Tool]) -> ParseOutcome {
                      разобрать: пришли вызовы обычным блоком ```tool_calls"
                         .to_string(),
                 );
+            }
+            // Calls written line by line in inline code, no fence at all
+            // (live 05.11: `[`, `  {`, `"name": "shell",` ... each line in
+            // backticks): read them as the block they stand for.
+            if let Some((start, body)) = backticked_calls(text, tools) {
+                return match parse_calls(&body, tools) {
+                    Ok(calls) => ParseOutcome::Calls {
+                        prefix: text[..start].trim().to_string(),
+                        calls,
+                    },
+                    Err(problem) => ParseOutcome::Invalid(problem),
+                };
+            }
+            if let Some(found) = call_shaped_in(text, &blocks, tools) {
+                return match found {
+                    Found::Calls(problem) => ParseOutcome::Invalid(problem),
+                    Found::Shaped(problem) => ParseOutcome::CallShaped {
+                        problem,
+                        text: text.trim().to_string(),
+                    },
+                };
             }
             if has_widget(text) {
                 return ParseOutcome::Widget {
@@ -124,13 +158,381 @@ pub fn parse_reply(text: &str, tools: &[Tool]) -> ParseOutcome {
             "блок tool_calls не закрыт: после JSON-массива нужна строка ```".to_string(),
         );
     }
-    match parse_calls(&block.body, tools) {
+    // The same lines in inline code, inside the block (live 05.11).
+    let body = unwrap_backticked_lines(&block.body).unwrap_or_else(|| block.body.clone());
+    match parse_calls(&body, tools) {
         Ok(calls) => ParseOutcome::Calls {
             prefix: text[..block.start].trim().to_string(),
             calls,
         },
         Err(problem) => ParseOutcome::Invalid(problem),
     }
+}
+
+/// A line that is all one inline-code span: `` `x` ``, maybe indented.
+fn backticked_line(line: &str) -> Option<&str> {
+    let t = line.trim();
+    let inner = t.strip_prefix('`')?.strip_suffix('`')?;
+    (!inner.contains('`')).then_some(inner)
+}
+
+/// `body` with the backticks around every line removed, when every
+/// non-empty line is one inline-code span; `None` otherwise.
+fn unwrap_backticked_lines(body: &str) -> Option<String> {
+    let mut out = Vec::new();
+    let mut any = false;
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            out.push("");
+            continue;
+        }
+        out.push(backticked_line(line)?);
+        any = true;
+    }
+    any.then(|| out.join("\n"))
+}
+
+/// Outside fenced blocks, the first run of two or more lines that are each
+/// one inline-code span and together hold calls: where the run starts in
+/// `text`, and its lines without the backticks.
+fn backticked_calls(text: &str, tools: &[Tool]) -> Option<(usize, String)> {
+    let mut open: Option<Fence> = None;
+    let mut run: Option<(usize, Vec<&str>)> = None;
+    let mut offset = 0;
+    let check = |run: &mut Option<(usize, Vec<&str>)>| -> Option<(usize, String)> {
+        let (start, lines) = run.take()?;
+        if lines.len() < 2 {
+            return None;
+        }
+        let body = lines.join("\n");
+        looks_like_calls(&body, tools).then_some((start, body))
+    };
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let line = line.trim_end_matches(['\n', '\r']);
+        if let Some(fence) = &open {
+            if fence.closes(line) {
+                open = None;
+            }
+            continue;
+        }
+        if let Some((fence, _)) = fence_open(line) {
+            if let Some(found) = check(&mut run) {
+                return Some(found);
+            }
+            open = Some(fence);
+            continue;
+        }
+        match backticked_line(line) {
+            Some(inner) => run.get_or_insert_with(|| (start, Vec::new())).1.push(inner),
+            None if line.trim().is_empty() => {}
+            None => {
+                if let Some(found) = check(&mut run) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    check(&mut run)
+}
+
+/// A block's body, the backticks around its lines removed when every line
+/// is one inline-code span.
+fn block_body(b: &Block) -> String {
+    unwrap_backticked_lines(&b.body).unwrap_or_else(|| b.body.clone())
+}
+
+/// A block's label as the repair request names it.
+fn label_name(b: &Block) -> &str {
+    if b.label().is_empty() {
+        "без метки"
+    } else {
+        b.label()
+    }
+}
+
+/// What [`call_shaped_in`] found.
+enum Found {
+    /// Calls in the gateway's own form (`name` of an offered tool and
+    /// `arguments`), only not in a `tool_calls` block.
+    Calls(String),
+    /// A call in another form.
+    Shaped(String),
+}
+
+/// Keys ChatGPT has been seen to use (or may use) for a tool's name and for
+/// its arguments in call-like JSON. `function` is the OpenAI wire form.
+const NAME_KEYS: [&str; 4] = ["name", "tool", "tool_name", "recipient_name"];
+const ARGS_KEYS: [&str; 5] = ["arguments", "args", "parameters", "input", "params"];
+/// Keys of an object that wraps a list of calls.
+const WRAPPER_KEYS: [&str; 3] = ["tool_calls", "calls", "tool_uses"];
+
+/// The offered tool `name` stands for (`functions.<name>` is OpenAI's
+/// recipient form).
+fn offered<'a>(name: &str, tools: &'a [Tool]) -> Option<&'a Tool> {
+    let name = name.strip_prefix("functions.").unwrap_or(name);
+    tools.iter().find(|t| t.function.name == name)
+}
+
+/// The name of the tool a call-like JSON value calls, when it is one in a
+/// form other than the gateway's own: an object (or a non-empty array of
+/// objects, or an object wrapping such an array under `tool_calls`) that
+/// names an offered tool under a name key and has arguments under an
+/// arguments key, or `{"function": {"name": ...}}` naming an offered tool.
+/// `{"name": X, "arguments": {...}}` counts for any X: an unknown name is
+/// still a call (one the repair names as unknown).
+fn shaped_call(value: &Value, tools: &[Tool]) -> Option<String> {
+    match value {
+        Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_object) => {
+            items.iter().find_map(|i| shaped_call(i, tools))
+        }
+        Value::Object(obj) => {
+            if let Some(inner) = WRAPPER_KEYS.iter().find_map(|k| obj.get(*k)) {
+                return shaped_call(inner, tools);
+            }
+            if let Some(name) = obj
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .filter(|n| offered(n, tools).is_some())
+            {
+                return Some(name.to_string());
+            }
+            if let (Some(name), Some(args)) = (
+                obj.get("name").and_then(Value::as_str),
+                obj.get("arguments"),
+            ) {
+                if args.is_object() || args.is_string() {
+                    return Some(name.to_string());
+                }
+            }
+            let name = NAME_KEYS
+                .iter()
+                .chain(["function"].iter())
+                .filter_map(|k| obj.get(*k).and_then(Value::as_str))
+                .find(|n| offered(n, tools).is_some())?;
+            // A tool's definition (`description`, `parameters` as a JSON
+            // schema) names it too, and is no call.
+            let schema_like = |a: &Value| {
+                a.get("properties").is_some() || a.get("type") == Some(&Value::from("object"))
+            };
+            let described = obj.contains_key("description");
+            ARGS_KEYS
+                .iter()
+                .filter_map(|k| obj.get(*k))
+                .any(|a| a.is_object() && !schema_like(a) && !described)
+                .then(|| name.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Whether `value` is an arguments object for `tool` and nothing else: not
+/// empty, every key a parameter of the tool, every required one there, and
+/// every type right.
+fn fits_tool(value: &Value, tool: &Tool) -> bool {
+    let Some(args) = value.as_object().filter(|a| !a.is_empty()) else {
+        return false;
+    };
+    let schema = &tool.function.parameters;
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return false;
+    };
+    args.keys().all(|k| props.contains_key(k)) && argument_problems(args, schema).is_empty()
+}
+
+/// The offered tools named as a whole word in `s` (not inside a longer word
+/// or a quoted JSON string).
+fn named_tools<'a>(s: &str, tools: &'a [Tool]) -> Vec<&'a Tool> {
+    tools
+        .iter()
+        .filter(|t| word_at(s, &t.function.name).next().is_some())
+        .collect()
+}
+
+/// Byte offsets just past every whole-word occurrence of `word` in `s`.
+fn word_at<'a>(s: &'a str, word: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let part = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '"' | '.' | '/');
+    s.match_indices(word).filter_map(move |(i, _)| {
+        let end = i + word.len();
+        let before = s[..i].chars().next_back().is_none_or(|c| !part(c));
+        let after = s[end..].chars().next().is_none_or(|c| !part(c));
+        (before && after).then_some(end)
+    })
+}
+
+/// The first JSON value at the start of `s` (after whitespace), whatever
+/// follows it.
+fn json_prefix(s: &str) -> Option<Value> {
+    serde_json::Deserializer::from_str(s)
+        .into_iter::<Value>()
+        .next()?
+        .ok()
+}
+
+/// Something call-shaped in an answer without a `tool_calls` block:
+/// - a fenced block with any other label (or none), closed or not, holding
+///   call-like JSON;
+/// - call-like JSON outside fences, starting a line (maybe as one inline-code
+///   span);
+/// - an offered tool's name followed on its line (after `(`, `:`, spaces or
+///   backticks) by a JSON object that is exactly an arguments object of that
+///   tool, or a line naming a tool right before such an object (fenced or
+///   not).
+///
+/// Prose that only names a tool, JSON that is not call-like and code that is
+/// not JSON stay text.
+fn call_shaped_in(text: &str, blocks: &[Block], tools: &[Tool]) -> Option<Found> {
+    let shaped = |where_: &str, name: &str| {
+        let unknown = match offered(name, tools) {
+            Some(_) => String::new(),
+            None => {
+                let known: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
+                format!(
+                    "; инструмента «{}» нет, доступны: {}",
+                    name,
+                    known.join(", ")
+                )
+            }
+        };
+        Found::Shaped(format!(
+            "{} похоже на вызов инструмента, но это не блок tool_calls: вызовы пишутся \
+             блоком ```tool_calls с массивом [{{\"name\": \"...\", \"arguments\": {{...}}}}]{}",
+            where_, unknown
+        ))
+    };
+    // Fenced blocks of another label.
+    for b in blocks {
+        let body = block_body(b);
+        if let Ok(value) = serde_json::from_str::<Value>(body.trim()) {
+            if let Some(name) = shaped_call(&value, tools) {
+                return Some(shaped(&format!("блок «{}»", label_name(b)), &name));
+            }
+        }
+    }
+    // Lines outside fences: bare JSON, and a tool name with its arguments.
+    let mut prev_line = "";
+    let mut offset = 0;
+    let mut blocks_left = blocks.iter().peekable();
+    while offset < text.len() {
+        if let Some(b) = blocks_left.peek() {
+            if offset >= b.start {
+                // A block right after a line naming a tool: its body may be
+                // that tool's arguments.
+                if let Ok(value) = serde_json::from_str::<Value>(block_body(b).trim()) {
+                    if let Some(tool) = named_tools(prev_line, tools)
+                        .into_iter()
+                        .find(|t| fits_tool(&value, t))
+                    {
+                        return Some(shaped(
+                            &format!(
+                                "аргументы «{}» в блоке «{}»",
+                                tool.function.name,
+                                label_name(b)
+                            ),
+                            &tool.function.name,
+                        ));
+                    }
+                }
+                offset = b.end.max(offset + 1);
+                prev_line = "";
+                blocks_left.next();
+                continue;
+            }
+        }
+        let rest = &text[offset..];
+        let line_end = rest.find('\n').map_or(rest.len(), |i| i + 1);
+        let line = rest[..line_end].trim_end_matches(['\n', '\r']);
+        let inner = backticked_line(line).unwrap_or(line).trim_start();
+        if inner.starts_with('{') || inner.starts_with('[') {
+            // From the brace on, the value may run over several lines.
+            let from = if backticked_line(line).is_some() {
+                inner.to_string()
+            } else {
+                rest[rest.find(['{', '[']).unwrap_or(0)..].to_string()
+            };
+            if let Some(value) = json_prefix(&from) {
+                if is_calls(&value, tools) {
+                    return Some(Found::Calls(
+                        "вызовы написаны JSON без блока: нужен блок ```tool_calls".to_string(),
+                    ));
+                }
+                if let Some(name) = shaped_call(&value, tools) {
+                    return Some(shaped("JSON без блока", &name));
+                }
+                if let Some(tool) = named_tools(prev_line, tools)
+                    .into_iter()
+                    .find(|t| fits_tool(&value, t))
+                {
+                    let name = &tool.function.name;
+                    return Some(shaped(&format!("аргументы «{}» без блока", name), name));
+                }
+            }
+        }
+        for tool in tools {
+            let name = &tool.function.name;
+            for end in word_at(line, name) {
+                let after = line[end..].trim_start_matches(|c: char| {
+                    c.is_whitespace() || matches!(c, '`' | '(' | ':')
+                });
+                if !after.starts_with('{') {
+                    continue;
+                }
+                // The object may run past this line.
+                let at = offset + (line.len() - after.len());
+                if json_prefix(&text[at..]).is_some_and(|v| fits_tool(&v, tool)) {
+                    return Some(shaped(&format!("«{} {{...}}» текстом", name), name));
+                }
+            }
+        }
+        if !line.trim().is_empty() {
+            prev_line = line;
+        }
+        offset += line_end;
+    }
+    None
+}
+
+/// Most whitespace between the two copies of a doubled answer.
+const MAX_SEAM_BYTES: usize = 256;
+
+/// The first copy of an answer that is the same text twice over, when it
+/// is; `None` otherwise. The copies must be byte for byte the same; only
+/// whitespace at the ends and at the seam between them (none at all too:
+/// right after a closing fence) is not compared. Whitespace inside a copy
+/// counts: `rm -r ./build /tmp/x` and `rm -r ./build/tmp/x` are two calls.
+fn doubled_half(text: &str) -> Option<&str> {
+    let t = text.trim();
+    (0..=MAX_SEAM_BYTES.min(t.len()))
+        .filter(|seam| (t.len() - seam) % 2 == 0)
+        .find_map(|seam| {
+            let half = (t.len() - seam) / 2;
+            let (first, rest) = (t.get(..half)?, t.get(half..)?);
+            let (gap, second) = (rest.get(..seam)?, rest.get(seam..)?);
+            (half > 0 && gap.chars().all(char::is_whitespace) && first == second).then_some(first)
+        })
+}
+
+/// Whether the answer is the same text twice over (see [`doubled_half`]),
+/// for the gateway's log of unusual answers.
+pub fn is_doubled(text: &str) -> bool {
+    let (text, _) = codeblocks_to_fences(text);
+    doubled_half(&text).is_some()
+}
+
+/// Whether text handed out as the final answer still mentions calls: the
+/// block label, an `"arguments"` key, or an offered tool's name as a JSON
+/// string next to a `"name"` key. Weaker than [`call_shaped_in`] (no repair
+/// follows); only for the gateway's log of unusual answers.
+pub fn mentions_calls(text: &str, tools: &[Tool]) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains(LABEL)
+        || text.contains("\"arguments\"")
+        || (text.contains("\"name\"")
+            && tools
+                .iter()
+                .any(|t| text.contains(&format!("\"{}\"", t.function.name))))
 }
 
 /// The one automatic follow-up after an `Invalid` reply.
@@ -337,14 +739,19 @@ fn fence_len_for(body: &str) -> usize {
 /// A block body that is a call (with `arguments`) or a non-empty array of
 /// calls, every one named and at least one naming a known tool.
 fn looks_like_calls(body: &str, tools: &[Tool]) -> bool {
+    serde_json::from_str::<Value>(body.trim()).is_ok_and(|v| is_calls(&v, tools))
+}
+
+/// [`looks_like_calls`] for a parsed value.
+fn is_calls(value: &Value, tools: &[Tool]) -> bool {
     let known = |item: &Value| {
         item.get("name")
             .and_then(Value::as_str)
             .is_some_and(|n| tools.iter().any(|t| t.function.name == n))
     };
-    match serde_json::from_str::<Value>(body.trim()) {
-        Ok(Value::Object(obj)) => obj.contains_key("arguments") && known(&Value::Object(obj)),
-        Ok(Value::Array(items)) => {
+    match value {
+        Value::Object(obj) => obj.contains_key("arguments") && known(value),
+        Value::Array(items) => {
             !items.is_empty()
                 && items
                     .iter()
@@ -706,6 +1113,41 @@ mod tests {
             }
             other => panic!("expected Invalid, got {:?}", other),
         }
+    }
+
+    // Live 05.11 (Windows): calls written line by line in inline code.
+    const BACKTICKED: &str = "`[`\n`  {`\n`    \"name\": \"read\",`\n`    \"arguments\": {`\n`      \"path\": \"C:\\\\scanner opencode\\\\a.cs\",`\n`      \"offset\": 1`\n`    }`\n`  }`\n`]`";
+
+    #[test]
+    fn calls_line_by_line_in_inline_code_without_a_fence_are_calls() {
+        let text = format!("Сначала прочитаю файл.\n{}\n", BACKTICKED);
+        match parse_reply(&text, &tools()) {
+            ParseOutcome::Calls { prefix, calls } => {
+                assert_eq!(prefix, "Сначала прочитаю файл.");
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].0, "read");
+                assert_eq!(calls[0].1["path"], "C:\\scanner opencode\\a.cs");
+            }
+            other => panic!("expected Calls, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn calls_line_by_line_in_inline_code_inside_the_block_are_calls() {
+        let text = format!("```tool_calls\n{}\n```", BACKTICKED);
+        match parse_reply(&text, &tools()) {
+            ParseOutcome::Calls { calls, .. } => assert_eq!(calls[0].0, "read"),
+            other => panic!("expected Calls, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inline_code_lines_that_are_not_calls_stay_text() {
+        let text = "Команды:\n`git status`\n`git log --oneline`\n";
+        assert_eq!(
+            parse_reply(text, &tools()),
+            ParseOutcome::Text(text.trim().to_string())
+        );
     }
 
     #[test]
@@ -1133,10 +1575,12 @@ mod tests {
             }
             other => panic!("{:?}", other),
         }
-        // A fence and a CodeBlock both labelled tool_calls are two blocks.
+        // A fence and a CodeBlock both labelled tool_calls are two blocks
+        // (the same block twice over would be a doubled answer).
+        let other = "[{\"name\": \"read\", \"arguments\": {\"path\": \"c\"}}]";
         let two = format!(
             "```tool_calls\n{}\n```\n<CodeBlock language=\"tool_calls\">{}</CodeBlock>",
-            call, call
+            call, other
         );
         assert!(invalid(&two).contains("ровно один"));
         // Markup shown inside a fenced example is part of that example.
@@ -1359,5 +1803,297 @@ mod tests {
         let r = repair_request("вызов 1 (read): нет обязательного параметра «path»");
         assert!(r.contains("вызов 1 (read): нет обязательного параметра «path»"));
         assert!(r.contains("```tool_calls"));
+    }
+
+    /// OpenCode's real tools, from the captured first request.
+    fn opencode_tools() -> Vec<Tool> {
+        let req: crate::openai::ChatRequest =
+            serde_json::from_str(include_str!("../tests/fixtures/opencode-first.json")).unwrap();
+        req.tools.unwrap()
+    }
+
+    /// What a fixture answer must give.
+    enum Want {
+        /// These calls (name, arguments), and the text before them.
+        Calls(&'static str, Vec<(&'static str, Value)>),
+        /// A repair request (`Invalid`) naming all of these.
+        Invalid(&'static [&'static str]),
+        /// A repair request for a call in another form, naming all of these;
+        /// the answer as text if the repair fails.
+        Shaped(&'static [&'static str]),
+        /// The answer as text.
+        Text,
+    }
+
+    /// The answers under `tests/fixtures/replies/`, one per file, with what
+    /// the parser must make of them (see `tests/fixtures/replies`):
+    /// live cases name their date, the others are built after a live case
+    /// or a form ChatGPT is known to use.
+    fn fixtures() -> Vec<(&'static str, &'static str, Want)> {
+        macro_rules! fixture {
+            ($name:literal) => {
+                (
+                    $name,
+                    include_str!(concat!("../tests/fixtures/replies/", $name, ".txt")),
+                )
+            };
+        }
+        let with = |(name, text): (&'static str, &'static str), want| (name, text, want);
+        vec![
+            // After acceptance 02.11, step s12: the forbidden `curl … | sh`
+            // written as a `json` block under the old tool name `bash`, which
+            // went to OpenCode as text.
+            with(
+                fixture!("json-labelled-old-tool-name"),
+                Want::Shaped(&["блок «json»", "инструмента «bash» нет", "shell"]),
+            ),
+            // The same in the gateway's own form, only labelled `json`.
+            with(
+                fixture!("json-labelled-call"),
+                Want::Invalid(&["вызовы оформлены блоком «json», нужна метка tool_calls"]),
+            ),
+            // The OpenAI wire form in a `json` block.
+            with(
+                fixture!("json-labelled-openai-form"),
+                Want::Shaped(&["блок «json»"]),
+            ),
+            // A line naming `shell`, then its arguments alone in a block.
+            with(
+                fixture!("tool-name-then-json-block"),
+                Want::Shaped(&["аргументы «shell» в блоке «json»"]),
+            ),
+            // `read {...}` in prose.
+            with(
+                fixture!("tool-name-inline"),
+                Want::Shaped(&["«read {...}» текстом"]),
+            ),
+            // The gateway's own form without any block.
+            with(
+                fixture!("bare-json-call"),
+                Want::Invalid(&["JSON без блока"]),
+            ),
+            // The whole answer twice, label `tool_calls id="..."` (doubling
+            // seen live, cause not confirmed): the calls of one copy.
+            with(
+                fixture!("doubled-tool-calls-id"),
+                Want::Calls(
+                    "Посмотрю, где описан конфиг шлюза, и найду все его ключи.",
+                    vec![
+                        ("read", json!({"path": "gateway/src/config.rs"})),
+                        (
+                            "grep",
+                            json!({"pattern": "KNOWN_KEYS", "path": "gateway/src"}),
+                        ),
+                    ],
+                ),
+            ),
+            // Live 05.11 (Windows): every line of the call in inline code.
+            with(
+                fixture!("inline-code-lines"),
+                Want::Calls(
+                    "Сначала прочитаю файл сканера.",
+                    vec![(
+                        "read",
+                        json!({"path": "C:\\scanner opencode\\Scanner.cs", "offset": 1}),
+                    )],
+                ),
+            ),
+            // Live 05.11: attributes after the label.
+            with(
+                fixture!("label-with-attributes"),
+                Want::Calls(
+                    "Подготовлю ревью: посмотрю изменённые файлы.",
+                    vec![("shell", json!({"command": "git diff --stat main...HEAD"}))],
+                ),
+            ),
+            // Prose naming tools, a package.json, a tool's definition, JS
+            // code calling `read(...)`, a glob pattern alone: no call.
+            with(fixture!("prose-and-json-not-calls"), Want::Text),
+        ]
+    }
+
+    #[test]
+    fn fixture_answers_are_read_as_recorded() {
+        let tools = opencode_tools();
+        for (name, text, want) in fixtures() {
+            let got = parse_reply(text, &tools);
+            match (&want, &got) {
+                (
+                    Want::Calls(prefix, calls),
+                    ParseOutcome::Calls {
+                        prefix: p,
+                        calls: c,
+                    },
+                ) => {
+                    assert_eq!(p, prefix, "{}", name);
+                    let calls: Vec<(String, Value)> = calls
+                        .iter()
+                        .map(|(n, a)| (n.to_string(), a.clone()))
+                        .collect();
+                    assert_eq!(c, &calls, "{}", name);
+                }
+                (Want::Invalid(words), ParseOutcome::Invalid(problem))
+                | (Want::Shaped(words), ParseOutcome::CallShaped { problem, .. }) => {
+                    for w in *words {
+                        assert!(problem.contains(w), "{}: {:?} not in {}", name, w, problem);
+                    }
+                    // Repair asks for the block, and nothing of it is run.
+                    assert!(
+                        repair_request(problem).contains("```tool_calls"),
+                        "{}",
+                        name
+                    );
+                }
+                (Want::Text, ParseOutcome::Text(t)) => assert_eq!(t, text.trim(), "{}", name),
+                _ => panic!("{}: got {:?}", name, got),
+            }
+            if let ParseOutcome::CallShaped { text: t, .. } = &got {
+                assert_eq!(t, text.trim(), "{}: the text as it came", name);
+            }
+        }
+    }
+
+    #[test]
+    fn every_fixture_file_is_in_the_table() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/replies");
+        let mut files: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .trim_end_matches(".txt")
+                    .to_string()
+            })
+            .collect();
+        files.sort();
+        let mut listed: Vec<String> = fixtures().iter().map(|(n, _, _)| n.to_string()).collect();
+        listed.sort();
+        assert_eq!(files, listed);
+    }
+
+    #[test]
+    fn call_shaped_forms_ask_for_repair_and_near_misses_stay_text() {
+        let tools = opencode_tools();
+        let shaped = |text: &str| match parse_reply(text, &tools) {
+            ParseOutcome::CallShaped { problem, .. } => problem,
+            other => panic!("{:?}: expected CallShaped, got {:?}", text, other),
+        };
+        // Other keys for the name and the arguments, with or without a fence,
+        // closed or not, `functions.` before the name.
+        shaped("```\n{\"tool\": \"read\", \"args\": {\"path\": \"a\"}}\n```");
+        shaped(
+            "```javascript\n{\"tool_name\": \"glob\", \"parameters\": {\"pattern\": \"*\"}}\n```",
+        );
+        shaped("```json\n{\"recipient_name\": \"functions.read\", \"input\": {\"path\": \"a\"}}\n");
+        shaped("Вызываю:\n{\"tool\": \"shell\", \"params\": {\"command\": \"ls\"}}\n");
+        shaped("`{\"function\": {\"name\": \"read\", \"arguments\": \"{}\"}}`");
+        // A tool name with its arguments: after `(` or `:`, over two lines.
+        shaped("Читаю: read({\"path\": \"a\"})");
+        shaped("shell: {\"command\":\n  \"ls -la\"}");
+        // An unknown name in the gateway's own form names the known ones.
+        let problem =
+            shaped("```json\n[{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}]\n```");
+        assert!(
+            problem.contains("доступны: glob, grep, patch"),
+            "{}",
+            problem
+        );
+        // Unclosed, the gateway's own form: the label is wrong all the same.
+        assert!(matches!(
+            parse_reply(
+                "```json\n[{\"name\": \"read\", \"arguments\": {\"path\": \"a\"}}]\n",
+                &tools
+            ),
+            ParseOutcome::Invalid(_)
+        ));
+
+        for text in [
+            // Prose about tools.
+            "Инструмент read читает файл, shell запускает команду.",
+            "Я вызову read, когда ты пришлёшь путь: {путь}.",
+            // Arguments that do not fit the tool named before them.
+            "read {\"file\": \"a\"}",
+            "shell {\"command\": 5}",
+            "Пример для read:\n```json\n{\"path\": \"a\", \"encoding\": \"utf8\"}\n```",
+            // An object naming a tool, but no arguments.
+            "```json\n{\"tool\": \"read\"}\n```",
+            // A tool's definition.
+            "```json\n{\"tool\": \"read\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}\n```",
+            // Arguments-like JSON with no tool named before it.
+            "Маска:\n{\"pattern\": \"*.rs\"}",
+            // `read` inside another word or a path, and in code.
+            "reader {\"path\": \"a\"}\n./read {\"path\": \"a\"}",
+            "```js\nread({\"path\": \"a\"})\n```",
+        ] {
+            assert_eq!(
+                parse_reply(text, &tools),
+                ParseOutcome::Text(text.trim().to_string()),
+                "{:?}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn a_doubled_answer_gives_the_calls_once_and_other_doubles_are_read_as_they_are() {
+        let tools = opencode_tools();
+        let one =
+            "Читаю.\n```tool_calls\n[{\"name\": \"read\", \"arguments\": {\"path\": \"a\"}}]\n```";
+        // The copies meet right after the closing fence: one broken block,
+        // but the answer is still one answer twice.
+        let glued = format!("{}{}", one, one);
+        for text in [format!("{}\n{}", one, one), glued] {
+            assert!(is_doubled(&text));
+            match parse_reply(&text, &tools) {
+                ParseOutcome::Calls { prefix, calls } => {
+                    assert_eq!(prefix, "Читаю.");
+                    assert_eq!(calls, vec![("read".into(), json!({"path": "a"}))]);
+                }
+                other => panic!("{:?}", other),
+            }
+        }
+        // Copies that differ only by whitespace inside an argument are two
+        // different calls: two blocks, a repair, nothing run.
+        let spaced = "Удаляю.\n```tool_calls\n[{\"name\": \"shell\", \"arguments\": {\"command\": \"rm -r ./build /tmp/x\"}}]\n```";
+        let joined = spaced.replace("./build /tmp/x", "./build/tmp/x");
+        let near = format!("{}\n{}", spaced, joined);
+        assert!(!is_doubled(&near));
+        assert!(matches!(
+            parse_reply(&near, &tools),
+            ParseOutcome::Invalid(ref p) if p.contains("ровно один")
+        ));
+        // Whitespace around the copies and at the seam does not count.
+        let padded = format!("  {}\n\n \t{}\n", spaced, spaced);
+        assert!(matches!(
+            parse_reply(&padded, &tools),
+            ParseOutcome::Calls { ref calls, .. } if calls.len() == 1
+        ));
+        // Two different blocks stay two blocks.
+        let two = format!("{}\n{}", one, one.replace("\"a\"", "\"b\""));
+        assert!(!is_doubled(&two));
+        assert!(matches!(
+            parse_reply(&two, &tools),
+            ParseOutcome::Invalid(_)
+        ));
+        // Doubled text without calls is left as it is.
+        assert_eq!(
+            parse_reply("Готово. Готово.", &tools),
+            ParseOutcome::Text("Готово. Готово.".into())
+        );
+        assert!(!is_doubled("Готово. Готово!"));
+    }
+
+    #[test]
+    fn mentions_calls_flags_text_that_talks_in_calls() {
+        let tools = opencode_tools();
+        assert!(mentions_calls("пример: ```tool_calls ...", &tools));
+        assert!(mentions_calls(
+            "{\"name\": \"x\", \"arguments\": {}}",
+            &tools
+        ));
+        assert!(mentions_calls("{\"name\": \"read\"}", &tools));
+        assert!(!mentions_calls("Готово, файл прочитан (read).", &tools));
+        assert!(!mentions_calls("{\"name\": \"app\"}", &tools));
     }
 }

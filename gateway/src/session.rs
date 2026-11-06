@@ -460,6 +460,7 @@ pub mod tests {
             content: Some(Content::Parts(vec![Part {
                 kind: "text".into(),
                 text: Some("привет".into()),
+                ..Default::default()
             }])),
             ..Default::default()
         };

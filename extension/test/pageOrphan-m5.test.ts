@@ -52,3 +52,25 @@ test("orphan.a_reload_while_waiting_for_send_clicks_nothing", async () => {
     await settlePage();
   }
 });
+
+// Review N2: an orphan whose ask was already sent fails later (here at its
+// deadline: the answer never ends). Its abandonTurn must not press Stop:
+// the chat is the same session's, where the new script may be answering.
+test("orphan.a_sent_ask_that_fails_after_the_reload_presses_no_stop", async () => {
+  const chat = new AccountChat("/c/abc", [{ id: "m0", text: "An earlier answer." }]);
+  try {
+    chat.onSend = () => {
+      chat.beginTurn();
+      later(500, () => setExtensionContextAlive(false));
+    };
+    const reply = await ask("o3", "explain this failure", {
+      timeoutMs: TIMEOUT_MS,
+      target: { kind: "conversation", url: "https://chatgpt.com/c/abc" },
+    });
+    assert.equal(reply.ok, false, JSON.stringify(reply));
+    assert.deepEqual(chat.sentPrompts, ["explain this failure"]);
+    assert.equal(chat.stop.clicks, 0, "the orphan pressed Stop");
+  } finally {
+    await settlePage();
+  }
+});

@@ -2,7 +2,10 @@ import { submitBudgetMs, takeStop, type PageAskState } from "./askControl";
 import {
   assertAnsweredInTarget,
   assertAtTarget,
+  attachFiles,
   captureAnswerBaseline,
+  clearComposerAttachments,
+  composerAttachmentCount,
   currentConversationUrl,
   diagnose,
   findComposer,
@@ -12,16 +15,19 @@ import {
   lastTurnCancelled,
   openProjectForNewChat,
   openTarget,
+  pageCheckNow,
   previousAnswerRunning,
   generatingSignal,
   projectPageId,
   setComposerText,
   settlePreviousAnswer,
   setPageShimActive,
+  showsSameChatId,
   startKeepAlive,
   stopGenerating,
   stopKeepAlive,
   submit,
+  takeStreamCapture,
   targetMatchesPath,
   userTurnCount,
   waitForLoggedIn,
@@ -34,6 +40,7 @@ import {
   AnswerTimeoutError,
   ChatUrlMissingError,
   AskRunningError,
+  AttachmentsLeftOverError,
   CancelledError,
   ExtensionReloadedError,
   NotLoggedInError,
@@ -47,6 +54,9 @@ import {
 } from "./errors";
 import {
   isValidProjectName,
+  type AskDiagnostics,
+  parseAttachments,
+  type AskAttachment,
   type ChatTarget,
   type ExtensionRequest,
   type ExtensionResponse,
@@ -73,6 +83,9 @@ const LOGIN_GRACE_MS = 2_000;
 // conversation this long ends the ask (target_mismatch). Shorter visits, and
 // ChatGPT moving the address for a moment, are tolerated.
 const LEFT_TARGET_GRACE_MS = 3_000;
+// The files of an ask may take this long to upload (never past the time the
+// prompt needs to be sent).
+const ATTACH_WAIT_MS = 60_000;
 
 // The ask running in this page. The background sends at most one at a time
 // per tab; a second one (toolbar test, or a retry after a service-worker
@@ -242,6 +255,8 @@ function parseRequest(value: unknown): ExtensionRequest | null {
     const target = parseTarget(v.target);
     if (target === null) return null;
     if (v.project !== undefined && !isValidProjectName(v.project)) return null;
+    const files = parseAttachments(v.attachments);
+    if (!files.ok) return null;
     return {
       id: v.id,
       type: "test.ask",
@@ -253,6 +268,8 @@ function parseRequest(value: unknown): ExtensionRequest | null {
       ...(typeof v.deadlineMs === "number" ? { deadlineMs: v.deadlineMs } : {}),
       ...(v.reloaded === true ? { reloaded: true } : {}),
       ...(typeof v.ownMark === "string" && v.ownMark !== "" ? { ownMark: v.ownMark } : {}),
+      ...(v.captureStream === true ? { captureStream: true } : {}),
+      ...(files.attachments.length === 0 ? {} : { attachments: files.attachments }),
     };
   }
 
@@ -269,6 +286,14 @@ function parseRequest(value: unknown): ExtensionRequest | null {
   }
 
   return null;
+}
+
+// An ask's file as the page takes it.
+function attachmentFile(a: AskAttachment): File {
+  const binary = atob(a.dataBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new File([bytes], a.name, { type: a.mime });
 }
 
 // undefined: no target (untargeted ask); null: malformed target.
@@ -426,6 +451,22 @@ async function handleTestAsk(
       }
     };
 
+    // The saved address a gateway ask's new chat got after Send (its first
+    // `/c/<id>` path; the temporary `local-chatgpt` one does not count).
+    let newChatUrl: string | undefined;
+    // Fails when the page shows another chat than the new chat the prompt
+    // went to: a click in the bridge window's sidebar. Compared by chat id:
+    // the chat may get its project prefix after its first address.
+    const assertNewChatShown = (when: string): void => {
+      if (newChatUrl === undefined) return;
+      if (showsSameChatId(newChatUrl, location.pathname)) return;
+      throw new TargetMismatchError(
+        `The bridge window was switched to another chat by a click ${when}: it shows ${location.pathname}, ` +
+          `the prompt went to ${newChatUrl}. ChatGPT goes on answering it in that chat; ` +
+          `nothing was sent to the chat now shown. Do not click chats in the bridge window.`,
+      );
+    };
+
     // Run on every tick of the answer wait: a refused stop ends the ask, and
     // so does a page that stays away from the watched chat (a gateway ask's
     // conversation, or the saved chat a CLI ask was sent from; a new chat has
@@ -433,6 +474,9 @@ async function handleTestAsk(
     let awaySince = 0;
     const watchWait = (): void => {
       if (endRunningAsk?.ask === ask) throw endRunningAsk.err;
+      if (pageTarget?.kind === "new_chat" && ask.submitted && newChatUrl === undefined) {
+        newChatUrl = currentConversationUrl() ?? undefined;
+      }
       const watched = watchedChat();
       if (watched === undefined) return;
       if (targetMatchesPath(watched, location.pathname)) {
@@ -451,11 +495,31 @@ async function handleTestAsk(
     startKeepAlive();
     // Grace on top of the deadline so the shim outlives our own wait. Only
     // the shim's reports in this epoch belong to this ask.
-    const shimEpoch = await setPageShimActive(true, left() + 15_000);
+    const shimEpoch = await setPageShimActive(true, left() + 15_000, req.captureStream === true);
     let text: string;
+    const diagnostics: AskDiagnostics = {};
     try {
       const baseline = captureAnswerBaseline();
       checkpoint();
+      // An own tab may hold the files of an ask that failed before Send
+      // (maybe another session's): Send would carry them into this chat.
+      // They are removed, or nothing is sent.
+      if (target !== undefined && composerAttachmentCount() > 0 && !(await clearComposerAttachments())) {
+        throw new AttachmentsLeftOverError();
+      }
+      // The files first: they upload while the page waits, and Send is
+      // pressed only once every one has.
+      if (req.attachments !== undefined) {
+        checkpoint();
+        const budget = Math.min(ATTACH_WAIT_MS, left() - submitBudgetMs(req.timeoutMs));
+        if (budget <= 0) {
+          throw new AnswerTimeoutError(
+            `No time left to upload the files before the deadline (${left()} ms); the prompt was not sent.`,
+          );
+        }
+        await attachFiles(req.attachments.map(attachmentFile), { timeoutMs: budget, check: checkpoint });
+        checkpoint();
+      }
       await setComposerText(req.text);
       const earlyShimReports = await submit(() => {
         checkpoint();
@@ -468,14 +532,16 @@ async function handleTestAsk(
             ownChat ?? (projectId === null ? { kind: "new_chat" } : { kind: "new_chat", projectId });
           cliTurn = { ask, turn: { target: sentTo, prompt: req.text } };
         }
-      }, shimEpoch, deadline);
+      }, shimEpoch, deadline, deadline - submitBudgetMs(req.timeoutMs));
       // Gateway asks never return a cut-off answer at the deadline.
+      const seen = { streamText: null as string | null, streamDone: false };
       text = await waitForNewAnswer(baseline, left(), {
         partialOnTimeout: target === undefined,
         shimEpoch,
         earlyShimReports,
         check: watchWait,
         stopped: () => ask.cancelled,
+        seen,
       }).catch((err: unknown) => {
         // No answer (say, the stream ended without one) in a page that has
         // left the target chat: the cause is the switch, and the stop guard
@@ -484,8 +550,25 @@ async function handleTestAsk(
         if (watchedChat() !== undefined && err instanceof AnswerNotDetectedError) {
           assertInWatchedChat();
         }
+        if (err instanceof AnswerNotDetectedError) assertNewChatShown("while the answer was awaited");
         throw err;
       });
+      // Reports only: neither ever changes the answer or fails the ask.
+      // The stream ↔ page check reads the page once, without waiting, and
+      // only for gateway asks.
+      if (target !== undefined && seen.streamDone && seen.streamText && text === seen.streamText) {
+        let check = null;
+        try {
+          check = pageCheckNow(baseline, text);
+        } catch {
+          /* no check */
+        }
+        if (check?.mismatch === true) diagnostics.streamCheck = check;
+      }
+      if (req.captureStream === true && shimEpoch !== null) {
+        const raw = await takeStreamCapture(shimEpoch).catch(() => null);
+        if (raw !== null) diagnostics.streamCapture = raw;
+      }
     } catch (err) {
       // A gateway turn that failed after its prompt was sent must not keep
       // generating: the next ask in this chat would type into it. Unless the
@@ -502,6 +585,9 @@ async function handleTestAsk(
 
     // A CLI ask from a saved chat returns only an answer read in that chat.
     if (ownChat !== undefined) assertInWatchedChat();
+    // A gateway ask's new chat that the window left by a click: said so
+    // before its address or its turns are read in the other chat.
+    assertNewChatShown("before the answer was read");
 
     // A targeted ask always names its chat (or fails): null reaches the
     // gateway only from an extension that predates targets.
@@ -541,6 +627,7 @@ async function handleTestAsk(
       text,
       conversationUrl,
       ...(warning === null ? {} : { warning }),
+      ...(Object.keys(diagnostics).length === 0 ? {} : { diagnostics }),
     };
   } catch (err) {
     // Before Send or after the answer alike: the page shows another chat.
@@ -557,17 +644,24 @@ async function handleTestAsk(
 // conversation is checked by its path at once, any chat right before the
 // click. A new chat is not checked up front, and one whose user turn is not
 // recognised (drifted markup) keeps the ask's own error: that failure is the
-// DOM's, not a switch.
+// DOM's, not a switch. A script an extension reload cut off presses nothing
+// (checked up front and right before the click): the new script may have
+// an ask of the same chat generating there.
 async function abandonTurn(cause: unknown, turn: SentTurn): Promise<void> {
+  if (!extensionContextAlive()) return;
   await setPageShimActive(false);
   try {
     if (turn.target.kind === "conversation") assertShowsTurn(turn);
     await stopGenerating(
       ABANDON_STOP_MS,
       cause instanceof AnswerTimeoutError ? ABANDON_START_GRACE_MS : 0,
-      () => assertShowsTurn(turn),
+      () => {
+        if (!extensionContextAlive()) throw new ExtensionReloadedError();
+        assertShowsTurn(turn);
+      },
     );
   } catch (err) {
+    if (err instanceof ExtensionReloadedError) return;
     if (err instanceof StopRefused) {
       warnNotPressed(err.message);
       if (err.mismatch !== null) throw err.mismatch;

@@ -98,7 +98,7 @@ test("ownWindow.after_a_reload_the_gateway_ask_runs_in_the_marked_window", async
     world.injected.map((i) => i.file),
     ["pageShim.js", "content.js"],
   );
-  assert.deepEqual(world.session.ownTab, { windowId: WINDOW_ID, tabId: TAB_ID });
+  assert.deepEqual(world.session.ownTab, { windowId: WINDOW_ID, tabIds: [TAB_ID] });
   assert.ok(tabs.updates.some((u) => u.props.autoDiscardable === false));
   // The ask keeps the page marked.
   assert.equal(askSends()[0]?.ownMark, MARK);
@@ -138,7 +138,7 @@ test("ownWindow.after_a_browser_restart_the_marked_window_is_taken_back_only_aft
   receive(fixture("request_ask_conversation"));
   await until(() => posted("a2").length > 0);
   assert.equal(posted("a2")[0]?.type, "ask_result", JSON.stringify(posted("a2")));
-  assert.deepEqual(world.local.ownWindowMark, { token: MARK, windowId: WINDOW_ID, tabId: TAB_ID });
+  assert.deepEqual(world.local.ownWindowMark, { token: MARK, windowId: WINDOW_ID, tabIds: [TAB_ID] });
   assert.equal(askSends()[0]?.ownMark, MARK);
 });
 

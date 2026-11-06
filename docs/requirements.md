@@ -269,7 +269,7 @@ Ctrl+C while `cgpt ask` (or the current turn of `cgpt agent`) waits for the answ
 - Exit codes. `cgpt ask` and `cgpt agent` share one table (`cli/src/exit.rs`, pinned by tests):
   - `0` success.
   - `1` generic failure: a clipboard, stdin or editor failure while reading input, a host `rate_limited`, an assistant `blocked`, a runner error.
-  - `2` usage / argument error: an unknown option, no prompt or task given, a host `bad_request`, and a request whose serialized form is over the native host's frame cap (1 MiB): the CLI refuses it before connecting, with its size and the limit; nothing is sent.
+  - `2` usage / argument error: an unknown option, no prompt or task given, a host `bad_request`, and a request whose serialized form is over the native host's frame cap (1 MiB): the CLI refuses it before connecting, with its size and the limit; nothing is sent. For a `cgpt agent` command result the message says so and suggests going on with `cgpt agent -c`.
   - `3` setup error (native host, extension, manifest, `.cgpt-bridge/` session store).
   - `4` transport / native messaging error.
   - `5` tab unavailable / wrong URL / not active; also the chat changing under an `agent` session, a host `timeout`, and no answer from the host in time. A signed-out ChatGPT window (`not_logged_in`) reaches the CLI as tab unavailable, so it ends with 5.

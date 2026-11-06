@@ -1,0 +1,10 @@
+Посмотрю, где описан конфиг шлюза, и найду все его ключи.
+
+```tool_calls id="call-read-config"
+[{"name": "read", "arguments": {"path": "gateway/src/config.rs"}}, {"name": "grep", "arguments": {"pattern": "KNOWN_KEYS", "path": "gateway/src"}}]
+```
+Посмотрю, где описан конфиг шлюза, и найду все его ключи.
+
+```tool_calls id="call-read-config"
+[{"name": "read", "arguments": {"path": "gateway/src/config.rs"}}, {"name": "grep", "arguments": {"pattern": "KNOWN_KEYS", "path": "gateway/src"}}]
+```

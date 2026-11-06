@@ -48,6 +48,7 @@ fn spawn_host(ep: String, replies: Vec<String>) -> common::Host<Vec<serde_json::
                 text,
                 conversation_url: Some(CHAT.to_string()),
                 warning: None,
+                diagnostics: None,
             };
             write_frame(&mut writer, &serde_json::to_vec(&reply).unwrap()).unwrap();
             writer.flush().unwrap();
